@@ -1,0 +1,27 @@
+/*
+ * uvcd_config.h -- flat key=value persistence for struct uvcd_control_state
+ */
+#ifndef UVCD_CONFIG_H
+#define UVCD_CONFIG_H
+
+#include "uvcd.h"
+
+#define UVCD_CONFIG_PATH "/etc/uvcd.conf"
+
+/* Seed *out with every control's compiled-in default. */
+void uvcd_config_defaults(struct uvcd_control_state *out);
+
+/* Seed *out with defaults, then override from path if it exists. A missing
+ * file, or missing/unrecognized/out-of-range keys within it, are not
+ * errors -- the corresponding field is just left at its default. */
+void uvcd_config_load(const char *path, struct uvcd_control_state *out);
+
+/* Atomically write *in to path as flat "name=value" lines (temp file +
+ * fsync + rename). Returns 0 on success, -1 on failure (errno set).
+ *
+ * Controls are persistent by default, so there is no host-visible SAVE:
+ * uvcd_gadget.c calls this itself, debounced, after any accepted control
+ * change. */
+int uvcd_config_save(const char *path, const struct uvcd_control_state *in);
+
+#endif /* UVCD_CONFIG_H */

@@ -1,0 +1,49 @@
+pylibfdt: use the Python 3 C-API names directly
+
+scripts/dtc/pylibfdt/libfdt.i still calls PyString_FromString() and
+PyInt_AsLong(). Those are Python 2 C-API names; they only ever compiled
+under Python 3 because SWIG's pyhead.swg emitted compatibility macros
+(PyString_FromString -> PyUnicode_FromString, PyInt_AsLong ->
+PyLong_AsLong) into the generated wrapper.
+
+SWIG 4.5.0 dropped that Python 2 compatibility block, so libfdt_wrap.c
+now fails to build:
+
+  libfdt_wrap.c:5618: error: implicit declaration of function 'PyInt_AsLong'
+  libfdt_wrap.c:6679: error: implicit declaration of function 'PyString_FromString'
+  libfdt_wrap.c:6679: error: assignment to 'PyObject *' from 'int' makes
+                             pointer from integer without a cast
+
+which breaks scripts_dtc, and with it every U-Boot build that has
+CONFIG_PYLIBFDT=y (selected by CONFIG_BINMAN).
+
+Call the Python 3 names the macros expanded to. Behaviour is unchanged;
+U-Boot builds pylibfdt with $(PYTHON3) only, so the Python 2 spellings
+had no remaining purpose.
+
+Note the third Python 2 call, PyString_AsString() in the fdt_setprop()
+typemap, needs no change: it sits in the %#else branch of a
+PY_VERSION_HEX >= 0x03000000 test and is not compiled under Python 3.
+
+Signed-off-by: Thingino <thingino@thingino.com>
+
+--- a/scripts/dtc/pylibfdt/libfdt.i_shipped
++++ b/scripts/dtc/pylibfdt/libfdt.i_shipped
+@@ -1033,7 +1033,7 @@
+ 	PyObject *buff;
+ 
+ 	if ($1) {
+-		resultobj = PyString_FromString(
++		resultobj = PyUnicode_FromString(
+ 			fdt_string(fdt1, fdt32_to_cpu($1->nameoff)));
+ 		buff = PyByteArray_FromStringAndSize(
+ 			(const char *)($1 + 1), fdt32_to_cpu($1->len));
+@@ -1070,7 +1070,7 @@
+ 
+ /* typemaps used for fdt_next_node() */
+ %typemap(in, numinputs=1) int *depth (int depth) {
+-   depth = (int) PyInt_AsLong($input);
++   depth = (int) PyLong_AsLong($input);
+    $1 = &depth;
+ }
+ 

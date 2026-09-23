@@ -1,0 +1,125 @@
+#!/bin/sh
+# S31uvcd -- minimal on-demand ISP -> UVC webcam daemon (T31 + GC2083 only)
+
+DAEMON=/usr/bin/uvcd
+CONSOLE_PID=/var/run/uvcd-console.pid
+
+# Tear down the ttyGS0 debug console: the respawn loop first (so it cannot
+# start another getty), then the getty itself. Matched on its command line
+# rather than by name -- "pidof getty" would also hit the board's real
+# serial console, and killing that would lock the user out.
+stop_console() {
+	if [ -f "$CONSOLE_PID" ]; then
+		kill "$(cat "$CONSOLE_PID")" 2>/dev/null
+		rm -f "$CONSOLE_PID"
+	fi
+	for p in $(pidof getty 2>/dev/null); do
+		if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q ttyGS0; then
+			kill "$p" 2>/dev/null
+		fi
+	done
+}
+
+soft_connect_path() {
+	find /sys/devices -name soft_connect -path "*/dwc2/*" 2>/dev/null | head -1
+}
+
+disconnect_gadget() {
+	soft=$(soft_connect_path)
+	[ -n "$soft" ] && echo disconnect >"$soft"
+}
+
+connect_gadget() {
+	soft=$(soft_connect_path)
+	[ -n "$soft" ] && echo connect >"$soft"
+}
+
+case "$1" in
+start)
+	echo "Starting uvcd..."
+	# Clear any console left over from a previous start, so a second
+	# "start" can't leave two respawn loops fighting over ttyGS0.
+	stop_console
+	disconnect_gadget
+	sleep 1
+	if [ -x /usr/sbin/usb-role ]; then
+		usb-role -m device 2>/dev/null
+	fi
+	if [ ! -e /dev/video0 ]; then
+		# g_webcam composes a CDC-ACM function alongside UVC on its own
+		# (webcam.c requests "acm" via the kernel's usbfunc: module
+		# alias); this is belt-and-suspenders in case that autoload
+		# path ever fails at boot -- harmless no-op otherwise.
+		modprobe usb_f_acm 2>/dev/null
+		modprobe g_webcam || {
+			echo "Failed to load g_webcam"
+			exit 1
+		}
+		sleep 1
+		for i in 1 2 3 4 5; do
+			[ -e /dev/video0 ] && break
+			sleep 1
+		done
+	fi
+	if [ ! -e /dev/video0 ]; then
+		echo "UVC video device not available"
+		exit 1
+	fi
+	start-stop-daemon -S -b -x "$DAEMON" -- -d /dev/video0
+	pid=""
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		pid=$(pidof uvcd)
+		ready=""
+		if [ -n "$pid" ]; then
+			for fd in /proc/$pid/fd/*; do
+				[ "$(readlink "$fd" 2>/dev/null)" = "/dev/video0" ] && ready=1
+			done
+		fi
+		[ -n "$ready" ] && break
+		sleep 1
+	done
+	if [ -z "$ready" ]; then
+		echo "uvcd failed to start"
+		exit 1
+	fi
+	# Debug console: g_webcam composes a CDC-ACM function alongside UVC, so
+	# /dev/ttyGS0 (host: /dev/ttyACM0) is free for a login shell. Camera
+	# settings do NOT go through here -- they are UVC controls, driven by
+	# uvcdctl. This is purely a development console, which is why a plain
+	# getty is enough: it already gives arbitrary commands, devmem for
+	# register access, and logread for logs.
+	#
+	# Non-fatal throughout: the console must never block or fail UVC
+	# bring-up. The getty is respawned in a loop, as the sibling
+	# S31raptor-webcam does, because it exits each time the host closes
+	# the port.
+	for i in 1 2 3 4 5; do
+		[ -e /dev/ttyGS0 ] && break
+		sleep 1
+	done
+	if [ -e /dev/ttyGS0 ]; then
+		while :; do
+			setsid /sbin/getty -n -l /bin/sh ttyGS0 0 vt100
+			sleep 1
+		done &
+		echo $! >"$CONSOLE_PID"
+	else
+		echo "Debug console (/dev/ttyGS0) not available"
+	fi
+	connect_gadget
+	;;
+stop)
+	echo "Stopping uvcd..."
+	start-stop-daemon -K -x "$DAEMON"
+	stop_console
+	disconnect_gadget
+	;;
+restart)
+	$0 stop
+	$0 start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac

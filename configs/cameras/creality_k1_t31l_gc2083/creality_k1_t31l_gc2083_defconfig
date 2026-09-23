@@ -1,0 +1,56 @@
+# NAME: Creality K1 Camera (T31L, GC2083, USB)
+# FRAG: soc-xburst1 core ssl
+# uvcd selects BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM directly, so the
+# webcam fragment (raptor.conf keys, RWC/RAD/WEBRTC/TLS selects -- none of
+# which uvcd reads or needs) is intentionally not applied here.
+BR2_ETHERNET=n
+BR2_INGENIC_SOC_MODEL="t31l"
+BR2_LINUX_KERNEL_PATCH="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/kernel-patches"
+BR2_PACKAGE_MDNSD=n
+BR2_PACKAGE_MDNSD_HTTP_SERVICE=n
+BR2_PACKAGE_TELEGRAMBOT=n
+BR2_PACKAGE_THINGINO_AGENT=n
+BR2_PACKAGE_THINGINO_DIAG=n
+BR2_PACKAGE_THINGINO_HA=n
+BR2_PACKAGE_THINGINO_KOPT_DWC2=y
+BR2_PACKAGE_THINGINO_KOPT_DWC2_OTG=y
+BR2_PACKAGE_THINGINO_MOSQUITTO_20X=n
+BR2_PACKAGE_THINGINO_STREAMER_UVCD=y
+BR2_PACKAGE_THINGINO_SYSUPGRADE=n
+BR2_PACKAGE_THINGINO_VPN_NONE=y
+BR2_PACKAGE_THINGINO_VPN_WIREGUARD=n
+BR2_PACKAGE_THINGINO_WEBSERVER_NONE=y
+BR2_SENSOR_1_NAME="gc2083"
+BR2_THINGINO_AUDIO=n
+BR2_THINGINO_DEV_WEBCAM=y
+BR2_THINGINO_GPIO_LIST="18O"
+FLASH_SIZE_MB=8
+
+# USB UVC webcam module from the Creality K1 3D printer.
+# Closest sibling is vanhua_l34_t31l_gc2083_eth (same SoC, sensor, 8MB NOR),
+# minus everything this board does not have: no IR, no motor, no mic,
+# no Wi-Fi, no Ethernet.
+#
+# GPIO: stock U-Boot sets "gpio_default=18O". That env var only exists in the
+# legacy 2013.07 U-Boot; core.fragment pins 2026.07, where it is a no-op. The
+# equivalent here is BR2_THINGINO_GPIO_LIST, same <pin><O|o> token syntax --
+# it writes "18 high" to /etc/gpio.conf, applied by S05gpio before S11modules
+# loads the sensor driver.
+#
+# Runtime: uvcd only -- a standalone T31+GC2083 UVC webcam daemon, not raptor.
+# Fuses ISP/encoder bring-up and the UVC gadget bridge into one process, no
+# SHM ring, no raptor-common/IPC, no control socket, no config file. Encoder
+# channel is created on UVC COMMIT and destroyed on STREAMOFF/DISCONNECT, so
+# no ISP/encoder cycles run with no host attached. See package/thingino-uvcd.
+#
+# Sensor .so is still pulled independently of the streamer choice: uvcd
+# selects BR2_PACKAGE_THINGINO_RAPTOR_HAL -> ..._HAL_INGENIC -> INGENIC_LIB,
+# which builds the sensor driver from BR2_SENSOR_1_NAME regardless of which
+# streamer/daemon links against it.
+#
+# Hardware status: enumerates on a Linux host as "Raptor Webcam: UVC Camera",
+# MJPEG 1920x1080 @ 30fps. Still unverified: sustained frame capture (the
+# descriptors above come from the gadget, not from rvd), /dev/ttyGS0 (see the
+# getty loop in S31raptor-webcam), serialport (common.uenv.txt defaults to
+# ttyS1), and image orientation (add BR2_SENSOR_1_PARAMS="shvflip=1" if
+# inverted, as vanhua_h33 does).

@@ -1,0 +1,12 @@
+# Intentionally empty -- no "auto" stanza, so S40network's "ifup -v -a"
+# leaves usb0 alone.
+#
+# The usbnet package installs an "auto usb0 / iface usb0 inet dhcp" stanza
+# in its default (no-NCM) branch, and usbnet is force-selected by
+# BR2_PACKAGE_THINGINO_KOPT_DWC2_OTG, which we need for USB device mode.
+# The g_webcam composite on this kernel DOES include an NCM function
+# (host side: "cdc_ncm 3-1.1.4:1.6"), so usb0 exists here -- but this
+# board is deliberately UVC-only, there is no DHCP server on the other
+# end, and the stanza just leaves a udhcpc broadcasting DISCOVER forever.
+#
+# Delete this file to re-enable USB networking.
