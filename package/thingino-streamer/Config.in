@@ -46,13 +46,6 @@ config BR2_PACKAGE_THINGINO_STREAMER_TIMPS
 	  Tiny IMP Streamer — minimal, dependency-light RTSP / fMP4 / MJPEG
 	  streamer. Built on vendor libimp (no live555/libconfig/libwebsockets).
 
-config BR2_PACKAGE_THINGINO_STREAMER_UVCD
-	bool "uvcd (minimal T31+GC2083 UVC-only webcam)"
-	select BR2_PACKAGE_THINGINO_UVCD
-	select BR2_PACKAGE_THINGINO_STREAMER
-	help
-	  Minimal fixed-function UVC webcam daemon for T31 sensors.
-
 endchoice
 
 if BR2_PACKAGE_THINGINO_STREAMER

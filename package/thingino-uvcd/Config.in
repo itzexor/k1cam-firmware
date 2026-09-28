@@ -1,5 +1,15 @@
 config BR2_PACKAGE_THINGINO_UVCD
-	bool
+	bool "thingino-uvcd"
 	select BR2_PACKAGE_THINGINO_RAPTOR_HAL
 	select BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM
 	select BR2_PACKAGE_THINGINO_SYSTEM_USB_ROLE
+	help
+	  Minimal fixed-function UVC webcam daemon for T31 + GC2083.
+
+	  Fuses ISP/encoder bring-up and the UVC gadget bridge into one
+	  process. Standard image controls are exposed on the UVC
+	  Processing Unit; nonstandard ISP controls on Extension Unit 4.
+
+	  Enabled directly by the camera defconfig rather than through
+	  the thingino streamer choice. Requires the uvcd gadget
+	  descriptors in the kernel's g_webcam.

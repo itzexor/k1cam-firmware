@@ -1,11 +1,9 @@
 # NAME: Creality K1 Camera (T31L, GC2083, USB)
 # FRAG: soc-xburst1 core ssl
-# uvcd selects BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM directly, so the
-# webcam fragment (raptor.conf keys, RWC/RAD/WEBRTC/TLS selects -- none of
-# which uvcd reads or needs) is intentionally not applied here.
 BR2_ETHERNET=n
 BR2_INGENIC_SOC_MODEL="t31l"
-BR2_LINUX_KERNEL_PATCH="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/kernel-patches"
+BR2_LINUX_KERNEL_CUSTOM_REPO_URL="$(BR2_EXTERNAL_THINGINO_PATH)/../thingino-linux"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="a040f8acc4bc72a496f4779ecfdcd368e2020ef7"
 BR2_PACKAGE_MDNSD=n
 BR2_PACKAGE_MDNSD_HTTP_SERVICE=n
 BR2_PACKAGE_TELEGRAMBOT=n
@@ -15,17 +13,42 @@ BR2_PACKAGE_THINGINO_HA=n
 BR2_PACKAGE_THINGINO_KOPT_DWC2=y
 BR2_PACKAGE_THINGINO_KOPT_DWC2_OTG=y
 BR2_PACKAGE_THINGINO_MOSQUITTO_20X=n
-BR2_PACKAGE_THINGINO_STREAMER_UVCD=y
+BR2_PACKAGE_THINGINO_STREAMER_NONE=y
 BR2_PACKAGE_THINGINO_SYSUPGRADE=n
+BR2_PACKAGE_THINGINO_UVCD=y
 BR2_PACKAGE_THINGINO_VPN_NONE=y
 BR2_PACKAGE_THINGINO_VPN_WIREGUARD=n
 BR2_PACKAGE_THINGINO_WEBSERVER_NONE=y
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_THINGINO_PATH)/scripts/rootfs_script.sh $(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/post-build.sh"
 BR2_SENSOR_1_NAME="gc2083"
 BR2_THINGINO_AUDIO=n
 BR2_THINGINO_DEV_WEBCAM=y
 BR2_THINGINO_GPIO_LIST="18O"
 FLASH_SIZE_MB=8
 
+# Kernel: our fork of gtxaspec/thingino-linux, checked out as a sibling of
+# this repo (../thingino-linux) and pinned by SHA. The uvcd gadget
+# descriptors are a commit on its creality-k1-uvcd branch, not a patch here.
+# The BR2_LINUX_KERNEL_CUSTOM_REPO_* lines above override core.fragment,
+# which is applied before this file. Pinning also replaces upstream's
+# `git ls-remote` branch lookup, so the kernel only changes when that SHA
+# does -- bump it after committing to the fork.
+#
+# Streamer: none of thingino's. uvcd is enabled directly as a package
+# (BR2_PACKAGE_THINGINO_UVCD), not through the streamer choice, so this
+# camera does not depend on that menu.
+#
+# Boot services: this board is a USB-powered webcam with no network, so
+# post-build.sh (appended to thingino's post-build script above, which still
+# runs first) removes the network, time, sysadmin and LED services that
+# thingino's global overlay installs unconditionally, and moves the USB ACM
+# console under init's supervision. Kconfig cannot do this -- those scripts
+# are not owned by any package option.
+#
+# uvcd selects BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM directly, so the
+# webcam fragment (raptor.conf keys, RWC/RAD/WEBRTC/TLS selects -- none of
+# which uvcd reads or needs) is intentionally not applied here.
+#
 # USB UVC webcam module from the Creality K1 3D printer.
 # Closest sibling is vanhua_l34_t31l_gc2083_eth (same SoC, sensor, 8MB NOR),
 # minus everything this board does not have: no IR, no motor, no mic,

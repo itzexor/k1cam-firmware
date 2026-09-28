@@ -1,5 +1,0 @@
-# Intentionally empty. This board has no Ethernet MAC, but the global
-# rootfs overlay ships an "auto eth0 / iface eth0 inet dhcp" stanza for
-# every build. S40network runs "ifup -v -a", which then leaves a udhcpc
-# broadcasting DISCOVER forever on an interface that will never carry a
-# link. Shadowing the file with no "auto" stanza stops that.
