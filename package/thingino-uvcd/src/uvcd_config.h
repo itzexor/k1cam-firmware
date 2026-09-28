@@ -7,6 +7,7 @@
 #include "uvcd.h"
 
 #define UVCD_CONFIG_PATH "/etc/uvcd.conf"
+#define UVCD_CONFIG_DIRTY_PATH UVCD_CONFIG_PATH ".dirty"
 
 /* Seed *out with every control's compiled-in default. */
 void uvcd_config_defaults(struct uvcd_control_state *out);
@@ -20,8 +21,8 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *out);
  * fsync + rename). Returns 0 on success, -1 on failure (errno set).
  *
  * Controls are persistent by default, so there is no host-visible SAVE:
- * uvcd_gadget.c calls this itself, debounced, after any accepted control
- * change. */
+ * uvcd_gadget.c calls this after accepted changes have survived ten
+ * seconds of healthy streaming. Idle changes remain in RAM. */
 int uvcd_config_save(const char *path, const struct uvcd_control_state *in);
 
 #endif /* UVCD_CONFIG_H */

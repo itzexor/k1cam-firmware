@@ -2,6 +2,8 @@
 # S31uvcd -- minimal on-demand ISP -> UVC webcam daemon (T31 + GC2083 only)
 
 DAEMON=/usr/bin/uvcd
+SUPERVISOR_PID=/var/run/uvcd-supervisor.pid
+READY=/var/run/uvcd.ready
 
 # Poll a condition in 50ms steps. Every wait in start() is on the path to
 # the host seeing the camera, and polling in whole seconds rounds each one
@@ -17,13 +19,45 @@ wait_for() {
 	"$@"
 }
 
-# True once uvcd holds /dev/video0 open.
+# Readiness is published only after all UVC subscriptions are installed.
 uvcd_ready() {
-	pid=$(pidof uvcd) || return 1
-	for fd in /proc/$pid/fd/*; do
-		[ "$(readlink "$fd" 2>/dev/null)" = "/dev/video0" ] && return 0
+	[ -s "$READY" ] && kill -0 "$(cat "$READY")" 2>/dev/null
+}
+
+supervise() {
+	child=
+	sleeper=
+	trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; disconnect_gadget; if [ -n "$child" ]; then
+		kill "$child" 2>/dev/null
+		(sleep 5; kill -KILL "$child" 2>/dev/null) &
+		reaper=$!
+		wait "$child" 2>/dev/null
+		kill "$reaper" 2>/dev/null
+	fi; rm -f "$READY" "$SUPERVISOR_PID"; exit 0' TERM INT
+	backoff=1
+	while :; do
+		disconnect_gadget
+		rm -f "$READY"
+		"$DAEMON" -s -d /dev/video0 &
+		child=$!
+		if wait_for 200 uvcd_ready; then
+			connect_gadget
+		else
+			kill -KILL "$child" 2>/dev/null
+		fi
+		started=$(cut -d. -f1 /proc/uptime)
+		wait "$child"
+		child=
+		disconnect_gadget
+		rm -f "$READY"
+		now=$(cut -d. -f1 /proc/uptime)
+		[ $((now - started)) -ge 30 ] && backoff=1
+		sleep "$backoff" &
+		sleeper=$!
+		wait "$sleeper"
+		sleeper=
+		[ "$backoff" -ge 16 ] || backoff=$((backoff * 2))
 	done
-	return 1
 }
 
 # Resolved once, in the current shell rather than a $(...) subshell so the
@@ -45,7 +79,13 @@ connect_gadget() {
 }
 
 case "$1" in
+	supervise)
+		supervise
+		;;
 	start)
+		if [ -s "$SUPERVISOR_PID" ] && kill -0 "$(cat "$SUPERVISOR_PID")" 2>/dev/null; then
+			exit 0
+		fi
 		echo "Starting uvcd..."
 		# Only a restart needs the pause: it gives the host time to see the
 		# unplug before we reconnect. At boot g_webcam isn't loaded yet, nothing
@@ -74,23 +114,29 @@ case "$1" in
 			echo "UVC video device not available"
 			exit 1
 		fi
-		start-stop-daemon -S -b -x "$DAEMON" -- -d /dev/video0
+		start-stop-daemon -S -b -m -p "$SUPERVISOR_PID" -x /bin/sh -- "$0" supervise
 		# uvcd must have /dev/video0 open and its UVC events subscribed before
 		# the gadget connects, or the host's first SETUP requests go unanswered.
 		if ! wait_for 200 uvcd_ready; then
 			echo "uvcd failed to start"
 			exit 1
 		fi
-		connect_gadget
 		;;
 	stop)
 		echo "Stopping uvcd..."
-		start-stop-daemon -K -x "$DAEMON"
 		disconnect_gadget
+		if [ -s "$SUPERVISOR_PID" ]; then
+			supervisor=$(cat "$SUPERVISOR_PID")
+			if ! kill "$supervisor" 2>/dev/null; then
+				rm -f "$SUPERVISOR_PID"
+			fi
+			wait_for 160 test ! -e "$SUPERVISOR_PID" || exit 1
+		else
+			start-stop-daemon -K -x "$DAEMON"
+		fi
 		;;
 	restart)
-		$0 stop
-		$0 start
+		"$0" stop && "$0" start
 		;;
 	*)
 		echo "Usage: $0 {start|stop|restart}"

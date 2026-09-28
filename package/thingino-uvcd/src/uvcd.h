@@ -195,6 +195,7 @@ struct uvcd_frame_buf {
 	uint64_t seq;      /* bumped on every publish; consumer tracks last seen */
 	int64_t ts_us;     /* capture time, CLOCK_MONOTONIC microseconds */
 	bool is_key;
+	bool jpeg_near_limit; /* sticky until the gadget consumes it, under lock */
 };
 
 /* --------------------------------------------------------------------------
@@ -236,6 +237,7 @@ typedef struct {
 	 * (or compiled-in defaults) at init, changed in place by the gadget's
 	 * control paths, and read here when the encoder channel is created. */
 	struct uvcd_control_state controls;
+	int mjpeg_quality_limit; /* runtime size protection; 0 = requested quality */
 
 	/* The ISP's factory gamma curve, read once after HAL init. Scaling
 	 * this rather than synthesizing a curve from scratch keeps gamma=100

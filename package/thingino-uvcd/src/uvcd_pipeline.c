@@ -412,7 +412,18 @@ int uvcd_pipeline_init(uvcd_pipeline_t *p)
 	 * defaults. They are held here and pushed to the ISP at every
 	 * bring-up (hal_bring_up), since the ISP itself only exists while a
 	 * host is streaming. */
-	uvcd_config_load(UVCD_CONFIG_PATH, &p->controls);
+	if (access(UVCD_CONFIG_DIRTY_PATH, F_OK) == 0) {
+		LOGW("previous run did not exit cleanly; using factory controls");
+		uvcd_config_defaults(&p->controls);
+		/* Keep the rejected values for diagnosis, but never reload them
+		 * after a clean idle shutdown of this recovery run. */
+		if (rename(UVCD_CONFIG_PATH, UVCD_CONFIG_PATH ".rejected") != 0 && errno != ENOENT) {
+			LOGE("cannot quarantine unsafe config: %s", strerror(errno));
+			goto fail;
+		}
+	} else {
+		uvcd_config_load(UVCD_CONFIG_PATH, &p->controls);
+	}
 
 	/* Nothing else: the sensor, ISP and IMP system come up on the first
 	 * stream (uvcd_pipeline_start), so an unused camera never starts them
@@ -477,6 +488,9 @@ static void *pump_thread(void *arg)
 			total += frame.nals[n].length;
 
 		pthread_mutex_lock(&p->frame.lock);
+		if (p->cur_format == UVCD_FMT_MJPEG &&
+		    total > uvcd_frames[p->cur_frame].max_size * 9 / 10)
+			p->frame.jpeg_near_limit = true;
 		if (total <= p->frame.size) {
 			uint32_t off = 0;
 			for (uint32_t n = 0; n < frame.nal_count; n++) {
@@ -520,26 +534,14 @@ struct uvcd_imp_expr { /* IMPISPExpr, s_attr side of the union */
 	uint16_t pad;  /* the union is 12 bytes (its g_attr side) */
 };
 
-struct uvcd_imp_autozoom { /* IMPISPAutoZoom */
-	int chan;
-	int scaler_enable;
-	int scaler_outwidth;
-	int scaler_outheight;
-	int crop_enable;
-	int crop_left;
-	int crop_top;
-	int crop_width;
-	int crop_height;
-};
-
 /* Exposure priority: with auto-exposure out of frame time and leaning on
  * gain, slow the sensor down a step so it can expose longer instead; once
  * the gain is low and the exposure would fit a faster frame, speed back up.
  * Gains are total gain as a plain multiple (the ISP reports [24.8]); the
  * gap between the two thresholds keeps it from hunting. */
 #define UVCD_PRIORITY_PERIOD_MS 2000
-#define UVCD_PRIORITY_SLOWER_GAIN 4.0f
-#define UVCD_PRIORITY_FASTER_GAIN 2.0f
+#define UVCD_PRIORITY_SLOWER_GAIN 16.0f
+#define UVCD_PRIORITY_FASTER_GAIN 8.0f
 
 /* Run the sensor at `fps`, and tell the encoder so its rate control keeps
  * bits per second rather than bits per frame. */
@@ -558,15 +560,16 @@ static void set_sensor_fps(uvcd_pipeline_t *p, uint32_t fps)
 	p->sensor_fps = fps;
 }
 
-/* The listed frame rate one step slower/faster than `fps`, never below the
- * slowest listed nor above `ceiling`. */
+/* One listed step, at most `ceiling`, with a 15 fps priority floor.
+ * A host explicitly negotiating 5/10 fps keeps that rate. */
 static uint32_t fps_step(uint32_t fps, int dir, uint32_t ceiling)
 {
 	uint32_t best = fps;
 
 	for (int i = 0; i < UVCD_NUM_INTERVALS; i++) {
 		uint32_t f = uvcd_interval_fps(uvcd_intervals[i]);
-		if (dir < 0 && f < fps && (best == fps || f > best))
+		if (dir < 0 && f < fps && f >= (ceiling < 15 ? ceiling : 15) &&
+		    (best == fps || f > best))
 			best = f;
 		if (dir > 0 && f > fps && f <= ceiling && (best == fps || f < best))
 			best = f;
@@ -590,8 +593,10 @@ static void compute_view(const uvcd_pipeline_t *p, const struct uvcd_control_sta
 		bw = (int)((int64_t)sh * ow / oh);
 	}
 	/* The ISP wants the crop aligned; round down, so it stays inside. */
-	*w = (bw * UVCD_ZOOM_MIN / zoom) & ~15;
-	*h = (bh * UVCD_ZOOM_MIN / zoom) & ~7;
+	*w = bw * UVCD_ZOOM_MIN / zoom;
+	*h = bh * UVCD_ZOOM_MIN / zoom;
+	*w &= ~1;
+	*h &= ~1;
 
 	int spare_x = sw - *w, spare_y = sh - *h;
 	*x = spare_x / 2 + (int)((int64_t)(spare_x / 2) * c->pan / UVCD_PANTILT_MAX);
@@ -609,33 +614,24 @@ int uvcd_apply_view(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
 
 	int x, y, w, h;
 	compute_view(p, c, p->cur_frame, &x, &y, &w, &h);
+	if (x == p->view.x && y == p->view.y && w == p->view.w && h == p->view.h)
+		return RSS_OK;
 
-	const struct uvcd_frame_info *fi = &uvcd_frames[p->cur_frame];
-	struct uvcd_imp_autozoom z = {
-		.chan = UVCD_FS_CHN,
-		.scaler_enable = (w != fi->width || h != fi->height),
-		.scaler_outwidth = fi->width,
-		.scaler_outheight = fi->height,
-		.crop_enable = (w != p->sensor_w || h != p->sensor_h),
-		.crop_left = x,
-		.crop_top = y,
-		.crop_width = w,
-		.crop_height = h,
-	};
-	int ret = RSS_HAL_CALL(p->ops, isp_set_auto_zoom, p->hal_ctx, &z);
+	/* AutoZoom crops AFTER scaling on T31. Recreate with a front crop
+	 * instead, so zoom never needs a sensor-wide 7680-pixel scaler output.
+	 * Preserve the old controls if the SDK rejects the requested view. */
+	struct uvcd_control_state old = p->controls;
+	uint8_t format = p->cur_format, frame = p->cur_frame;
+	uint32_t interval = p->cur_interval;
+	uvcd_pipeline_stop(p);
+	p->controls = *c;
+	int ret = uvcd_pipeline_start(p, format, frame, interval);
+	p->controls = old;
 	if (ret != RSS_OK) {
-		LOGW("view %dx%d+%d+%d rejected: %d", w, h, x, y, ret);
-		return ret;
+		LOGW("view change failed; restoring previous view");
+		uvcd_pipeline_start(p, format, frame, interval);
 	}
-	p->view.x = x;
-	p->view.y = y;
-	p->view.w = w;
-	p->view.h = h;
-	LOGD("view %dx%d+%d+%d", w, h, x, y);
-
-	/* Metering follows what is in view. */
-	uvcd_apply_metering(p, c);
-	return RSS_OK;
+	return ret;
 }
 
 int uvcd_apply_exposure(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
@@ -652,7 +648,7 @@ int uvcd_apply_exposure(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
 			if (c->ae_priority) {
 				uint32_t fits = 1000000 / us;
 				while (fps > fits) {
-					uint32_t slower = fps_step(fps, -1, fps);
+					uint32_t slower = fps_step(fps, -1, uvcd_interval_fps(p->cur_interval));
 					if (slower == fps)
 						break;
 					fps = slower;
@@ -856,12 +852,16 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	 * it live from then on. */
 	int vx, vy, vw, vh;
 	compute_view(p, &p->controls, frame, &vx, &vy, &vw, &vh);
+	/* Never pass an invalid sensor-space rectangle to the ISP. */
+	if (vw <= 0 || vh <= 0 || vx < 0 || vy < 0 ||
+	    vx + vw > p->sensor_w || vy + vh > p->sensor_h)
+		return -EINVAL;
 	if (vw != p->sensor_w || vh != p->sensor_h) {
-		fs_cfg.crop.enable = true;
-		fs_cfg.crop.x = vx;
-		fs_cfg.crop.y = vy;
-		fs_cfg.crop.w = vw;
-		fs_cfg.crop.h = vh;
+		fs_cfg.fcrop.enable = true;
+		fs_cfg.fcrop.x = vx;
+		fs_cfg.fcrop.y = vy;
+		fs_cfg.fcrop.w = vw;
+		fs_cfg.fcrop.h = vh;
 	}
 	if (fi->width != vw || fi->height != vh) {
 		fs_cfg.scaler.enable = true;
@@ -892,6 +892,9 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	uint32_t bitrate = jpeg ? 0 : effective_h264_bitrate(p, frame);
 	int16_t min_qp = (int16_t)c->h264_min_qp;
 	int16_t max_qp = (int16_t)c->h264_max_qp;
+	int jpeg_quality = c->mjpeg_quality;
+	if (p->mjpeg_quality_limit > 0 && jpeg_quality > p->mjpeg_quality_limit)
+		jpeg_quality = p->mjpeg_quality_limit;
 
 	/* Crossed bounds would make channel creation fail, and when this runs
 	 * as an in-place restart the host is left with no frames at all. Fall
@@ -914,14 +917,33 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 		.fps_num = fps_num,
 		.fps_den = fps_den,
 		.gop_length = effective_h264_gop(p, fps_num),
+		.max_same_scene_cnt = 1, /* SDK default 2 doubles the IDR interval */
 		/* On T31 a JPEG channel's quality *is* its initial QP, and it can
 		 * only be set here -- enc_set_jpeg_qp is unsupported on this SDK. */
-		.init_qp = jpeg ? (int16_t)c->mjpeg_quality : -1,
+		.init_qp = jpeg ? (int16_t)jpeg_quality : -1,
 		.min_qp = jpeg ? -1 : min_qp,
 		.max_qp = jpeg ? -1 : max_qp,
 		.ip_delta = -1,
 		.pb_delta = -1,
 	};
+
+	/* JPEG creation in this HAL bypasses enc_cfg's buffer options. Set
+	 * them explicitly before CreateChn and check errors. Keep one large
+	 * JPEG buffer because the pump copies/releases it immediately; two
+	 * would waste scarce reserved memory. Reset both options for H.264.
+	 * USB still has a smaller cap, protected by adaptive JPEG quality. */
+	uint32_t stream_bytes = jpeg ? (fi->width * fi->height * 4u + 65535u) & ~4095u
+				    : fi->max_size;
+	ret = RSS_HAL_CALL(p->ops, enc_set_max_stream_cnt, p->hal_ctx, UVCD_ENC_CHN,
+			   jpeg ? 1 : 2);
+	if (ret < 0)
+		goto fail_grp;
+	ret = RSS_HAL_CALL(p->ops, enc_set_stream_buf_size, p->hal_ctx,
+			   UVCD_ENC_CHN, stream_bytes);
+	if (ret < 0) {
+		LOGE("encoder stream buffer (%u bytes) rejected: %d", stream_bytes, ret);
+		goto fail_grp;
+	}
 
 	ret = RSS_HAL_CALL(p->ops, enc_create_channel, p->hal_ctx, UVCD_ENC_CHN, &enc_cfg);
 	if (ret != RSS_OK) {
@@ -972,6 +994,9 @@ static void teardown_channel(uvcd_pipeline_t *p)
 int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 			uint32_t interval)
 {
+	if (frame < 1 || frame > UVCD_NUM_FRAMES ||
+	    (format != UVCD_FMT_MJPEG && format != UVCD_FMT_H264))
+		return -EINVAL;
 	if (p->running && p->configured && p->cur_format == format && p->cur_frame == frame &&
 	    p->cur_interval == interval)
 		return RSS_OK; /* already running with these exact params */
@@ -1003,8 +1028,14 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	if (!p->ts_rebased)
 		LOGW("SDK timestamp rebase failed; stamping frames on receipt");
 
-	RSS_HAL_CALL(p->ops, fs_enable_channel, p->hal_ctx, UVCD_FS_CHN);
-	RSS_HAL_CALL(p->ops, enc_start, p->hal_ctx, UVCD_ENC_CHN);
+	ret = RSS_HAL_CALL(p->ops, fs_enable_channel, p->hal_ctx, UVCD_FS_CHN);
+	if (ret != RSS_OK)
+		goto fail_start;
+	ret = RSS_HAL_CALL(p->ops, enc_start, p->hal_ctx, UVCD_ENC_CHN);
+	if (ret != RSS_OK) {
+		RSS_HAL_CALL(p->ops, fs_disable_channel, p->hal_ctx, UVCD_FS_CHN);
+		goto fail_start;
+	}
 
 	/* Now that there is a frame rate to hold or give up: manual exposure
 	 * with exposure priority may need a slower sensor. And metering can
@@ -1014,6 +1045,7 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 
 	p->frame.seq = 0;
 	p->frame.len = 0;
+	p->frame.jpeg_near_limit = false;
 	p->pump_run = 1;
 	if (pthread_create(&p->pump_tid, NULL, pump_thread, p) != 0) {
 		LOGE("pump thread create failed");
@@ -1028,6 +1060,12 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	p->running = true;
 	LOGI("pipeline started (on demand)");
 	return RSS_OK;
+
+fail_start:
+	LOGE("pipeline enable failed: %d", ret);
+	teardown_channel(p);
+	p->configured = false;
+	return ret;
 }
 
 bool uvcd_pipeline_restart_encoder(uvcd_pipeline_t *p, uint8_t format)

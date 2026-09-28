@@ -113,12 +113,6 @@ struct uvc_event {
  * find payload boundaries; matching it lets a full payload end on size too. */
 #define UVCD_BULK_PAYLOAD (512 * 32)
 
-/* A host that stops reading normally says so: it clears the halt on the
- * streaming endpoint and the gadget raises STREAMOFF. This is only the
- * fallback for one that just goes quiet -- long enough that a player
- * pausing to seek or reopen is not mistaken for a host that left. */
-#define UVCD_HOST_STALL_MS 3000
-
 struct gadget_buffer {
 	void *start;
 	size_t length;
@@ -153,10 +147,13 @@ struct gadget_s {
 
 	/* Controls are persistent by default -- there is no explicit SAVE.
 	 * Every accepted change marks the shadow dirty; the poll loop writes
-	 * it out once writes have settled, so dragging a slider costs one
-	 * flash write per burst rather than one per tick. */
+	 * it out after ten seconds of healthy streaming with stable settings. */
 	bool config_dirty;
-	time_t config_dirty_at;
+	bool recovery_confirmed;
+	int64_t config_dirty_at;
+	int64_t healthy_since_ms;
+	int64_t last_frame_ms;
+	uint64_t watched_seq;
 
 	/* While a factory reset walks every control, encoder re-creation is
 	 * deferred and done once at the end instead of once per setting. */
@@ -579,20 +576,38 @@ static const struct uvcd_ctrl_def *standard_ctrl_def(uint8_t selector)
  * reboot, so the write-back is the daemon's job, not the caller's.
  */
 #define UVCD_CONFIG_SETTLE_SECS 2
+#define UVCD_CONFIG_HEALTHY_MS 10000
+#define UVCD_FRAME_TIMEOUT_MS 5000
+
+static int64_t monotonic_ms(void);
 
 static void config_mark_dirty(gadget_t *g)
 {
 	g->config_dirty = true;
-	g->config_dirty_at = time(NULL);
+	g->config_dirty_at = monotonic_ms();
+	g->healthy_since_ms = 0;
 }
 
-/* Write the shadow out once no further change has arrived for a moment.
- * force=true flushes immediately regardless (daemon shutdown). */
-static void config_flush(gadget_t *g, bool force)
+/* Persist only settings exercised by ten seconds of healthy streaming. */
+static void config_flush(gadget_t *g)
 {
-	if (!g->config_dirty)
+	/* Idle settings have not been exercised by the encoder. Even a clean
+	 * shutdown must not promote them to the next boot's defaults. */
+	if (!g->streaming || !g->healthy_since_ms ||
+	    monotonic_ms() - g->healthy_since_ms < UVCD_CONFIG_HEALTHY_MS ||
+	    monotonic_ms() - g->last_frame_ms >= 1000 ||
+	    monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_SECS * 1000)
 		return;
-	if (!force && time(NULL) - g->config_dirty_at < UVCD_CONFIG_SETTLE_SECS)
+
+	/* A healthy saved configuration should survive ordinary USB power
+	 * removal. Only startup probation needs the persistent dirty marker;
+	 * subsequent unproven edits are kept in RAM until this same gate. */
+	if (!g->recovery_confirmed) {
+		if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
+			return;
+		g->recovery_confirmed = true;
+	}
+	if (!g->config_dirty)
 		return;
 
 	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls) != 0) {
@@ -634,8 +649,12 @@ static void encoder_restart(gadget_t *g, uint8_t format)
 	}
 	/* The pipeline's frame sequence restarts at 0, so resync the reader or
 	 * it would wait for the old count to be passed again. */
-	if (uvcd_pipeline_restart_encoder(g->pipe, format))
+	if (uvcd_pipeline_restart_encoder(g->pipe, format)) {
 		g->read_seq = 0;
+		g->watched_seq = 0;
+		g->last_frame_ms = monotonic_ms();
+		g->healthy_since_ms = 0;
+	}
 }
 
 static void encoder_after_store(gadget_t *g, uint8_t selector)
@@ -656,6 +675,7 @@ static void encoder_after_store(gadget_t *g, uint8_t selector)
 		encoder_restart(g, UVCD_FMT_H264);
 		break;
 	case UVCD_CUSTOM_MJPEG_QUALITY:
+		g->pipe->mjpeg_quality_limit = 0;
 		encoder_restart(g, UVCD_FMT_MJPEG);
 		break;
 	default:
@@ -694,8 +714,19 @@ static int apply_camera_control(gadget_t *g, const struct uvcd_ctrl_def *def, in
 	case UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
 		return uvcd_apply_exposure(g->pipe, &c);
 	case UVC_CT_ZOOM_ABSOLUTE_CONTROL:
-	case UVC_CT_PANTILT_ABSOLUTE_CONTROL:
-		return uvcd_apply_view(g->pipe, &c);
+	case UVC_CT_PANTILT_ABSOLUTE_CONTROL: {
+		bool changed = c.zoom != live->zoom || c.pan != live->pan || c.tilt != live->tilt;
+		int ret = uvcd_apply_view(g->pipe, &c);
+		/* Front-crop changes recreate the channel and reset its sequence,
+		 * including when a rejected change restores the previous view. */
+		if (changed) {
+			g->read_seq = 0;
+			g->watched_seq = 0;
+			g->last_frame_ms = monotonic_ms();
+			g->healthy_since_ms = 0;
+		}
+		return ret;
+	}
 	default:
 		return -EINVAL;
 	}
@@ -758,9 +789,8 @@ void uvcd_ctrl_reset(gadget_t *g)
 	if (g->restart_mjpeg)
 		encoder_restart(g, UVCD_FMT_MJPEG);
 
-	/* A factory reset is deliberate and rare -- don't let it sit in the
-	 * settle window where a power cut could lose it. */
-	config_flush(g, true);
+	/* Defaults use the same streaming health gate as host settings. */
+	config_flush(g);
 	LOGI("factory reset: all controls restored to defaults");
 }
 
@@ -1236,7 +1266,7 @@ static int start_streaming(gadget_t *g)
 	/* Bring up the ISP/encoder pipeline for exactly what was negotiated */
 	if (uvcd_pipeline_start(g->pipe, g->cur_format, g->cur_frame, g->cur_interval) != 0) {
 		LOGE("pipeline start failed for fmt=%u frame=%u", g->cur_format, g->cur_frame);
-		return -1;
+		_exit(1);
 	}
 	g->read_seq = g->pipe->frame.seq;
 
@@ -1303,6 +1333,9 @@ static int start_streaming(gadget_t *g)
 
 	g->stalled_since_ms = 0;
 	g->streaming = true;
+	g->last_frame_ms = monotonic_ms();
+	g->watched_seq = 0;
+	g->healthy_since_ms = 0;
 
 	LOGI("streaming: %s %ux%u", g->cur_format == UVCD_FMT_H264 ? "H.264" : "MJPEG",
 	     uvcd_frames[g->cur_frame].width, uvcd_frames[g->cur_frame].height);
@@ -1434,24 +1467,39 @@ static void deliver_frame(gadget_t *g)
 
 	pthread_mutex_lock(&g->pipe->frame.lock);
 	wseq = g->pipe->frame.seq;
+	bool near_limit = g->pipe->frame.jpeg_near_limit;
+	g->pipe->frame.jpeg_near_limit = false;
 	pthread_mutex_unlock(&g->pipe->frame.lock);
+	if (near_limit && g->cur_format == UVCD_FMT_MJPEG) {
+		int quality = g->pipe->controls.mjpeg_quality;
+		if (g->pipe->mjpeg_quality_limit > 0 && quality > g->pipe->mjpeg_quality_limit)
+			quality = g->pipe->mjpeg_quality_limit;
+		if (quality > 20) {
+			g->pipe->mjpeg_quality_limit = quality > 25 ? quality - 5 : 20;
+			LOGW("MJPEG near USB frame limit; reducing effective quality to %d",
+			     g->pipe->mjpeg_quality_limit);
+			encoder_restart(g, UVCD_FMT_MJPEG);
+			return;
+		}
+	}
 	if (g->read_seq >= wseq)
 		return;
 
 	idx = acquire_buffer(g);
 	if (idx < 0) {
-		if (errno != EAGAIN)
+		if (errno != EAGAIN) {
+			g->healthy_since_ms = 0;
 			return;
-		int64_t now = monotonic_ms();
-		if (!g->stalled_since_ms)
-			g->stalled_since_ms = now;
-		else if (now - g->stalled_since_ms >= UVCD_HOST_STALL_MS) {
-			LOGI("host stopped reading for %d ms without a stream stop, stopping streaming",
-			     UVCD_HOST_STALL_MS);
-			stop_streaming(g);
 		}
+		/* Keep encoding into the single latest-frame slot. A host that
+		 * resumes reading can immediately receive a fresh frame. */
+		if (!g->stalled_since_ms)
+			g->stalled_since_ms = monotonic_ms();
+		g->healthy_since_ms = 0;
 		return;
 	}
+	if (g->stalled_since_ms && g->cur_format == UVCD_FMT_H264)
+		uvcd_enc_request_keyframe(g->pipe);
 	g->stalled_since_ms = 0;
 
 	pthread_mutex_lock(&g->pipe->frame.lock);
@@ -1461,6 +1509,7 @@ static void deliver_frame(gadget_t *g)
 	skipped = wseq - g->read_seq - 1;
 	g->read_seq = wseq;
 	if (len > g->buffers[idx].length) {
+		g->healthy_since_ms = 0;
 		/* Never truncate: a cut frame decodes as garbage from the cut
 		 * onward, which is worse than the host not getting it. The
 		 * buffer stays ours for the next frame. */
@@ -1495,10 +1544,13 @@ static void deliver_frame(gadget_t *g)
 	buf.timestamp.tv_sec = (time_t)(ts_us / 1000000);
 	buf.timestamp.tv_usec = (suseconds_t)(ts_us % 1000000);
 	if (ioctl(g->fd, VIDIOC_QBUF, &buf) < 0) {
+		g->healthy_since_ms = 0;
 		LOGW("VIDIOC_QBUF: %s", strerror(errno));
 		return;
 	}
 	g->buf_queued[idx] = true;
+	if (!g->healthy_since_ms)
+		g->healthy_since_ms = monotonic_ms();
 }
 
 static int gadget_open(gadget_t *g)
@@ -1532,6 +1584,18 @@ static int gadget_open(gadget_t *g)
 	g->commit = g->probe;
 	g->buf_count = UVCD_MAX_BUFFERS;
 
+	FILE *ready = fopen("/var/run/uvcd.ready", "w");
+	if (!ready) {
+		close(g->fd);
+		g->fd = -1;
+		return -1;
+	}
+	fprintf(ready, "%ld\n", (long)getpid());
+	if (fclose(ready) != 0) {
+		close(g->fd);
+		g->fd = -1;
+		return -1;
+	}
 	LOGI("UVC device %s opened", g->device);
 	return 0;
 }
@@ -1565,16 +1629,35 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 		if (pfd.revents & POLLPRI)
 			process_events(&g);
 
-		if (g.streaming)
+		if (g.streaming) {
+			uint64_t seq;
+			pthread_mutex_lock(&p->frame.lock);
+			seq = p->frame.seq;
+			pthread_mutex_unlock(&p->frame.lock);
+			if (seq != g.watched_seq) {
+				g.watched_seq = seq;
+				g.last_frame_ms = monotonic_ms();
+			}
+			if (monotonic_ms() - g.last_frame_ms >= UVCD_FRAME_TIMEOUT_MS) {
+				LOGE("no encoded frames for %d ms; restarting daemon",
+				     UVCD_FRAME_TIMEOUT_MS);
+				/* The SDK can hang during teardown after an ISP failure.
+				 * Leave the dirty marker and let the supervisor disconnect. */
+				_exit(1);
+			}
 			deliver_frame(&g);
+		} else {
+			g.healthy_since_ms = 0;
+		}
 
-		config_flush(&g, false);
+		config_flush(&g);
 		uvcd_pipeline_tick(p);
 	}
 
+	unlink("/var/run/uvcd.ready");
 	stop_streaming(&g);
-	config_flush(&g, true);
+	config_flush(&g);
 	if (g.fd >= 0)
 		close(g.fd);
-	return 0;
+	return uvcd_running ? -1 : 0;
 }
