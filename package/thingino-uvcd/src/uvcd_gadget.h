@@ -15,14 +15,16 @@
 typedef struct gadget_s gadget_t;
 
 /* --------------------------------------------------------------------------
- * Control table -- single source of truth for ACM protocol dispatch,
+ * Control table -- single source of truth for UVC request dispatch,
  * config load/save, and RESET. `selector` is only meaningful inside
  * uvcd_gadget.c (UVC_PU_* for UVCD_CTRL_STANDARD, UVCD_CUSTOM_* for
- * UVCD_CTRL_CUSTOM); callers outside that file never need to interpret it.
+ * UVCD_CTRL_CUSTOM, UVC_CT_* for UVCD_CTRL_CAMERA); callers outside that
+ * file never need to interpret it.
  */
 typedef enum {
-	UVCD_CTRL_STANDARD,
-	UVCD_CTRL_CUSTOM,
+	UVCD_CTRL_STANDARD, /* UVC Processing Unit */
+	UVCD_CTRL_CUSTOM,   /* UVC Extension Unit 4 */
+	UVCD_CTRL_CAMERA,   /* UVC Camera Terminal */
 } uvcd_ctrl_kind_t;
 
 struct uvcd_ctrl_def {
@@ -31,6 +33,8 @@ struct uvcd_ctrl_def {
 	unsigned selector;
 	int min, max, def;
 	size_t state_offset; /* offsetof(struct uvcd_control_state, <field>) */
+	int res;       /* GET_RES reply; 0 means 1 */
+	unsigned part; /* which value within a multi-value UVC control (pan/tilt) */
 };
 
 static inline int *uvcd_ctrl_field(struct uvcd_control_state *s, const struct uvcd_ctrl_def *def)
@@ -45,7 +49,8 @@ const struct uvcd_ctrl_def *uvcd_ctrl_find(const char *name);
 /* Read the live shadow value for a control (no HAL round-trip). */
 int uvcd_ctrl_get(gadget_t *g, const struct uvcd_ctrl_def *def);
 
-/* Clamp to [def->min, def->max], push to the HAL, and update the shadow on
+/* Clamp to [def->min, def->max], push to the HAL (when it is up -- else the
+ * value is only stored, for the next bring-up), and update the shadow on
  * success. Returns 0 with *out_applied set to the value actually applied,
  * or -1 if the HAL rejected it (shadow left unchanged). */
 int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *out_applied);

@@ -9,17 +9,50 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "uvcd.h"
 
 volatile sig_atomic_t uvcd_running = 1;
+
+/* Where log lines go once daemonized. The kernel ring buffer (/dev/kmsg)
+ * rather than syslog: this image runs no syslogd, and kmsg needs no daemon
+ * at all -- `dmesg` on the debug console shows uvcd's lines interleaved with
+ * the gadget/ISP driver messages they relate to. kernel.printk keeps these
+ * levels off the UART, so they cost nothing at boot. syslog is only the
+ * fallback for a kernel without /dev/kmsg. */
+static int uvcd_log_kmsg_fd = -1;
 static bool uvcd_log_use_syslog = false;
+
+/* Debug level is dropped unless -v: the per-frame and per-event lines live
+ * there, and at 30fps they would otherwise be a steady CPU and ring-buffer
+ * tax on a single-core SoC that is busy encoding. */
+static bool uvcd_log_verbose = false;
 
 void uvcd_log(int level, const char *fmt, ...)
 {
 	va_list ap;
+
+	if (level >= UVCD_LOG_DBG && !uvcd_log_verbose)
+		return;
+
 	va_start(ap, fmt);
-	if (uvcd_log_use_syslog) {
+	if (uvcd_log_kmsg_fd >= 0) {
+		char buf[512];
+		int n = snprintf(buf, sizeof(buf), "<%d>uvcd: ", level);
+		if (n > 0 && n < (int)sizeof(buf)) {
+			int m = vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, ap);
+			size_t len = (size_t)n + (m > 0 ? (size_t)m : 0);
+			/* Keep room for the newline: without it the kernel
+			 * treats the next record as a continuation of this
+			 * one and dmesg runs them together. */
+			if (len > sizeof(buf) - 2)
+				len = sizeof(buf) - 2;
+			buf[len++] = '\n';
+			ssize_t ignored = write(uvcd_log_kmsg_fd, buf, len);
+			(void)ignored;
+		}
+	} else if (uvcd_log_use_syslog) {
 		vsyslog(level, fmt, ap);
 	} else {
 		vfprintf(stderr, fmt, ap);
@@ -61,11 +94,18 @@ int main(int argc, char **argv)
 			device = argv[++i];
 		else if (strcmp(argv[i], "-f") == 0)
 			foreground = true;
+		else if (strcmp(argv[i], "-v") == 0)
+			uvcd_log_verbose = true;
 	}
 
 	if (!foreground) {
-		uvcd_log_use_syslog = true;
-		openlog("uvcd", LOG_PID, LOG_DAEMON);
+		/* Opened before daemon(): it only redirects fds 0-2, so this
+		 * one survives into the daemon. */
+		uvcd_log_kmsg_fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+		if (uvcd_log_kmsg_fd < 0) {
+			uvcd_log_use_syslog = true;
+			openlog("uvcd", LOG_PID, LOG_DAEMON);
+		}
 		if (daemon(0, 0) != 0) {
 			LOGE("daemon() failed: %s", strerror(errno));
 			return 1;

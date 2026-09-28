@@ -17,6 +17,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <linux/videodev2.h>
 #include <linux/usb/ch9.h>
 #include <linux/usb/video.h>
@@ -51,6 +52,9 @@ struct uvc_event {
 
 #define UVC_INTF_CONTROL   0
 #define UVC_INTF_STREAMING 1
+/* Entity IDs from the gadget descriptor (kernel webcam.c). */
+#define UVCD_CAMERA_TERMINAL_ID 1
+#define UVCD_PROCESSING_UNIT_ID 2
 #define UVCD_CUSTOM_UNIT_ID 4
 #define UVCD_CUSTOM_MAX_AGAIN 1
 #define UVCD_CUSTOM_MAX_DGAIN 2
@@ -65,16 +69,29 @@ struct uvc_event {
  * control (standard and custom alike) to its compiled-in factory default.
  * GET_CUR always reads back 0 -- there is no state here to report. */
 #define UVCD_CUSTOM_RESET 10
-/* Standard V4L2 controls that UVC never standardized -- the Processing Unit
- * is modeled on an analog proc-amp, and image orientation isn't a proc-amp
- * function -- so like every other UVC vendor we carry them in the XU. */
-#define UVCD_CUSTOM_HFLIP 11
-#define UVCD_CUSTOM_VFLIP 12
+/* 11 and 12 were horizontal/vertical flip, replaced by rotation (22). Not
+ * reused, so an old host tool can't set the wrong thing by number. */
+/* Encoder settings. Bitrate and GOP apply live; the rest can only be set when
+ * the encoder channel is created, so changing them mid-stream re-creates it
+ * in place (a short gap in frames, no renegotiation with the host). */
+#define UVCD_CUSTOM_H264_BITRATE 13
+#define UVCD_CUSTOM_H264_RATE_CONTROL 14
+#define UVCD_CUSTOM_H264_GOP 15
+#define UVCD_CUSTOM_H264_MIN_QP 16
+#define UVCD_CUSTOM_H264_MAX_QP 17
+#define UVCD_CUSTOM_H264_PROFILE 18
+#define UVCD_CUSTOM_MJPEG_QUALITY 19
+/* Action control, like factory reset: SET_CUR of a non-zero value makes the
+ * H.264 encoder emit an IDR frame now. */
+#define UVCD_CUSTOM_H264_KEYFRAME 20
+/* Which part of the view auto-exposure meters on (UVCD_METERING_*). */
+#define UVCD_CUSTOM_METERING 21
+/* Image rotation, 0 or 180 degrees. UVC does standardize this, as the
+ * Camera Terminal's Roll control, but V4L2 has no control for it, so Linux
+ * hosts could never reach it there. */
+#define UVCD_CUSTOM_ROTATION 22
 #define UVCD_CUSTOM_GAIN_MIN 0
 #define UVCD_CUSTOM_GAIN_MAX 160
-#define UVCD_FLIP_MIN 0
-#define UVCD_FLIP_MAX 1
-#define UVCD_FLIP_DEF 0
 
 #define UVCD_CONTROL_MIN 0
 #define UVCD_CONTROL_MAX 255
@@ -87,7 +104,20 @@ struct uvc_event {
 #define UVCD_BACKLIGHT_DEF 0
 #define UVCD_POWER_LINE_MIN 0
 #define UVCD_POWER_LINE_MAX 2
-#define UVCD_POWER_LINE_DEF 1
+#define UVCD_POWER_LINE_DEF 0 /* off: anti-flicker holds exposure to 10 ms steps */
+
+/* What the host is told a payload may be. It must match how the gadget
+ * actually frames bulk payloads -- f_uvc.c sets max_payload_size to
+ * ep->maxpacket * 32, i.e. 512 * 32 at high speed. A host that believes
+ * payloads are larger than that relies entirely on short packets and ZLPs to
+ * find payload boundaries; matching it lets a full payload end on size too. */
+#define UVCD_BULK_PAYLOAD (512 * 32)
+
+/* A host that stops reading normally says so: it clears the halt on the
+ * streaming endpoint and the gadget raises STREAMOFF. This is only the
+ * fallback for one that just goes quiet -- long enough that a player
+ * pausing to seek or reopen is not mistaken for a host that left. */
+#define UVCD_HOST_STALL_MS 3000
 
 struct gadget_buffer {
 	void *start;
@@ -101,17 +131,24 @@ struct gadget_s {
 	int fd;
 	struct gadget_buffer buffers[UVCD_MAX_BUFFERS];
 	int buf_count;
+	/* true while the buffer is with the gadget (QBUF'd, not yet DQBUF'd).
+	 * A buffer is only ever queued once it holds a real frame. */
+	bool buf_queued[UVCD_MAX_BUFFERS];
 	bool streaming;
-	int eagain_count;
+	/* When the gadget last ran out of free buffers with a frame waiting;
+	 * 0 while buffers are coming back. */
+	int64_t stalled_since_ms;
 
 	uint8_t cur_format;
 	uint8_t cur_frame;
 	uint32_t cur_interval;
 	struct uvc_streaming_control probe;
 	struct uvc_streaming_control commit;
-	struct uvcd_control_state controls;
+	/* No control state here: the one runtime copy is g->pipe->controls,
+	 * which the pipeline also reads when it creates the encoder channel. */
 	uint8_t last_cs;
 	uint8_t last_intf;
+	uint8_t last_unit; /* entity ID, for control-interface requests */
 	uint8_t last_request;
 
 	/* Controls are persistent by default -- there is no explicit SAVE.
@@ -120,6 +157,11 @@ struct gadget_s {
 	 * flash write per burst rather than one per tick. */
 	bool config_dirty;
 	time_t config_dirty_at;
+
+	/* While a factory reset walks every control, encoder re-creation is
+	 * deferred and done once at the end instead of once per setting. */
+	bool defer_encoder_restart;
+	bool restart_h264, restart_mjpeg;
 
 	uint64_t read_seq;
 };
@@ -138,18 +180,10 @@ static void fill_streaming_control(struct uvc_streaming_control *ctrl, uint8_t f
 		frame_idx = UVCD_FRAME_1080P;
 	ctrl->bFrameIndex = frame_idx;
 
-	if (interval <= UVCD_INTERVAL_30FPS)
-		interval = UVCD_INTERVAL_30FPS;
-	else if (interval <= UVCD_INTERVAL_25FPS)
-		interval = UVCD_INTERVAL_25FPS;
-	else if (interval <= UVCD_INTERVAL_15FPS)
-		interval = UVCD_INTERVAL_15FPS;
-	else
-		interval = UVCD_INTERVAL_15FPS;
-	ctrl->dwFrameInterval = interval;
+	ctrl->dwFrameInterval = uvcd_snap_interval(interval);
 
 	ctrl->dwMaxVideoFrameSize = uvcd_frames[frame_idx].max_size;
-	ctrl->dwMaxPayloadTransferSize = 64 * 1024;
+	ctrl->dwMaxPayloadTransferSize = UVCD_BULK_PAYLOAD;
 	ctrl->bmFramingInfo = 3;
 	ctrl->bPreferedVersion = 1;
 	ctrl->bMinVersion = 1;
@@ -163,25 +197,25 @@ static int *control_value(gadget_t *g, uint8_t selector)
 {
 	switch (selector) {
 	case UVC_PU_HUE_CONTROL:
-		return &g->controls.hue;
+		return &g->pipe->controls.hue;
 	case UVC_PU_BRIGHTNESS_CONTROL:
-		return &g->controls.brightness;
+		return &g->pipe->controls.brightness;
 	case UVC_PU_CONTRAST_CONTROL:
-		return &g->controls.contrast;
+		return &g->pipe->controls.contrast;
 	case UVC_PU_SATURATION_CONTROL:
-		return &g->controls.saturation;
+		return &g->pipe->controls.saturation;
 	case UVC_PU_SHARPNESS_CONTROL:
-		return &g->controls.sharpness;
+		return &g->pipe->controls.sharpness;
 	case UVC_PU_BACKLIGHT_COMPENSATION_CONTROL:
-		return &g->controls.backlight;
+		return &g->pipe->controls.backlight;
 	case UVC_PU_POWER_LINE_FREQUENCY_CONTROL:
-		return &g->controls.power_line_frequency;
+		return &g->pipe->controls.power_line_frequency;
 	case UVC_PU_GAMMA_CONTROL:
-		return &g->controls.gamma;
+		return &g->pipe->controls.gamma;
 	case UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL:
-		return &g->controls.wb_temp;
+		return &g->pipe->controls.wb_temp;
 	case UVC_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL:
-		return &g->controls.wb_auto;
+		return &g->pipe->controls.wb_auto;
 	default:
 		return NULL;
 	}
@@ -256,10 +290,24 @@ static int apply_control(gadget_t *g, uint8_t selector, int value)
 			value = UVCD_WB_TEMP_MIN;
 		if (value > UVCD_WB_TEMP_MAX)
 			value = UVCD_WB_TEMP_MAX;
-		return uvcd_apply_wb(g->pipe, value, g->controls.wb_auto);
+		return uvcd_apply_wb(g->pipe, value, g->pipe->controls.wb_auto);
 	case UVC_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL:
 		value = value ? 1 : 0;
-		return uvcd_apply_wb(g->pipe, g->controls.wb_temp, value);
+		/* Leaving auto: start manual from the temperature auto had
+		 * measured, so the picture doesn't jump and the temperature
+		 * control reads where the light actually is. */
+		if (!value && g->pipe->controls.wb_auto) {
+			int ct = uvcd_awb_current_ct(g->pipe);
+			if (ct > 0) {
+				if (ct < UVCD_WB_TEMP_MIN)
+					ct = UVCD_WB_TEMP_MIN;
+				if (ct > UVCD_WB_TEMP_MAX)
+					ct = UVCD_WB_TEMP_MAX;
+				g->pipe->controls.wb_temp = ct;
+				LOGI("white-balance-temperature=%d (from auto)", ct);
+			}
+		}
+		return uvcd_apply_wb(g->pipe, g->pipe->controls.wb_temp, value);
 	default:
 		return -EINVAL;
 	}
@@ -269,27 +317,41 @@ static int *custom_control_value(gadget_t *g, uint8_t selector)
 {
 	switch (selector) {
 	case UVCD_CUSTOM_MAX_AGAIN:
-		return &g->controls.max_again;
+		return &g->pipe->controls.max_again;
 	case UVCD_CUSTOM_MAX_DGAIN:
-		return &g->controls.max_dgain;
+		return &g->pipe->controls.max_dgain;
 	case UVCD_CUSTOM_AE_COMP:
-		return &g->controls.ae_comp;
+		return &g->pipe->controls.ae_comp;
 	case UVCD_CUSTOM_SINTER:
-		return &g->controls.sinter;
+		return &g->pipe->controls.sinter;
 	case UVCD_CUSTOM_TEMPER:
-		return &g->controls.temper;
+		return &g->pipe->controls.temper;
 	case UVCD_CUSTOM_DPC:
-		return &g->controls.dpc;
+		return &g->pipe->controls.dpc;
 	case UVCD_CUSTOM_DRC:
-		return &g->controls.drc;
+		return &g->pipe->controls.drc;
 	case UVCD_CUSTOM_DEFOG:
-		return &g->controls.defog;
+		return &g->pipe->controls.defog;
 	case UVCD_CUSTOM_HIGHLIGHT:
-		return &g->controls.highlight;
-	case UVCD_CUSTOM_HFLIP:
-		return &g->controls.hflip;
-	case UVCD_CUSTOM_VFLIP:
-		return &g->controls.vflip;
+		return &g->pipe->controls.highlight;
+	case UVCD_CUSTOM_METERING:
+		return &g->pipe->controls.metering;
+	case UVCD_CUSTOM_ROTATION:
+		return &g->pipe->controls.rotation;
+	case UVCD_CUSTOM_H264_BITRATE:
+		return &g->pipe->controls.h264_bitrate_kbps;
+	case UVCD_CUSTOM_H264_RATE_CONTROL:
+		return &g->pipe->controls.h264_rate_control;
+	case UVCD_CUSTOM_H264_GOP:
+		return &g->pipe->controls.h264_gop_frames;
+	case UVCD_CUSTOM_H264_MIN_QP:
+		return &g->pipe->controls.h264_min_qp;
+	case UVCD_CUSTOM_H264_MAX_QP:
+		return &g->pipe->controls.h264_max_qp;
+	case UVCD_CUSTOM_H264_PROFILE:
+		return &g->pipe->controls.h264_profile;
+	case UVCD_CUSTOM_MJPEG_QUALITY:
+		return &g->pipe->controls.mjpeg_quality;
 	default:
 		return NULL;
 	}
@@ -319,6 +381,12 @@ static int custom_control_def(uint8_t selector)
 	return def ? def->def : UVCD_CUSTOM_GAIN_MIN;
 }
 
+static int custom_control_res(uint8_t selector)
+{
+	const struct uvcd_ctrl_def *def = custom_ctrl_def(selector);
+	return def && def->res ? def->res : 1;
+}
+
 static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
 {
 	if (value < custom_control_min(selector))
@@ -345,10 +413,26 @@ static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_defog_strength, g->pipe->hal_ctx, value);
 	case UVCD_CUSTOM_HIGHLIGHT:
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_highlight_depress, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_HFLIP:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_hflip, g->pipe->hal_ctx, value ? 1 : 0);
-	case UVCD_CUSTOM_VFLIP:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_vflip, g->pipe->hal_ctx, value ? 1 : 0);
+	case UVCD_CUSTOM_METERING: {
+		struct uvcd_control_state c = g->pipe->controls;
+		c.metering = value;
+		return uvcd_apply_metering(g->pipe, &c);
+	}
+	case UVCD_CUSTOM_ROTATION: {
+		struct uvcd_control_state c = g->pipe->controls;
+		c.rotation = value;
+		return uvcd_apply_rotation(g->pipe, &c);
+	}
+	case UVCD_CUSTOM_H264_BITRATE:
+	case UVCD_CUSTOM_H264_RATE_CONTROL:
+	case UVCD_CUSTOM_H264_GOP:
+	case UVCD_CUSTOM_H264_MIN_QP:
+	case UVCD_CUSTOM_H264_MAX_QP:
+	case UVCD_CUSTOM_H264_PROFILE:
+	case UVCD_CUSTOM_MJPEG_QUALITY:
+		/* The pipeline reads these from the stored state, so they take
+		 * effect in encoder_after_store(), once the value is in place. */
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -361,53 +445,95 @@ static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
  * apply_custom_control() above; they're re-clamped there too, so a mismatch
  * would only ever narrow the effective range, never widen it.
  */
+/* One control-table row. Only a few rows need .res or .part, so they are
+ * named where used and zero everywhere else. */
+#define UVCD_CTRL_ROW(n, k, sel, lo, hi, dv, field, ...)                                  \
+	{.name = (n), .kind = (k), .selector = (sel), .min = (lo), .max = (hi), .def = (dv),   \
+	 .state_offset = offsetof(struct uvcd_control_state, field), __VA_ARGS__}
+
 static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
-	{"brightness", UVCD_CTRL_STANDARD, UVC_PU_BRIGHTNESS_CONTROL, UVCD_CONTROL_MIN,
-	 UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, offsetof(struct uvcd_control_state, brightness)},
-	{"contrast", UVCD_CTRL_STANDARD, UVC_PU_CONTRAST_CONTROL, UVCD_CONTROL_MIN,
-	 UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, offsetof(struct uvcd_control_state, contrast)},
-	{"saturation", UVCD_CTRL_STANDARD, UVC_PU_SATURATION_CONTROL, UVCD_CONTROL_MIN,
-	 UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, offsetof(struct uvcd_control_state, saturation)},
-	{"sharpness", UVCD_CTRL_STANDARD, UVC_PU_SHARPNESS_CONTROL, UVCD_CONTROL_MIN,
-	 UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, offsetof(struct uvcd_control_state, sharpness)},
-	{"hue", UVCD_CTRL_STANDARD, UVC_PU_HUE_CONTROL, UVCD_HUE_MIN, UVCD_HUE_MAX, UVCD_HUE_DEF,
-	 offsetof(struct uvcd_control_state, hue)},
-	{"backlight", UVCD_CTRL_STANDARD, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL,
-	 UVCD_BACKLIGHT_MIN, UVCD_BACKLIGHT_MAX, UVCD_BACKLIGHT_DEF,
-	 offsetof(struct uvcd_control_state, backlight)},
-	{"power-line-frequency", UVCD_CTRL_STANDARD, UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
-	 UVCD_POWER_LINE_MIN, UVCD_POWER_LINE_MAX, UVCD_POWER_LINE_DEF,
-	 offsetof(struct uvcd_control_state, power_line_frequency)},
-	{"gamma", UVCD_CTRL_STANDARD, UVC_PU_GAMMA_CONTROL, UVCD_GAMMA_MIN, UVCD_GAMMA_MAX,
-	 UVCD_GAMMA_DEF, offsetof(struct uvcd_control_state, gamma)},
-	{"white-balance-temperature", UVCD_CTRL_STANDARD,
-	 UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL, UVCD_WB_TEMP_MIN, UVCD_WB_TEMP_MAX,
-	 UVCD_WB_TEMP_DEF, offsetof(struct uvcd_control_state, wb_temp)},
-	{"white-balance-auto", UVCD_CTRL_STANDARD,
-	 UVC_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL, 0, 1, UVCD_WB_AUTO_DEF,
-	 offsetof(struct uvcd_control_state, wb_auto)},
-	{"hflip", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_HFLIP, UVCD_FLIP_MIN, UVCD_FLIP_MAX,
-	 UVCD_FLIP_DEF, offsetof(struct uvcd_control_state, hflip)},
-	{"vflip", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_VFLIP, UVCD_FLIP_MIN, UVCD_FLIP_MAX,
-	 UVCD_FLIP_DEF, offsetof(struct uvcd_control_state, vflip)},
-	{"max-again", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_AGAIN, UVCD_CUSTOM_GAIN_MIN,
-	 UVCD_CUSTOM_GAIN_MAX, 160, offsetof(struct uvcd_control_state, max_again)},
-	{"max-dgain", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_DGAIN, UVCD_CUSTOM_GAIN_MIN,
-	 UVCD_CUSTOM_GAIN_MAX, 80, offsetof(struct uvcd_control_state, max_dgain)},
-	{"ae-comp", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_AE_COMP, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, ae_comp)},
-	{"sinter", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_SINTER, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, sinter)},
-	{"temper", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_TEMPER, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, temper)},
-	{"dpc", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DPC, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, dpc)},
-	{"drc", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DRC, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, drc)},
-	{"defog", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DEFOG, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, defog)},
-	{"highlight", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_HIGHLIGHT, 0, 255, 128,
-	 offsetof(struct uvcd_control_state, highlight)},
+	UVCD_CTRL_ROW("brightness", UVCD_CTRL_STANDARD, UVC_PU_BRIGHTNESS_CONTROL,
+		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, brightness),
+	UVCD_CTRL_ROW("contrast", UVCD_CTRL_STANDARD, UVC_PU_CONTRAST_CONTROL,
+		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, contrast),
+	UVCD_CTRL_ROW("saturation", UVCD_CTRL_STANDARD, UVC_PU_SATURATION_CONTROL,
+		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, saturation),
+	UVCD_CTRL_ROW("sharpness", UVCD_CTRL_STANDARD, UVC_PU_SHARPNESS_CONTROL,
+		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, sharpness),
+	UVCD_CTRL_ROW("hue", UVCD_CTRL_STANDARD, UVC_PU_HUE_CONTROL,
+		      UVCD_HUE_MIN, UVCD_HUE_MAX, UVCD_HUE_DEF, hue),
+	UVCD_CTRL_ROW("backlight", UVCD_CTRL_STANDARD, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL,
+		      UVCD_BACKLIGHT_MIN, UVCD_BACKLIGHT_MAX, UVCD_BACKLIGHT_DEF, backlight),
+	UVCD_CTRL_ROW("power-line-frequency", UVCD_CTRL_STANDARD, UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+		      UVCD_POWER_LINE_MIN, UVCD_POWER_LINE_MAX, UVCD_POWER_LINE_DEF, power_line_frequency),
+	UVCD_CTRL_ROW("gamma", UVCD_CTRL_STANDARD, UVC_PU_GAMMA_CONTROL,
+		      UVCD_GAMMA_MIN, UVCD_GAMMA_MAX, UVCD_GAMMA_DEF, gamma),
+	UVCD_CTRL_ROW("white-balance-temperature", UVCD_CTRL_STANDARD,
+		      UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL,
+		      UVCD_WB_TEMP_MIN, UVCD_WB_TEMP_MAX, UVCD_WB_TEMP_DEF, wb_temp),
+	UVCD_CTRL_ROW("white-balance-auto", UVCD_CTRL_STANDARD,
+		      UVC_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL,
+		      0, 1, UVCD_WB_AUTO_DEF, wb_auto),
+	/* Camera Terminal. auto-exposure holds the UVC bitmap value (1 or 8),
+	 * so its GET_RES is the set of modes supported. */
+	UVCD_CTRL_ROW("auto-exposure", UVCD_CTRL_CAMERA, UVC_CT_AE_MODE_CONTROL,
+		      UVCD_AE_MANUAL, UVCD_AE_APERTURE_PRIORITY, UVCD_AE_APERTURE_PRIORITY, ae_mode,
+		      .res = UVCD_AE_MODES),
+	UVCD_CTRL_ROW("exposure-priority", UVCD_CTRL_CAMERA, UVC_CT_AE_PRIORITY_CONTROL,
+		      0, 1, 0, ae_priority),
+	UVCD_CTRL_ROW("exposure-time", UVCD_CTRL_CAMERA, UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL,
+		      UVCD_EXPOSURE_MIN, UVCD_EXPOSURE_MAX, UVCD_EXPOSURE_DEF, exposure_time),
+	UVCD_CTRL_ROW("zoom", UVCD_CTRL_CAMERA, UVC_CT_ZOOM_ABSOLUTE_CONTROL,
+		      UVCD_ZOOM_MIN, UVCD_ZOOM_MAX, UVCD_ZOOM_DEF, zoom),
+	UVCD_CTRL_ROW("pan", UVCD_CTRL_CAMERA, UVC_CT_PANTILT_ABSOLUTE_CONTROL,
+		      -UVCD_PANTILT_MAX, UVCD_PANTILT_MAX, 0, pan, .res = UVCD_PANTILT_RES, .part = 0),
+	UVCD_CTRL_ROW("tilt", UVCD_CTRL_CAMERA, UVC_CT_PANTILT_ABSOLUTE_CONTROL,
+		      -UVCD_PANTILT_MAX, UVCD_PANTILT_MAX, 0, tilt, .res = UVCD_PANTILT_RES, .part = 1),
+	/* Extension Unit 4. Named for what each knob does. */
+	UVCD_CTRL_ROW("exposure-compensation", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_AE_COMP,
+		      0, 255, 128, ae_comp),
+	UVCD_CTRL_ROW("max-analog-gain", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_AGAIN,
+		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_GAIN_MAX, 160, max_again),
+	UVCD_CTRL_ROW("max-digital-gain", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_DGAIN,
+		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_GAIN_MAX, 80, max_dgain),
+	/* Above the tuning's own 128: measured on the K1 indoors (AE at ~20x
+	 * gain), 192 cuts temporal noise ~37% for ~10% edge detail and makes
+	 * MJPEG frames ~20% smaller; 0-128 look alike. */
+	UVCD_CTRL_ROW("spatial-denoise", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_SINTER,
+		      0, 255, 192, sinter),
+	UVCD_CTRL_ROW("temporal-denoise", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_TEMPER,
+		      0, 255, 128, temper),
+	UVCD_CTRL_ROW("defective-pixel-correction", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DPC,
+		      0, 255, 128, dpc),
+	UVCD_CTRL_ROW("dynamic-range-compression", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DRC,
+		      0, 255, 128, drc),
+	UVCD_CTRL_ROW("defog-strength", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DEFOG,
+		      0, 255, 128, defog),
+	/* Not a 128-centred ratio like the knobs above: the SDK takes 0-10,
+	 * 0 = off. At the old 0-255/128 it ran flat out, exposing for the
+	 * brightest spot and leaving the rest of the picture black. */
+	UVCD_CTRL_ROW("highlight-suppression", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_HIGHLIGHT,
+		      0, 10, 0, highlight),
+	UVCD_CTRL_ROW("metering", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_METERING,
+		      UVCD_METERING_TUNING, UVCD_METERING_SPOT, UVCD_METERING_TUNING, metering),
+	UVCD_CTRL_ROW("rotation", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_ROTATION,
+		      0, 180, 0, rotation, .res = 180),
+
+	/* Encoder. Ranges fit the XU's 16-bit value, hence kbps. */
+	UVCD_CTRL_ROW("h264-bitrate-kbps", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_BITRATE,
+		      0, 16000, 0, h264_bitrate_kbps),
+	UVCD_CTRL_ROW("h264-rate-control", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_RATE_CONTROL,
+		      UVCD_H264_RC_CBR, UVCD_H264_RC_CAPPED_VBR, UVCD_H264_RC_CBR, h264_rate_control),
+	UVCD_CTRL_ROW("h264-gop-frames", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_GOP,
+		      0, 300, 0, h264_gop_frames),
+	UVCD_CTRL_ROW("h264-min-qp", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_MIN_QP,
+		      -1, 51, -1, h264_min_qp),
+	UVCD_CTRL_ROW("h264-max-qp", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_MAX_QP,
+		      -1, 51, -1, h264_max_qp),
+	UVCD_CTRL_ROW("h264-profile", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_PROFILE,
+		      0, 2, 2, h264_profile),
+	UVCD_CTRL_ROW("mjpeg-quality", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MJPEG_QUALITY,
+		      1, 100, 80, mjpeg_quality),
 };
 #define UVCD_CTRL_DEF_COUNT (sizeof(uvcd_ctrl_defs) / sizeof(uvcd_ctrl_defs[0]))
 
@@ -421,13 +547,20 @@ const struct uvcd_ctrl_def *uvcd_ctrl_at(size_t i)
 	return i < UVCD_CTRL_DEF_COUNT ? &uvcd_ctrl_defs[i] : NULL;
 }
 
-static const struct uvcd_ctrl_def *ctrl_def_by_selector(uvcd_ctrl_kind_t kind, uint8_t selector)
+static const struct uvcd_ctrl_def *ctrl_def_part(uvcd_ctrl_kind_t kind, uint8_t selector,
+						 unsigned part)
 {
 	for (size_t i = 0; i < UVCD_CTRL_DEF_COUNT; i++) {
-		if (uvcd_ctrl_defs[i].kind == kind && uvcd_ctrl_defs[i].selector == selector)
-			return &uvcd_ctrl_defs[i];
+		const struct uvcd_ctrl_def *d = &uvcd_ctrl_defs[i];
+		if (d->kind == kind && d->selector == selector && d->part == part)
+			return d;
 	}
 	return NULL;
+}
+
+static const struct uvcd_ctrl_def *ctrl_def_by_selector(uvcd_ctrl_kind_t kind, uint8_t selector)
+{
+	return ctrl_def_part(kind, selector, 0);
 }
 
 static const struct uvcd_ctrl_def *custom_ctrl_def(uint8_t selector)
@@ -462,7 +595,7 @@ static void config_flush(gadget_t *g, bool force)
 	if (!force && time(NULL) - g->config_dirty_at < UVCD_CONFIG_SETTLE_SECS)
 		return;
 
-	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->controls) != 0) {
+	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls) != 0) {
 		LOGW("persist %s: %s", UVCD_CONFIG_PATH, strerror(errno));
 		/* Don't spin retrying a write that keeps failing (read-only
 		 * rootfs, full flash): drop the flag and let the next accepted
@@ -486,7 +619,97 @@ const struct uvcd_ctrl_def *uvcd_ctrl_find(const char *name)
 
 int uvcd_ctrl_get(gadget_t *g, const struct uvcd_ctrl_def *def)
 {
-	return *uvcd_ctrl_field(&g->controls, def);
+	return *uvcd_ctrl_field(&g->pipe->controls, def);
+}
+
+/* Encoder settings whose value the pipeline reads from the stored state. */
+static void encoder_restart(gadget_t *g, uint8_t format)
+{
+	if (g->defer_encoder_restart) {
+		if (format == UVCD_FMT_H264)
+			g->restart_h264 = true;
+		else
+			g->restart_mjpeg = true;
+		return;
+	}
+	/* The pipeline's frame sequence restarts at 0, so resync the reader or
+	 * it would wait for the old count to be passed again. */
+	if (uvcd_pipeline_restart_encoder(g->pipe, format))
+		g->read_seq = 0;
+}
+
+static void encoder_after_store(gadget_t *g, uint8_t selector)
+{
+	int ret = 0;
+
+	switch (selector) {
+	case UVCD_CUSTOM_H264_BITRATE:
+		ret = uvcd_enc_apply_bitrate(g->pipe);
+		break;
+	case UVCD_CUSTOM_H264_GOP:
+		ret = uvcd_enc_apply_gop(g->pipe);
+		break;
+	case UVCD_CUSTOM_H264_RATE_CONTROL:
+	case UVCD_CUSTOM_H264_MIN_QP:
+	case UVCD_CUSTOM_H264_MAX_QP:
+	case UVCD_CUSTOM_H264_PROFILE:
+		encoder_restart(g, UVCD_FMT_H264);
+		break;
+	case UVCD_CUSTOM_MJPEG_QUALITY:
+		encoder_restart(g, UVCD_FMT_MJPEG);
+		break;
+	default:
+		break;
+	}
+	/* Stored either way: a setting the live encoder refused still applies
+	 * from the next stream start. */
+	if (ret != 0)
+		LOGW("encoder did not take selector %u live (%d); applies next stream", selector,
+		     ret);
+}
+
+/* Camera Terminal controls. The pipeline applies them from a whole control
+ * state, so hand it a copy with the new value in place. */
+static int apply_camera_control(gadget_t *g, const struct uvcd_ctrl_def *def, int value)
+{
+	struct uvcd_control_state *live = &g->pipe->controls;
+
+	/* Leaving auto-exposure: start manual from the exposure auto was
+	 * using, so the picture doesn't jump -- as for white balance. */
+	if (def->selector == UVC_CT_AE_MODE_CONTROL && value == UVCD_AE_MANUAL &&
+	    live->ae_mode != UVCD_AE_MANUAL) {
+		int t = uvcd_live_exposure(g->pipe);
+		if (t > 0) {
+			live->exposure_time = t > UVCD_EXPOSURE_MAX ? UVCD_EXPOSURE_MAX : t;
+			LOGI("exposure-time=%d (from auto)", live->exposure_time);
+		}
+	}
+
+	struct uvcd_control_state c = *live;
+	*uvcd_ctrl_field(&c, def) = value;
+
+	switch (def->selector) {
+	case UVC_CT_AE_MODE_CONTROL:
+	case UVC_CT_AE_PRIORITY_CONTROL:
+	case UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
+		return uvcd_apply_exposure(g->pipe, &c);
+	case UVC_CT_ZOOM_ABSOLUTE_CONTROL:
+	case UVC_CT_PANTILT_ABSOLUTE_CONTROL:
+		return uvcd_apply_view(g->pipe, &c);
+	default:
+		return -EINVAL;
+	}
+}
+
+/* Controls whose values mean one of a few things: store the meaning, not
+ * whatever in-between number arrived. */
+static int normalize_value(const struct uvcd_ctrl_def *def, int value)
+{
+	if (def->kind == UVCD_CTRL_CUSTOM && def->selector == UVCD_CUSTOM_ROTATION)
+		return value >= 90 ? 180 : 0;
+	if (def->kind == UVCD_CTRL_CAMERA && def->selector == UVC_CT_AE_MODE_CONTROL)
+		return value == UVCD_AE_MANUAL ? UVCD_AE_MANUAL : UVCD_AE_APERTURE_PRIORITY;
+	return value;
 }
 
 int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *out_applied)
@@ -495,14 +718,26 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 		value = def->min;
 	if (value > def->max)
 		value = def->max;
+	value = normalize_value(def, value);
 
-	int ret = (def->kind == UVCD_CTRL_STANDARD) ? apply_control(g, def->selector, value)
-						     : apply_custom_control(g, def->selector, value);
+	/* With the sensor/ISP down (no stream) there is nothing to apply to:
+	 * store the value and let the next bring-up push it with the rest. */
+	int ret = 0;
+	if (uvcd_pipeline_hal_up(g->pipe)) {
+		if (def->kind == UVCD_CTRL_STANDARD)
+			ret = apply_control(g, def->selector, value);
+		else if (def->kind == UVCD_CTRL_CAMERA)
+			ret = apply_camera_control(g, def, value);
+		else
+			ret = apply_custom_control(g, def->selector, value);
+	}
 	if (ret != 0)
 		return -1;
 
-	*uvcd_ctrl_field(&g->controls, def) = value;
+	*uvcd_ctrl_field(&g->pipe->controls, def) = value;
 	config_mark_dirty(g);
+	if (def->kind == UVCD_CTRL_CUSTOM)
+		encoder_after_store(g, (uint8_t)def->selector);
 	if (out_applied)
 		*out_applied = value;
 	return 0;
@@ -510,11 +745,19 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 
 void uvcd_ctrl_reset(gadget_t *g)
 {
+	g->defer_encoder_restart = true;
+	g->restart_h264 = g->restart_mjpeg = false;
 	for (size_t i = 0; i < UVCD_CTRL_DEF_COUNT; i++) {
 		int applied;
 		if (uvcd_ctrl_set(g, &uvcd_ctrl_defs[i], uvcd_ctrl_defs[i].def, &applied) != 0)
 			LOGW("reset: HAL rejected default for %s", uvcd_ctrl_defs[i].name);
 	}
+	g->defer_encoder_restart = false;
+	if (g->restart_h264)
+		encoder_restart(g, UVCD_FMT_H264);
+	if (g->restart_mjpeg)
+		encoder_restart(g, UVCD_FMT_MJPEG);
+
 	/* A factory reset is deliberate and rare -- don't let it sit in the
 	 * settle window where a power cut could lose it. */
 	config_flush(g, true);
@@ -527,7 +770,7 @@ static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	uint8_t selector = req->wValue >> 8;
 	int16_t value;
 	uint16_t len;
-	bool is_action = (selector == UVCD_CUSTOM_RESET);
+	bool is_action = (selector == UVCD_CUSTOM_RESET || selector == UVCD_CUSTOM_H264_KEYFRAME);
 	int *current = is_action ? NULL : custom_control_value(g, selector);
 
 	if (!is_action && current == NULL) {
@@ -541,7 +784,8 @@ static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 			return;
 		}
 		g->last_cs = selector;
-		g->last_intf = UVCD_CUSTOM_UNIT_ID;
+		g->last_intf = UVC_INTF_CONTROL;
+		g->last_unit = UVCD_CUSTOM_UNIT_ID;
 		g->last_request = req->bRequest;
 		resp->length = req->wLength;
 		return;
@@ -561,7 +805,8 @@ static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 			value = req->bRequest == UVC_GET_CUR ? *current :
 				req->bRequest == UVC_GET_MIN ? custom_control_min(selector) :
 				req->bRequest == UVC_GET_MAX ? custom_control_max(selector) :
-				req->bRequest == UVC_GET_DEF ? custom_control_def(selector) : 1;
+				req->bRequest == UVC_GET_DEF ? custom_control_def(selector) :
+				custom_control_res(selector);
 		}
 		len = req->wLength < sizeof(value) ? req->wLength : sizeof(value);
 		memcpy(resp->data, &value, len);
@@ -613,6 +858,7 @@ static void handle_control_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 		}
 		g->last_cs = selector;
 		g->last_intf = UVC_INTF_CONTROL;
+		g->last_unit = UVCD_PROCESSING_UNIT_ID;
 		g->last_request = req->bRequest;
 		resp->length = length;
 		return;
@@ -656,6 +902,160 @@ static void handle_control_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	}
 }
 
+/* Camera Terminal. Control sizes are fixed by UVC, and pan/tilt is one
+ * control carrying two values, so a reply is built part by part. */
+static uint16_t camera_control_length(uint8_t selector)
+{
+	switch (selector) {
+	case UVC_CT_AE_MODE_CONTROL:
+	case UVC_CT_AE_PRIORITY_CONTROL:
+		return 1;
+	case UVC_CT_ZOOM_ABSOLUTE_CONTROL:
+		return 2;
+	case UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
+		return 4;
+	case UVC_CT_PANTILT_ABSOLUTE_CONTROL:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+static unsigned camera_control_parts(uint8_t selector)
+{
+	return selector == UVC_CT_PANTILT_ABSOLUTE_CONTROL ? 2 : 1;
+}
+
+static void put_le(uint8_t *out, int value, unsigned size)
+{
+	for (unsigned i = 0; i < size; i++)
+		out[i] = (uint8_t)((uint32_t)value >> (8 * i));
+}
+
+static int get_le_signed(const uint8_t *in, unsigned size)
+{
+	uint32_t v = 0;
+	for (unsigned i = 0; i < size; i++)
+		v |= (uint32_t)in[i] << (8 * i);
+	if (size < 4 && (v & (1u << (8 * size - 1))))
+		v |= ~0u << (8 * size); /* sign-extend */
+	return (int)v;
+}
+
+static void handle_camera_setup(gadget_t *g, const struct usb_ctrlrequest *req,
+				struct uvc_request_data *resp)
+{
+	uint8_t selector = req->wValue >> 8;
+	uint16_t size = camera_control_length(selector);
+	unsigned parts = camera_control_parts(selector);
+
+	if (size == 0 || !ctrl_def_part(UVCD_CTRL_CAMERA, selector, 0)) {
+		resp->length = -1;
+		return;
+	}
+
+	if (!(req->bRequestType & USB_DIR_IN)) {
+		if (req->bRequest != UVC_SET_CUR) {
+			resp->length = -1;
+			return;
+		}
+		g->last_cs = selector;
+		g->last_intf = UVC_INTF_CONTROL;
+		g->last_unit = UVCD_CAMERA_TERMINAL_ID;
+		g->last_request = req->bRequest;
+		resp->length = req->wLength;
+		return;
+	}
+
+	uint8_t buf[8] = {0};
+	uint16_t len;
+
+	switch (req->bRequest) {
+	case UVC_GET_CUR:
+	case UVC_GET_MIN:
+	case UVC_GET_MAX:
+	case UVC_GET_RES:
+	case UVC_GET_DEF:
+		for (unsigned i = 0; i < parts; i++) {
+			const struct uvcd_ctrl_def *d = ctrl_def_part(UVCD_CTRL_CAMERA, selector, i);
+			int v;
+			switch (req->bRequest) {
+			case UVC_GET_CUR:
+				v = uvcd_ctrl_get(g, d);
+				/* Under auto-exposure, report the exposure auto is
+				 * actually using. */
+				if (selector == UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL &&
+				    g->pipe->controls.ae_mode != UVCD_AE_MANUAL) {
+					int t = uvcd_live_exposure(g->pipe);
+					if (t > 0)
+						v = t;
+				}
+				break;
+			case UVC_GET_MIN:
+				v = d->min;
+				break;
+			case UVC_GET_MAX:
+				v = d->max;
+				break;
+			case UVC_GET_RES:
+				v = d->res ? d->res : 1;
+				break;
+			default:
+				v = d->def;
+				break;
+			}
+			put_le(buf + i * (size / parts), v, size / parts);
+		}
+		len = req->wLength < size ? req->wLength : size;
+		memcpy(resp->data, buf, len);
+		resp->length = len;
+		break;
+	case UVC_GET_INFO: {
+		uint8_t info = UVC_CONTROL_CAP_GET | UVC_CONTROL_CAP_SET;
+		if (selector == UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL)
+			info |= UVC_CONTROL_CAP_AUTOUPDATE;
+		len = req->wLength < sizeof(info) ? req->wLength : sizeof(info);
+		memcpy(resp->data, &info, len);
+		resp->length = len;
+		break;
+	}
+	case UVC_GET_LEN:
+		put_le(buf, size, 2);
+		len = req->wLength < 2 ? req->wLength : 2;
+		memcpy(resp->data, buf, len);
+		resp->length = len;
+		break;
+	default:
+		resp->length = -1;
+		break;
+	}
+}
+
+static void handle_camera_data(gadget_t *g, const struct uvc_request_data *data)
+{
+	uint8_t selector = g->last_cs;
+	uint16_t size = camera_control_length(selector);
+	unsigned parts = camera_control_parts(selector);
+
+	if (size == 0 || data->length < (int32_t)size) {
+		LOGW("short camera control data selector=%u length=%d", selector, data->length);
+		return;
+	}
+	for (unsigned i = 0; i < parts; i++) {
+		const struct uvcd_ctrl_def *d = ctrl_def_part(UVCD_CTRL_CAMERA, selector, i);
+		int value = get_le_signed(data->data + i * (size / parts), size / parts);
+		int applied;
+
+		if (!d)
+			return;
+		if (uvcd_ctrl_set(g, d, value, &applied) != 0) {
+			LOGW("HAL rejected %s=%d", d->name, value);
+			continue;
+		}
+		LOGI("%s=%d", d->name, applied);
+	}
+}
+
 static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 {
 	struct uvc_request_data resp;
@@ -669,16 +1069,26 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 	uint8_t unit = req->wIndex >> 8;
 	uint8_t intf = req->wIndex & 0xff;
 	uint16_t wLength = req->wLength;
-	LOGI("UVC SETUP type=%02x req=%02x value=%04x index=%04x length=%u",
+	LOGD("UVC SETUP type=%02x req=%02x value=%04x index=%04x length=%u",
 	     type, request, req->wValue, req->wIndex, wLength);
 
-	if (intf == UVC_INTF_CONTROL && unit == UVCD_CUSTOM_UNIT_ID) {
-		handle_custom_setup(g, req, &resp);
-		goto send;
-	}
-
 	if (intf == UVC_INTF_CONTROL) {
-		handle_control_setup(g, req, &resp);
+		switch (unit) {
+		case UVCD_CUSTOM_UNIT_ID:
+			handle_custom_setup(g, req, &resp);
+			break;
+		case UVCD_PROCESSING_UNIT_ID:
+			handle_control_setup(g, req, &resp);
+			break;
+		case UVCD_CAMERA_TERMINAL_ID:
+			handle_camera_setup(g, req, &resp);
+			break;
+		default:
+			/* Interface-level requests (e.g. the error code
+			 * control) and the output terminal: nothing here. */
+			resp.length = -1;
+			break;
+		}
 		goto send;
 	}
 
@@ -702,13 +1112,13 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 			break;
 		case UVC_GET_MIN:
 			fill_streaming_control(&sc, UVCD_FMT_MJPEG, UVCD_FRAME_360P,
-					       UVCD_INTERVAL_15FPS);
+					       UVCD_INTERVAL_30FPS);
 			memcpy(resp.data, &sc, len);
 			resp.length = len;
 			break;
 		case UVC_GET_MAX:
 			fill_streaming_control(&sc, UVCD_FMT_H264, UVCD_FRAME_1080P,
-					       UVCD_INTERVAL_30FPS);
+					       UVCD_INTERVAL_5FPS);
 			memcpy(resp.data, &sc, len);
 			resp.length = len;
 			break;
@@ -728,70 +1138,32 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 		g->last_intf = intf;
 		g->last_request = request;
 		resp.length = wLength;
-		LOGI("UVC OUT request=%02x cs=%u awaiting DATA", request, cs);
+		LOGD("UVC OUT request=%02x cs=%u awaiting DATA", request, cs);
 	}
 
 send:
-	LOGI("UVC RESPONSE length=%d", resp.length);
+	LOGD("UVC RESPONSE length=%d", resp.length);
 	if (ioctl(g->fd, UVCIOC_SEND_RESPONSE, &resp) < 0) {
 		LOGW("UVCIOC_SEND_RESPONSE: %s", strerror(errno));
 		return;
 	}
-	LOGI("UVC RESPONSE sent");
+	LOGD("UVC RESPONSE sent");
 }
 
 static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 {
-	if (g->last_intf == UVCD_CUSTOM_UNIT_ID && g->last_request == UVC_SET_CUR &&
-	    g->last_cs == UVCD_CUSTOM_RESET) {
+	if (g->last_request == UVC_SET_CUR && g->last_intf == UVC_INTF_CONTROL) {
+		if (g->last_unit == UVCD_CAMERA_TERMINAL_ID) {
+			handle_camera_data(g, data);
+			return;
+		}
+		bool xu = (g->last_unit == UVCD_CUSTOM_UNIT_ID);
+		int32_t need = xu ? (int32_t)sizeof(int16_t) : (int32_t)control_length(g->last_cs);
 		int16_t value = 0;
 
-		if (data->length >= (int32_t)sizeof(value))
-			memcpy(&value, data->data, sizeof(value));
-		else if (data->length >= 1)
-			value = data->data[0];
-
-		if (value == 0) {
-			LOGI("factory reset requested with value 0, ignoring");
-			return;
-		}
-		uvcd_ctrl_reset(g);
-		return;
-	}
-
-	if (g->last_intf == UVCD_CUSTOM_UNIT_ID && g->last_request == UVC_SET_CUR) {
-		int16_t value;
-		int *current = custom_control_value(g, g->last_cs);
-
-		if (current == NULL || data->length < (int32_t)sizeof(value)) {
-			LOGW("invalid custom control selector=%u length=%d", g->last_cs,
-			     data->length);
-			return;
-		}
-		memcpy(&value, data->data, sizeof(value));
-		if (apply_custom_control(g, g->last_cs, value) != 0) {
-			LOGW("HAL rejected custom control selector=%u value=%d", g->last_cs, value);
-			return;
-		}
-		if (value < custom_control_min(g->last_cs))
-			value = custom_control_min(g->last_cs);
-		if (value > custom_control_max(g->last_cs))
-			value = custom_control_max(g->last_cs);
-		*current = value;
-		config_mark_dirty(g);
-		LOGI("custom control selector=%u value=%d", g->last_cs, value);
-		return;
-	}
-
-	if (g->last_intf == UVC_INTF_CONTROL && g->last_request == UVC_SET_CUR) {
-		int16_t value;
-		int *current = control_value(g, g->last_cs);
-		const struct uvcd_ctrl_def *cdef = standard_ctrl_def(g->last_cs);
-		int32_t need = (int32_t)control_length(g->last_cs);
-
-		if (current == NULL || cdef == NULL || data->length < need) {
-			LOGW("invalid UVC control data selector=%u length=%d", g->last_cs,
-			     data->length);
+		if (data->length < need) {
+			LOGW("short control data unit=%s selector=%u length=%d", xu ? "xu" : "pu",
+			     g->last_cs, data->length);
 			return;
 		}
 		if (need == 1)
@@ -799,17 +1171,32 @@ static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 		else
 			memcpy(&value, data->data, sizeof(value));
 
-		if (apply_control(g, g->last_cs, value) != 0) {
-			LOGW("HAL rejected UVC control selector=%u value=%d", g->last_cs, value);
+		/* Actions: a non-zero write triggers them, nothing is stored. */
+		if (xu && g->last_cs == UVCD_CUSTOM_RESET) {
+			if (value != 0)
+				uvcd_ctrl_reset(g);
 			return;
 		}
-		if (value < cdef->min)
-			value = cdef->min;
-		if (value > cdef->max)
-			value = cdef->max;
-		*current = value;
-		config_mark_dirty(g);
-		LOGI("UVC control selector=%u value=%d", g->last_cs, value);
+		if (xu && g->last_cs == UVCD_CUSTOM_H264_KEYFRAME) {
+			if (value != 0 && uvcd_enc_request_keyframe(g->pipe) != 0)
+				LOGW("keyframe request failed");
+			return;
+		}
+
+		/* Settings: one path for both units -- clamp, apply, store,
+		 * persist, and any encoder follow-up -- shared with the reset. */
+		const struct uvcd_ctrl_def *def =
+			xu ? custom_ctrl_def(g->last_cs) : standard_ctrl_def(g->last_cs);
+		int applied;
+		if (def == NULL) {
+			LOGW("unknown control unit=%s selector=%u", xu ? "xu" : "pu", g->last_cs);
+			return;
+		}
+		if (uvcd_ctrl_set(g, def, value, &applied) != 0) {
+			LOGW("HAL rejected %s=%d", def->name, value);
+			return;
+		}
+		LOGI("%s=%d", def->name, applied);
 		return;
 	}
 
@@ -818,7 +1205,7 @@ static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 		(g->last_cs == UVC_VS_COMMIT_CONTROL) ? &g->commit : &g->probe;
 
 	memcpy(&proposed, data->data, sizeof(proposed));
-	LOGI("UVC DATA format=%u frame=%u interval=%u", proposed.bFormatIndex,
+	LOGD("UVC DATA format=%u frame=%u interval=%u", proposed.bFormatIndex,
 	     proposed.bFrameIndex, proposed.dwFrameInterval);
 	fill_streaming_control(target, proposed.bFormatIndex, proposed.bFrameIndex,
 			       proposed.dwFrameInterval);
@@ -900,11 +1287,12 @@ static int start_streaming(gadget_t *g)
 			goto err_unmap;
 		}
 
-		buf.bytesused = 1;
-		if (ioctl(g->fd, VIDIOC_QBUF, &buf) < 0) {
-			LOGE("VIDIOC_QBUF %d: %s", i, strerror(errno));
-			goto err_unmap;
-		}
+		/* Not queued: a buffer goes to the gadget only once it holds a
+		 * real frame (see deliver_frame). Priming the queue with
+		 * placeholder buffers sends the host that many garbage frames
+		 * the moment streaming starts. STREAMON with an empty queue is
+		 * fine -- the gadget's pump idles until the first QBUF. */
+		g->buf_queued[i] = false;
 	}
 
 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -913,7 +1301,7 @@ static int start_streaming(gadget_t *g)
 		goto err_unmap;
 	}
 
-	g->eagain_count = 0;
+	g->stalled_since_ms = 0;
 	g->streaming = true;
 
 	LOGI("streaming: %s %ux%u", g->cur_format == UVCD_FMT_H264 ? "H.264" : "MJPEG",
@@ -957,7 +1345,8 @@ static void stop_streaming(gadget_t *g)
 
 	g->streaming = false;
 
-	/* True on-demand: no host means no ISP/encoder work at all */
+	/* True on-demand: the channels go now, the sensor/ISP once
+	 * uvcd_pipeline_tick() sees no stream for UVCD_HAL_LINGER_MS. */
 	uvcd_pipeline_stop(g->pipe);
 	LOGI("streaming stopped, pipeline released");
 }
@@ -968,7 +1357,7 @@ static void process_events(gadget_t *g)
 
 	while (ioctl(g->fd, VIDIOC_DQEVENT, &ev) == 0) {
 		struct uvc_event *uvc_ev = (struct uvc_event *)&ev.u.data;
-		LOGI("UVC EVENT type=%u", ev.type);
+		LOGD("UVC EVENT type=%u", ev.type);
 
 		switch (ev.type) {
 		case UVC_EVENT_CONNECT:
@@ -998,65 +1387,118 @@ static void process_events(gadget_t *g)
 			break;
 		}
 	}
-	if (errno != EAGAIN)
+	/* An empty queue is ENOENT on this kernel (EAGAIN on newer ones). */
+	if (errno != EAGAIN && errno != ENOENT)
 		LOGW("VIDIOC_DQEVENT: %s", strerror(errno));
+}
+
+static int64_t monotonic_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* A buffer userspace owns and may fill, or -1 with errno set. Unqueued
+ * buffers are used first; once every buffer is with the gadget, reclaim
+ * whichever the host has finished with. */
+static int acquire_buffer(gadget_t *g)
+{
+	struct v4l2_buffer buf;
+
+	for (int i = 0; i < g->buf_count; i++) {
+		if (!g->buf_queued[i])
+			return i;
+	}
+
+	memset(&buf, 0, sizeof(buf));
+	buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	buf.memory = V4L2_MEMORY_MMAP;
+	if (ioctl(g->fd, VIDIOC_DQBUF, &buf) < 0)
+		return -1;
+	if (buf.index >= (unsigned)g->buf_count) {
+		errno = EINVAL;
+		return -1;
+	}
+	g->buf_queued[buf.index] = false;
+	return (int)buf.index;
 }
 
 static void deliver_frame(gadget_t *g)
 {
 	struct v4l2_buffer buf;
-	uint64_t wseq;
+	uint64_t wseq, skipped;
 	uint32_t len;
+	int64_t ts_us;
+	int idx;
 
 	pthread_mutex_lock(&g->pipe->frame.lock);
 	wseq = g->pipe->frame.seq;
-	if (g->read_seq >= wseq) {
-		pthread_mutex_unlock(&g->pipe->frame.lock);
+	pthread_mutex_unlock(&g->pipe->frame.lock);
+	if (g->read_seq >= wseq)
+		return;
+
+	idx = acquire_buffer(g);
+	if (idx < 0) {
+		if (errno != EAGAIN)
+			return;
+		int64_t now = monotonic_ms();
+		if (!g->stalled_since_ms)
+			g->stalled_since_ms = now;
+		else if (now - g->stalled_since_ms >= UVCD_HOST_STALL_MS) {
+			LOGI("host stopped reading for %d ms without a stream stop, stopping streaming",
+			     UVCD_HOST_STALL_MS);
+			stop_streaming(g);
+		}
 		return;
 	}
+	g->stalled_since_ms = 0;
+
+	pthread_mutex_lock(&g->pipe->frame.lock);
+	wseq = g->pipe->frame.seq;
+	len = g->pipe->frame.len;
+	ts_us = g->pipe->frame.ts_us;
+	skipped = wseq - g->read_seq - 1;
+	g->read_seq = wseq;
+	if (len > g->buffers[idx].length) {
+		/* Never truncate: a cut frame decodes as garbage from the cut
+		 * onward, which is worse than the host not getting it. The
+		 * buffer stays ours for the next frame. */
+		pthread_mutex_unlock(&g->pipe->frame.lock);
+		LOGW("frame of %u bytes exceeds the %zu-byte buffer, dropped", len,
+		     g->buffers[idx].length);
+		/* Every H.264 frame after this one references what the host
+		 * never got; start a fresh chain now instead of at the GOP. */
+		uvcd_enc_request_keyframe(g->pipe);
+		return;
+	}
+	memcpy(g->buffers[idx].start, g->pipe->frame.data, len);
 	pthread_mutex_unlock(&g->pipe->frame.lock);
+
+	/* The handoff keeps only the newest frame, which is harmless for MJPEG
+	 * but not for H.264: a skipped P-frame breaks the reference chain and
+	 * the host shows errors until the next IDR. Say so rather than let it
+	 * look like USB corruption. */
+	if (skipped && g->cur_format == UVCD_FMT_H264)
+		LOGW("H.264: %llu frame(s) skipped before seq %llu; expect decode errors until the next IDR",
+		     (unsigned long long)skipped, (unsigned long long)wseq);
+
+	LOGD("delivering frame seq=%llu len=%u format=%u frame=%u",
+	     (unsigned long long)wseq, len, g->cur_format, g->cur_frame);
 
 	memset(&buf, 0, sizeof(buf));
 	buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	buf.memory = V4L2_MEMORY_MMAP;
-
-	if (ioctl(g->fd, VIDIOC_DQBUF, &buf) < 0) {
-		if (errno == EAGAIN) {
-			if (++g->eagain_count >= 100) {
-				LOGI("no host consumer, stopping streaming");
-				stop_streaming(g);
-			}
-		}
-		return;
-	}
-	g->eagain_count = 0;
-
-	if (buf.index >= (unsigned)g->buf_count) {
-		ioctl(g->fd, VIDIOC_QBUF, &buf);
-		return;
-	}
-
-	pthread_mutex_lock(&g->pipe->frame.lock);
-	wseq = g->pipe->frame.seq;
-	if (g->read_seq >= wseq) {
-		pthread_mutex_unlock(&g->pipe->frame.lock);
-		LOGW("frame disappeared after DQBUF index=%u", buf.index);
-		ioctl(g->fd, VIDIOC_QBUF, &buf);
-		return;
-	}
-
-	len = g->pipe->frame.len;
-	LOGI("delivering frame seq=%llu len=%u format=%u frame=%u",
-	     (unsigned long long)wseq, len, g->cur_format, g->cur_frame);
-	if (len > g->buffers[buf.index].length)
-		len = (uint32_t)g->buffers[buf.index].length;
-	memcpy(g->buffers[buf.index].start, g->pipe->frame.data, len);
-	g->read_seq = wseq;
-	pthread_mutex_unlock(&g->pipe->frame.lock);
-
+	buf.index = (unsigned)idx;
 	buf.bytesused = len;
-	if (ioctl(g->fd, VIDIOC_QBUF, &buf) < 0)
+	/* Capture time; the gadget sends it to the host as the frame's PTS. */
+	buf.timestamp.tv_sec = (time_t)(ts_us / 1000000);
+	buf.timestamp.tv_usec = (suseconds_t)(ts_us % 1000000);
+	if (ioctl(g->fd, VIDIOC_QBUF, &buf) < 0) {
 		LOGW("VIDIOC_QBUF: %s", strerror(errno));
+		return;
+	}
+	g->buf_queued[idx] = true;
 }
 
 static int gadget_open(gadget_t *g)
@@ -1076,7 +1518,7 @@ static int gadget_open(gadget_t *g)
 	memset(&sub, 0, sizeof(sub));
 	for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); i++) {
 		sub.type = events[i];
-		LOGI("subscribing UVC event type=%u", sub.type);
+		LOGD("subscribing UVC event type=%u", sub.type);
 		if (ioctl(g->fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
 			LOGE("subscribe event %u: %s", events[i], strerror(errno));
 			close(g->fd);
@@ -1088,10 +1530,6 @@ static int gadget_open(gadget_t *g)
 
 	fill_streaming_control(&g->probe, UVCD_FMT_MJPEG, UVCD_FRAME_1080P, UVCD_INTERVAL_30FPS);
 	g->commit = g->probe;
-	/* uvcd_pipeline_init() already loaded these from UVCD_CONFIG_PATH (or
-	 * compiled-in defaults) and pushed them to the HAL -- reuse the same
-	 * values here instead of a second hardcoded copy. */
-	g->controls = g->pipe->controls;
 	g->buf_count = UVCD_MAX_BUFFERS;
 
 	LOGI("UVC device %s opened", g->device);
@@ -1122,7 +1560,7 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 			break;
 		}
 		if (n > 0)
-			LOGI("UVC poll revents=%04x", pfd.revents);
+			LOGD("UVC poll revents=%04x", pfd.revents);
 
 		if (pfd.revents & POLLPRI)
 			process_events(&g);
@@ -1131,6 +1569,7 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 			deliver_frame(&g);
 
 		config_flush(&g, false);
+		uvcd_pipeline_tick(p);
 	}
 
 	stop_streaming(&g);

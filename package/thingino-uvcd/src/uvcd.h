@@ -2,11 +2,13 @@
  * uvcd.h -- minimal fixed-function ISP -> UVC webcam daemon
  *
  * Single process, single sensor (GC2083 on T31), single active video
- * pipeline. No SHM rings, no IPC, no config file, no control socket --
- * state transitions are driven only by standard UVC PROBE/COMMIT/
- * STREAMON/STREAMOFF requests from the USB host. When no host is
- * attached, the framesource and encoder channels are fully torn down
- * (not just idle): no ISP/encoder cycles are spent with nobody reading.
+ * pipeline. No SHM rings, no IPC, no control socket -- state transitions
+ * are driven only by standard UVC PROBE/COMMIT/STREAMON/STREAMOFF requests
+ * from the USB host, and settings arrive only as UVC controls. The daemon
+ * saves those itself to UVCD_CONFIG_PATH and reloads them at startup
+ * (uvcd_config.c). When no host is streaming, the framesource and encoder
+ * channels are torn down at once, and the sensor, ISP and IMP system follow
+ * after UVCD_HAL_LINGER_MS: an idle camera does no imaging work at all.
  */
 #ifndef UVCD_H
 #define UVCD_H
@@ -18,7 +20,8 @@
 #include <raptor_hal.h>
 
 /* --------------------------------------------------------------------------
- * Logging -- syslog only, no daemon framework
+ * Logging -- kernel ring buffer (/dev/kmsg) when daemonized, stderr in the
+ * foreground; see uvcd_main.c. No daemon framework.
  */
 void uvcd_log(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 #define UVCD_LOG_ERR  3
@@ -54,9 +57,26 @@ struct uvcd_frame_info {
 
 extern const struct uvcd_frame_info uvcd_frames[UVCD_NUM_FRAMES + 1];
 
+/* Frame intervals (100 ns units) offered in every frame descriptor of the
+ * gadget (kernel webcam.c), fastest first. The two lists must match: the
+ * host picks from the descriptor, the daemon snaps to this table. Any rate
+ * the GC2083 driver accepts (5-30 fps) could go here. */
+#define UVCD_NUM_INTERVALS 6
+extern const uint32_t uvcd_intervals[UVCD_NUM_INTERVALS];
 #define UVCD_INTERVAL_30FPS 333333
-#define UVCD_INTERVAL_25FPS 400000
-#define UVCD_INTERVAL_15FPS 666666
+#define UVCD_INTERVAL_5FPS 2000000
+
+/* The listed interval closest to `interval`, and the whole frame rate an
+ * interval stands for. */
+uint32_t uvcd_snap_interval(uint32_t interval);
+uint32_t uvcd_interval_fps(uint32_t interval);
+
+/* How long the sensor/ISP stay up after the last stream stops. Bringing
+ * them back costs about half a second before the first frame, and hosts
+ * routinely close and reopen a stream within a second or two (players
+ * seeking, browsers enumerating, Windows' frame server), so each of those
+ * would otherwise pay it. */
+#define UVCD_HAL_LINGER_MS 5000
 
 #define UVCD_MAX_BUFFERS 4
 #define UVCD_ENC_CHN 0
@@ -81,8 +101,17 @@ struct uvcd_control_state {
 	int gamma;    /* gamma * 100, UVC/V4L2 convention (100 == 1.0) */
 	int wb_temp;  /* white balance, Kelvin */
 	int wb_auto;  /* 0 = manual (use wb_temp), 1 = auto white balance */
-	int hflip;
-	int vflip;
+
+	/* Camera Terminal */
+	int ae_mode;       /* UVCD_AE_* -- the UVC bitmap value, not V4L2's menu index */
+	int ae_priority;   /* 0 = frame rate constant, 1 = may slow down for exposure */
+	int exposure_time; /* manual exposure, 100 us units (UVC convention) */
+	int zoom;          /* 100 = full view, 400 = 4x digital zoom */
+	int pan;           /* arc-seconds, + = right; moves the zoomed view */
+	int tilt;          /* arc-seconds, + = up */
+
+	int rotation; /* 0 or 180 degrees */
+	int metering; /* UVCD_METERING_* */
 	int max_again;
 	int max_dgain;
 	int ae_comp;
@@ -92,7 +121,49 @@ struct uvcd_control_state {
 	int drc;
 	int defog;
 	int highlight;
+
+	/* Encoder. Read by the pipeline when it creates the encoder channel;
+	 * the ones T31 can change at runtime are also applied live. */
+	int h264_bitrate_kbps; /* 0 = per-resolution default (uvcd_frames) */
+	int h264_rate_control; /* UVCD_H264_RC_* */
+	int h264_gop_frames;   /* 0 = one second at the negotiated frame rate */
+	int h264_min_qp;       /* -1 = SDK default */
+	int h264_max_qp;       /* -1 = SDK default */
+	int h264_profile;      /* 0 = baseline, 1 = main, 2 = high */
+	int mjpeg_quality;     /* 1..100, higher is better */
 };
+
+/* Auto-exposure modes, as UVC's CT_AE_MODE bitmap. There is no iris, so
+ * "aperture priority" -- exposure time automatic -- is what auto means here,
+ * as on most webcams. */
+#define UVCD_AE_MANUAL 1
+#define UVCD_AE_APERTURE_PRIORITY 8
+#define UVCD_AE_MODES (UVCD_AE_MANUAL | UVCD_AE_APERTURE_PRIORITY) /* GET_RES */
+
+/* Manual exposure time, 100 us units. The ISP takes microseconds in a 16-bit
+ * field, which caps it at 65.5 ms. */
+#define UVCD_EXPOSURE_MIN 1
+#define UVCD_EXPOSURE_MAX 655
+#define UVCD_EXPOSURE_DEF 333
+
+/* Digital zoom and pan/tilt, done by cropping the sensor image before the
+ * scaler. Pan/tilt move the crop within whatever the zoom leaves spare; at
+ * zoom 100 there is nothing to move. */
+#define UVCD_ZOOM_MIN 100
+#define UVCD_ZOOM_MAX 400
+#define UVCD_ZOOM_DEF 100
+#define UVCD_PANTILT_MAX 36000 /* +-10 degrees, spanning the whole spare range */
+#define UVCD_PANTILT_RES 3600
+
+/* Which part of the (visible) picture auto-exposure meters on. */
+#define UVCD_METERING_TUNING 0 /* the sensor tuning file's own weights */
+#define UVCD_METERING_AVERAGE 1
+#define UVCD_METERING_CENTER 2
+#define UVCD_METERING_SPOT 3
+
+#define UVCD_H264_RC_CBR 0
+#define UVCD_H264_RC_VBR 1
+#define UVCD_H264_RC_CAPPED_VBR 2
 
 /* Gamma is a 129-point curve in the HAL, but a single scalar in UVC/V4L2.
  * The ISP's factory curve is read once at init and used as the reference
@@ -103,8 +174,8 @@ struct uvcd_control_state {
 #define UVCD_GAMMA_DEF 100 /* 1.0 -- writes the factory curve back unchanged */
 
 /* White balance is a mode + RGB gains in the HAL, but a colour temperature
- * in UVC/V4L2. The sensor only offers discrete presets, so a requested
- * temperature snaps to the nearest one -- see uvcd_apply_wb(). */
+ * in UVC/V4L2. Manual mode computes the gains from a model of the sensor's
+ * white locus -- see uvcd_apply_wb(). */
 #define UVCD_WB_TEMP_MIN 2800
 #define UVCD_WB_TEMP_MAX 7500
 #define UVCD_WB_TEMP_DEF 5500
@@ -122,6 +193,7 @@ struct uvcd_frame_buf {
 	uint32_t size;     /* allocated capacity */
 	uint32_t len;      /* valid bytes */
 	uint64_t seq;      /* bumped on every publish; consumer tracks last seen */
+	int64_t ts_us;     /* capture time, CLOCK_MONOTONIC microseconds */
 	bool is_key;
 };
 
@@ -133,11 +205,36 @@ typedef struct {
 	const rss_hal_ops_t *ops;
 	const rss_hal_caps_t *caps;
 
+	/* Sensor identity, read from procfs once at init and handed to every
+	 * HAL bring-up. */
+	rss_sensor_config_t sensor;
 	int sensor_w, sensor_h;
 
-	/* ISP control values in effect -- loaded from UVCD_CONFIG_PATH (or
-	 * compiled-in defaults) before the HAL is initialized, and re-used by
-	 * gadget_open() to seed the UVC/ACM live shadow. */
+	/* Sensor + ISP + IMP system initialized (hal init done). Brought up by
+	 * uvcd_pipeline_start(), taken down by uvcd_pipeline_idle() once no
+	 * channel has been configured for UVCD_HAL_LINGER_MS. */
+	bool hal_up;
+	int64_t idle_since_ms; /* 0 = not counting */
+
+	/* The rate the sensor is actually running at, which exposure priority
+	 * may hold below the negotiated one. 0 = not set since bring-up. */
+	uint32_t sensor_fps;
+	int64_t priority_checked_ms;
+
+	/* The part of the sensor image the channel shows (zoom/pan/tilt),
+	 * sensor pixels. Metering weights follow it. */
+	struct {
+		int x, y, w, h;
+	} view;
+
+	/* The tuning file's own metering weights, read at the first bring-up,
+	 * for UVCD_METERING_TUNING. */
+	uint8_t ae_weight_ref[15][15];
+	bool ae_weight_ref_valid;
+
+	/* The one runtime copy of every control -- loaded from UVCD_CONFIG_PATH
+	 * (or compiled-in defaults) at init, changed in place by the gadget's
+	 * control paths, and read here when the encoder channel is created. */
 	struct uvcd_control_state controls;
 
 	/* The ISP's factory gamma curve, read once after HAL init. Scaling
@@ -153,6 +250,10 @@ typedef struct {
 	uint8_t cur_format; /* UVCD_FMT_* */
 	uint8_t cur_frame;  /* UVCD_FRAME_* */
 	uint32_t cur_interval;
+
+	/* The SDK's frame timestamps were rebased onto CLOCK_MONOTONIC at
+	 * start; if not, frames are stamped when the pump receives them. */
+	bool ts_rebased;
 
 	pthread_t pump_tid;
 	volatile sig_atomic_t pump_run;
@@ -170,14 +271,57 @@ void uvcd_pipeline_deinit(uvcd_pipeline_t *p);
 int uvcd_apply_gamma(uvcd_pipeline_t *p, int gamma_x100);
 int uvcd_apply_wb(uvcd_pipeline_t *p, int temp_kelvin, int auto_on);
 
-/* Bring up FS+encoder for (format,frame) if not already configured for it,
- * then enable the channel and start the pump thread. Idempotent. */
+/* Camera Terminal and orientation controls. Each takes the full control
+ * state rather than one value, so a caller can apply a change before
+ * storing it (uvcd_ctrl_set stores only what the ISP accepted). Exposure
+ * and the view also need a configured channel for the frame rate and the
+ * output size; without one they apply what they can and the rest follows
+ * at the next stream start. */
+int uvcd_apply_exposure(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
+int uvcd_apply_view(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
+int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
+int uvcd_apply_rotation(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
+
+/* The exposure time auto-exposure is using now, 100 us units, or -1. */
+int uvcd_live_exposure(uvcd_pipeline_t *p);
+
+/* The colour temperature the ISP's auto white balance currently measures,
+ * in Kelvin, or -1 when the HAL is down or the ISP won't say. */
+int uvcd_awb_current_ct(uvcd_pipeline_t *p);
+
+/* Encoder settings. Each returns 0 when the setting is stored for the next
+ * channel creation and, where T31 allows it, already applied live. */
+int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p);
+int uvcd_enc_apply_gop(uvcd_pipeline_t *p);
+int uvcd_enc_request_keyframe(uvcd_pipeline_t *p);
+
+/* Recreate the encoder channel with the current settings, keeping the
+ * negotiated format/frame/interval, for settings T31 can only take at
+ * channel creation. No-op unless running `format`. The frame sequence
+ * restarts at 0; the caller must resync anything that tracks it. */
+bool uvcd_pipeline_restart_encoder(uvcd_pipeline_t *p, uint8_t format);
+
+/* Bring up the sensor/ISP if they are down, then FS+encoder for
+ * (format,frame) if not already configured for it, then enable the channel
+ * and start the pump thread. Idempotent. */
 int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 			uint32_t interval);
 
-/* Stop the pump thread and fully tear down FS+encoder (true on-demand --
- * zero ISP/encoder cycles spent while no USB host is attached). */
+/* Stop the pump thread and fully tear down FS+encoder. The sensor/ISP stay
+ * up until uvcd_pipeline_idle() lets them go. */
 void uvcd_pipeline_stop(uvcd_pipeline_t *p);
+
+/* Call periodically from the main loop: runs exposure priority while
+ * streaming, and takes the sensor, ISP and IMP system down once no channel
+ * has been configured for UVCD_HAL_LINGER_MS. */
+void uvcd_pipeline_tick(uvcd_pipeline_t *p);
+
+/* True while the HAL is initialized. ISP calls are only valid then; while it
+ * is down, controls are stored and applied at the next bring-up. */
+static inline bool uvcd_pipeline_hal_up(const uvcd_pipeline_t *p)
+{
+	return p->hal_up;
+}
 
 /* --------------------------------------------------------------------------
  * Gadget (UVC + kernel webcam device) -- uvcd_gadget.c
