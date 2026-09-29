@@ -54,6 +54,12 @@ int uvcd_ctrl_get(gadget_t *g, const struct uvcd_ctrl_def *def);
  * success. Returns 0 with *out_applied set to the value actually applied,
  * or -1 if the HAL rejected it (shadow left unchanged). */
 int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *out_applied);
+int uvcd_ctrl_save(gadget_t *g, const struct uvcd_ctrl_def *def);
+int uvcd_ctrl_apply_saved(gadget_t *g);
+int uvcd_set_apply_on_boot(gadget_t *g, bool on);
+bool uvcd_get_apply_on_boot(gadget_t *g);
+bool uvcd_ctrl_get_saved(gadget_t *g, const struct uvcd_ctrl_def *def, int *value);
+int uvcd_ctrl_keyframe(gadget_t *g);
 
 /* Restore every control to its compiled-in factory default and persist the
  * result immediately. Reachable from the host as UVC XU selector 10. */

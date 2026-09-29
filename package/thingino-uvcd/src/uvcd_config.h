@@ -15,7 +15,8 @@ void uvcd_config_defaults(struct uvcd_control_state *out);
 /* Seed *out with defaults, then override from path if it exists. A missing
  * file, or missing/unrecognized/out-of-range keys within it, are not
  * errors -- the corresponding field is just left at its default. */
-void uvcd_config_load(const char *path, struct uvcd_control_state *out);
+void uvcd_config_load(const char *path, struct uvcd_control_state *saved,
+		      uint64_t *saved_mask, bool *apply_on_boot);
 
 /* Atomically write *in to path as flat "name=value" lines (temp file +
  * fsync + rename). Returns 0 on success, -1 on failure (errno set).
@@ -23,7 +24,8 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *out);
  * Controls are persistent by default, so there is no host-visible SAVE:
  * uvcd_gadget.c calls this after accepted changes have survived ten
  * seconds of healthy streaming. Idle changes remain in RAM. */
-int uvcd_config_save(const char *path, const struct uvcd_control_state *in);
+int uvcd_config_save(const char *path, const struct uvcd_control_state *saved,
+		     uint64_t saved_mask, bool apply_on_boot);
 
 /* Crash guard (uvcd_gadget.c): while a stream has not yet proven healthy,
  * UVCD_CONFIG_DIRTY_PATH holds how many streams in a row started without

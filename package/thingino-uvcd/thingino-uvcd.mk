@@ -28,18 +28,26 @@ define THINGINO_UVCD_BUILD_CMDS
 	$(TARGET_CC) $(TARGET_CFLAGS) -Wall -Wextra -std=gnu11 -D_GNU_SOURCE \
 		-Os -flto -ffunction-sections -fdata-sections \
 		-I$(STAGING_DIR)/usr/include \
+		-c $(@D)/uvcd_ctl.c -o $(@D)/uvcd_ctl.o
+	$(TARGET_CC) $(TARGET_CFLAGS) -Wall -Wextra -std=gnu11 -D_GNU_SOURCE \
+		-Os -flto -ffunction-sections -fdata-sections \
+		-I$(STAGING_DIR)/usr/include \
 		-c $(@D)/uvcd_main.c -o $(@D)/uvcd_main.o
 	$(TARGET_CC) $(TARGET_LDFLAGS) -Os -flto -Wl,--gc-sections \
 		-Wl,-z,max-page-size=0x1000 \
 		$(@D)/uvcd_pipeline.o $(@D)/uvcd_gadget.o \
-		$(@D)/uvcd_config.o $(@D)/uvcd_main.o \
+		$(@D)/uvcd_config.o $(@D)/uvcd_ctl.o $(@D)/uvcd_main.o \
 		-L$(STAGING_DIR)/usr/lib -L$(TARGET_DIR)/usr/lib -lraptor_hal_video \
 		-limp -lalog $(THINGINO_UVCD_SHIM) -lpthread -lrt -latomic -lm \
 		-o $(@D)/uvcd
+	$(TARGET_CC) $(TARGET_CFLAGS) -Wall -Wextra -std=gnu11 -D_GNU_SOURCE \
+		-Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+		$(THINGINO_UVCD_PKGDIR)/uvcdctl/uvcdctl.c -o $(@D)/uvcdctl
 endef
 
 define THINGINO_UVCD_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/uvcd $(TARGET_DIR)/usr/bin/uvcd
+	$(INSTALL) -D -m 0755 $(@D)/uvcdctl $(TARGET_DIR)/usr/bin/uvcdctl
 	$(INSTALL) -D -m 0755 $(THINGINO_UVCD_PKGDIR)/files/S31uvcd \
 		$(TARGET_DIR)/etc/init.d/S31uvcd
 endef

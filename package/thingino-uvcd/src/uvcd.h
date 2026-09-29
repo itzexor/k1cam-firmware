@@ -242,10 +242,12 @@ typedef struct {
 	uint8_t ae_weight_ref[15][15];
 	bool ae_weight_ref_valid;
 
-	/* The one runtime copy of every control -- loaded from UVCD_CONFIG_PATH
-	 * (or compiled-in defaults) at init, changed in place by the gadget's
-	 * control paths, and read here when the encoder channel is created. */
+	/* Live controls start at factory defaults. Saved controls are a sparse
+	 * overlay, applied at startup only when explicitly enabled. */
 	struct uvcd_control_state controls;
+	struct uvcd_control_state saved;
+	uint64_t saved_mask;
+	bool apply_on_boot;
 	/* Streams in a row that started without proving healthy, from the
 	 * crash guard file (uvcd_config.h); 0 once one does. */
 	int unproven_streak;

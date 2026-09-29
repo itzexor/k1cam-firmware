@@ -29,10 +29,13 @@ void uvcd_log(int level, const char *fmt, ...)
 	(void)fmt;
 }
 
-int uvcd_config_save(const char *path, const struct uvcd_control_state *c)
+int uvcd_config_save(const char *path, const struct uvcd_control_state *c,
+		     uint64_t mask, bool boot)
 {
 	(void)path;
 	(void)c;
+	(void)mask;
+	(void)boot;
 	saves++;
 	return 0;
 }
@@ -51,6 +54,19 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
 	idrs++;
 	return 0;
 }
+
+#define STUB_APPLY(name) int name(uvcd_pipeline_t *p, const struct uvcd_control_state *c) \
+	{ (void)p; (void)c; return 0; }
+int uvcd_apply_gamma(uvcd_pipeline_t *p, int v) { (void)p; (void)v; return 0; }
+int uvcd_apply_wb(uvcd_pipeline_t *p, int v, int a) { (void)p; (void)v; (void)a; return 0; }
+int uvcd_awb_current_ct(uvcd_pipeline_t *p) { (void)p; return -1; }
+int uvcd_live_exposure(uvcd_pipeline_t *p) { (void)p; return -1; }
+int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p) { (void)p; return 0; }
+int uvcd_enc_apply_gop(uvcd_pipeline_t *p) { (void)p; return 0; }
+STUB_APPLY(uvcd_apply_metering)
+STUB_APPLY(uvcd_apply_rotation)
+STUB_APPLY(uvcd_apply_exposure)
+STUB_APPLY(uvcd_apply_view)
 
 int test_ioctl(int fd, unsigned long request, ...)
 {
@@ -84,10 +100,14 @@ int main(void)
 	assert(standard_ctrl_def(UVC_PU_BACKLIGHT_COMPENSATION_CONTROL) == NULL);
 	assert(control_value(&g, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL) == NULL);
 	assert(custom_ctrl_def(8) == NULL && custom_control_value(&g, 8) == NULL);
-	config_mark_dirty(&g);
-	g.config_dirty_at -= 20000;
-	config_flush(&g);
-	assert(saves == 0 && g.config_dirty); /* Idle values never persist. */
+	int applied;
+	const struct uvcd_ctrl_def *brightness = uvcd_ctrl_find("brightness");
+	assert(uvcd_ctrl_set(&g, brightness, 150, &applied) == 0 && applied == 150);
+	assert(saves == 0 && p.saved_mask == 0); /* Generic sets are transient. */
+	assert(uvcd_ctrl_save(&g, brightness) == 0);
+	assert(saves == 1 && p.saved_mask != 0 && p.saved.brightness == 150);
+	p.controls.brightness = 128;
+	assert(uvcd_ctrl_apply_saved(&g) == 0 && p.controls.brightness == 150);
 	assert(streak_writes == 0 && unlinks == 0); /* ...and idle is never a crash. */
 
 	/* A stream is counted in the crash guard from its start, once, on top
@@ -100,19 +120,14 @@ int main(void)
 	g.streaming = true;
 	g.healthy_since_ms = monotonic_ms() - 9000;
 	g.last_frame_ms = monotonic_ms();
-	config_flush(&g);
-	assert(saves == 0 && g.guard_armed && unlinks == 0);
+	stream_guard_tick(&g);
+	assert(saves == 1 && g.guard_armed && unlinks == 0);
 	g.healthy_since_ms -= 2000;
-	config_flush(&g);
-	assert(saves == 1 && !g.config_dirty);
+	stream_guard_tick(&g);
 	/* Proven healthy: the guard file goes and the streak resets. */
 	assert(!g.guard_armed && p.unproven_streak == 0 && unlinks == 1);
 	stream_guard_clear(&g);
 	assert(unlinks == 1); /* nothing armed, nothing to clear */
-	config_mark_dirty(&g);
-	assert(g.healthy_since_ms == 0);
-	config_flush(&g);
-	assert(saves == 1); /* A change invalidates the previous health window. */
 
 	uint8_t data[] = {1, 2, 3, 4}, output[4] = {0};
 	p.frame.data = data;
