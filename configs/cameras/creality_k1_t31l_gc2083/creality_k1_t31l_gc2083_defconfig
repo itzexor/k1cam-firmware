@@ -1,9 +1,14 @@
 # NAME: Creality K1 Camera (T31L, GC2083, USB)
-# FRAG: soc-xburst1 core ssl
+# FRAG: soc-xburst1 core
 BR2_ETHERNET=n
 BR2_INGENIC_SOC_MODEL="t31l"
 BR2_LINUX_KERNEL_CUSTOM_REPO_URL="$(BR2_EXTERNAL_THINGINO_PATH)/../thingino-linux"
-BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="82b1d37742e59c1492c3416ea923419d350f8037"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="7ce676caffc36bb27ed0bd39446c3b1dbb03ed67"
+BR2_PACKAGE_DROPBEAR=n
+BR2_PACKAGE_IFUPDOWN_SCRIPTS=n
+BR2_PACKAGE_INGENIC_DIAG_TOOLS=n
+BR2_PACKAGE_INGENIC_PWM=n
+BR2_PACKAGE_LIBIMP_DEBUG=n
 BR2_PACKAGE_MDNSD=n
 BR2_PACKAGE_MDNSD_HTTP_SERVICE=n
 BR2_PACKAGE_TELEGRAMBOT=n
@@ -12,18 +17,24 @@ BR2_PACKAGE_THINGINO_DIAG=n
 BR2_PACKAGE_THINGINO_HA=n
 BR2_PACKAGE_THINGINO_KOPT_DWC2=y
 BR2_PACKAGE_THINGINO_KOPT_DWC2_OTG=y
+BR2_PACKAGE_THINGINO_KOPT_IPV6=n
+BR2_PACKAGE_THINGINO_KOPT_LEDS=n
+BR2_PACKAGE_THINGINO_LIBCURL=n
 BR2_PACKAGE_THINGINO_MOSQUITTO_20X=n
+BR2_PACKAGE_THINGINO_SSL_NONE=y
 BR2_PACKAGE_THINGINO_STREAMER_NONE=y
 BR2_PACKAGE_THINGINO_SYSUPGRADE=n
 BR2_PACKAGE_THINGINO_UVCD=y
 BR2_PACKAGE_THINGINO_VPN_NONE=y
 BR2_PACKAGE_THINGINO_VPN_WIREGUARD=n
 BR2_PACKAGE_THINGINO_WEBSERVER_NONE=y
+BR2_PACKAGE_USBNET=n
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_THINGINO_PATH)/scripts/rootfs_script.sh $(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/post-build.sh"
 BR2_SENSOR_1_NAME="gc2083"
 BR2_THINGINO_AUDIO=n
 BR2_THINGINO_DEV_WEBCAM=y
 BR2_THINGINO_GPIO_LIST="18O"
+BR2_THINGINO_PACKAGES=n
 FLASH_SIZE_MB=8
 
 # Kernel: our fork of gtxaspec/thingino-linux, checked out as a sibling of
@@ -37,6 +48,14 @@ FLASH_SIZE_MB=8
 # Streamer: none of thingino's. uvcd is enabled directly as a package
 # (BR2_PACKAGE_THINGINO_UVCD), not through the streamer choice, so this
 # camera does not depend on that menu.
+#
+# Packages: no network, so nothing that talks to one is built: no SSL
+# library (the ssl fragment is left out and the SSL choice is None), no
+# dropbear, curl, IPv6 (kernel or odhcp6c/netifd), package manager, or web
+# UI (webserver none). Also off: host-mode USB ethernet drivers (the port is
+# only ever a device), PWM and LEDs (none on the board), libaudioProcess (no
+# mic), and the libimp-debug and Ingenic diag tools. thingino's system menu implies these rather than
+# selecting them so a board can turn them off.
 #
 # Boot services: this board is a USB-powered webcam with no network, so
 # post-build.sh (appended to thingino's post-build script above, which still

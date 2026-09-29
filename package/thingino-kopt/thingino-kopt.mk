@@ -417,6 +417,11 @@ define THINGINO_KOPT_INSTALL_TARGET_CMDS_IPV6
 	echo "	dhcp-v6-enabled true" >> $(TARGET_DIR)/etc/network/interfaces.d/eth0
 	cat $(THINGINO_KOPT_PKGDIR)/files/hosts.ipv6 >> $(TARGET_DIR)/etc/hosts
 endef
+else
+# The SoC base configs build IPv6 in; a board that turns it off gets none.
+define THINGINO_KOPT_LINUX_CONFIG_FIXUPS_IPV6
+	$(call KCONFIG_DISABLE_OPT,CONFIG_IPV6)
+endef
 endif
 
 ################### NETFILTER #########################

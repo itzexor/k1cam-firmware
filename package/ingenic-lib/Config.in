@@ -35,7 +35,7 @@ config BR2_PACKAGE_INGENIC_LIB_LIBSYSUTILS
 config BR2_PACKAGE_INGENIC_LIB_AUDIOPROCESS
 	bool "libaudioProcess.so (proprietary)"
 	default n if BR2_PACKAGE_LIBAUDIOPROCESS_NEO
-	default y
+	default y if BR2_THINGINO_AUDIO
 	select BR2_THINGINO_LIBSTDCPP
 	help
 	  Ingenic proprietary audio processing library.

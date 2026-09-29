@@ -39,6 +39,12 @@ config BR2_PACKAGE_THINGINO_SSL_OPENSSL
 
 	  https://www.openssl.org/
 
+config BR2_PACKAGE_THINGINO_SSL_NONE
+	bool "None"
+	help
+	  No SSL/TLS library, for a board with no network (for example a
+	  USB webcam). Anything that needs TLS must bring its own.
+
 endchoice
 
 comment "wolfSSL needs a toolchain w/ threads"
