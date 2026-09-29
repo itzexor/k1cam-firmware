@@ -272,6 +272,14 @@ config BR2_PACKAGE_THINGINO_KOPT_IPV6
 	help
 	  Enable IPv6 networking support.
 
+config BR2_PACKAGE_THINGINO_KOPT_USB_GADGET_ONLY
+	bool "USB gadget-only appliance"
+	depends on BR2_PACKAGE_THINGINO_KOPT_DWC2_OTG
+	help
+	  Trim host USB, IP/Ethernet, sound and unrelated input/media support
+	  for a fixed-function appliance whose only external I/O is a composite
+	  USB gadget. AF_UNIX and the gadget-side DWC2/UVC stack remain enabled.
+
 config BR2_PACKAGE_THINGINO_KOPT_PWM
 	bool "PWM"
 	depends on BR2_PACKAGE_THINGINO_KOPT

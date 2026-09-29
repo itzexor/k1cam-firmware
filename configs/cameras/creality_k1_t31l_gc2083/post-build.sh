@@ -41,9 +41,34 @@ for script in \
 	S01syslogd S01seedrng S03mac S04hostname S50crond S94rc.local \
 	S97sysupgrade \
 	S00blink S99led \
-	S02sysctl; do
+	S02sysctl S05usb; do
 	rm -f "$INITD/$script"
 done
+
+# Files and libraries for features this hardware cannot use. Keep this list
+# board-local: the global rootfs overlay still serves full network cameras.
+rm -rf \
+	"$TARGET_DIR/etc/cron" \
+	"$TARGET_DIR/etc/dropbear" \
+	"$TARGET_DIR/etc/network" \
+	"$TARGET_DIR/etc/profile.d" \
+	"$TARGET_DIR/etc/ssl" \
+	"$TARGET_DIR/usr/share/udhcpc"
+rm -f \
+	"$TARGET_DIR/etc/default/ntp.conf" \
+	"$TARGET_DIR/etc/default/resolv.conf" \
+	"$TARGET_DIR/etc/banner" \
+	"$TARGET_DIR/etc/cfg-backup.list" \
+	"$TARGET_DIR/etc/ntpd_callback" \
+	"$TARGET_DIR/etc/protocols" \
+	"$TARGET_DIR/etc/rc.local" \
+	"$TARGET_DIR/etc/rc.local.stop" \
+	"$TARGET_DIR/etc/services" \
+	"$TARGET_DIR/etc/thingino.json" \
+	"$TARGET_DIR/etc/webrtc_profile.ini" \
+	"$TARGET_DIR/usr/bin/jct" \
+	"$TARGET_DIR/usr/lib/libjct.so"* \
+	"$TARGET_DIR/usr/lib/modules"/*/ingenic/gpio-userkeys.ko
 
 # No microphone on this board. S11modules loads everything listed in
 # modules.d, and loading a driver for absent hardware is boot time spent for
@@ -70,6 +95,66 @@ exit 0
 EOF
 chmod 0755 "$INITD/F02failsafe"
 
+# RAM-only logs. klogd feeds kernel/uvcd messages into BusyBox syslogd's
+# 64 KiB shared-memory ring, viewed with `logread` or `logread -f`. Nothing
+# is written to flash and no network logger is involved.
+cat >"$INITD/S01syslogd" <<'EOF'
+#!/bin/sh
+case "$1" in
+start)
+	start-stop-daemon -S -b -m -p /run/syslogd.pid -x /sbin/syslogd -- -n -C64 -S -D
+	start-stop-daemon -S -b -m -p /run/klogd.pid -x /sbin/klogd -- -n
+	;;
+stop)
+	start-stop-daemon -K -p /run/klogd.pid -x /sbin/klogd || true
+	start-stop-daemon -K -p /run/syslogd.pid -x /sbin/syslogd || true
+	rm -f /run/klogd.pid /run/syslogd.pid
+	;;
+restart)
+	"$0" stop
+	"$0" start
+	;;
+esac
+EOF
+chmod 0755 "$INITD/S01syslogd"
+
+# A small board-specific login environment. The stock profile probes network
+# routes and prints IP state that can never exist on this camera.
+cat >"$TARGET_DIR/etc/profile" <<'EOF'
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export EDITOR=vi
+export PAGER=less
+export HISTFILE=/tmp/.bash_history
+export HISTSIZE=500
+export HISTFILESIZE=500
+
+alias logs='logread'
+alias logf='logread -f'
+alias uvlog='logread | grep uvcd'
+alias uvlogf='logread -f | grep uvcd'
+alias controls='uvcdctl list'
+alias ll='ls -alF'
+
+if [ -n "$PS1" ]; then
+	printf '\033[1;36mCreality K1 USB camera\033[0m  '
+	printf 'uvcd: '
+	pidof uvcd >/dev/null && printf '\033[1;32mrunning\033[0m\n' || printf '\033[1;31mstopped\033[0m\n'
+	printf '  controls   saved/live controls\n'
+	printf '  uvlog      uvcd log buffer\n'
+	printf '  uvlogf     follow uvcd logs\n'
+	printf '  sinfo      sensor information\n\n'
+	export PS1='\[\e[38;5;208m\]k1\[\e[0m\]:\[\e[38;5;153m\]\w\[\e[0m\]# '
+fi
+EOF
+
+cat >"$TARGET_DIR/usr/bin/k1-console" <<'EOF'
+#!/bin/sh
+export TERM=${TERM:-vt100}
+exec /bin/bash --login
+EOF
+chmod 0755 "$TARGET_DIR/usr/bin/k1-console"
+
 # Emergency console on the USB ACM port (host: /dev/ttyACM0).
 #
 # Supervised by init, next to the UART getty, rather than by uvcd's init
@@ -80,12 +165,12 @@ chmod 0755 "$INITD/F02failsafe"
 # rcS included -- has finished, so none of this is on the path to
 # enumeration. busybox init does not rate-limit respawns, so the entry
 # throttles itself: /dev/ttyGS0 only exists once uvcd's init script has loaded
-# g_webcam, and a getty that fails must not spin. -L because a USB serial line
-# has no carrier to wait for.
+# g_webcam, and a getty that fails must not spin. -L ignores carrier; -w waits
+# for a clean CR/LF before starting Bash, discarding bytes queued while ACM was
+# enumerating instead of feeding them to a live shell as commands.
 INITTAB="$TARGET_DIR/etc/inittab"
-if ! grep -q 'ttyGS0' "$INITTAB"; then
-	cat >>"$INITTAB" <<'EOF'
+sed -i '/ttyGS0/d' "$INITTAB"
+cat >>"$INITTAB" <<'EOF'
 # USB ACM emergency console (added by creality_k1_t31l_gc2083/post-build.sh)
-::respawn:/bin/sh -c 'while [ ! -e /dev/ttyGS0 ]; do sleep 1; done; /sbin/getty -L -n -l /bin/sh ttyGS0 0 vt100; sleep 1'
+::respawn:/bin/sh -c 'while [ ! -e /dev/ttyGS0 ]; do sleep 1; done; /sbin/getty -L -w -n -l /usr/bin/k1-console ttyGS0 0 vt100; sleep 1'
 EOF
-fi
