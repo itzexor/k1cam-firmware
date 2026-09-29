@@ -263,7 +263,9 @@ static void apply_isp_controls(uvcd_pipeline_t *p)
 	RSS_HAL_CALL(p->ops, isp_set_max_dgain, p->hal_ctx, p->controls.max_dgain);
 	RSS_HAL_CALL(p->ops, isp_set_dpc_strength, p->hal_ctx, p->controls.dpc);
 	RSS_HAL_CALL(p->ops, isp_set_drc_strength, p->hal_ctx, p->controls.drc);
-	RSS_HAL_CALL(p->ops, isp_set_backlight_comp, p->hal_ctx, p->controls.backlight);
+	/* Off, and not a control: at any strength auto-exposure hunted (frame
+	 * brightness swinging 20x more than at 0) and clipped more. */
+	RSS_HAL_CALL(p->ops, isp_set_backlight_comp, p->hal_ctx, 0);
 	RSS_HAL_CALL(p->ops, isp_set_highlight_depress, p->hal_ctx, p->controls.highlight);
 	RSS_HAL_CALL(p->ops, isp_set_running_mode, p->hal_ctx, RSS_ISP_DAY);
 	RSS_HAL_CALL(p->ops, isp_set_bypass, p->hal_ctx, 1);

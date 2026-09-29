@@ -4,7 +4,6 @@
 DAEMON=/usr/bin/uvcd
 SUPERVISOR_PID=/var/run/uvcd-supervisor.pid
 READY=/var/run/uvcd.ready
-GADGET_STATE=/var/run/uvcd.gadget
 
 # Poll a condition in 50ms steps. Every wait in start() is on the path to
 # the host seeing the camera, and polling in whole seconds rounds each one
@@ -69,31 +68,21 @@ resolve_soft_connect() {
 		SOFT_CONNECT=$(find /sys/devices -name soft_connect -path "*/dwc2/*" 2>/dev/null | head -1)
 }
 
-# Never disconnect twice in a row: after a second disconnect the Ingenic dwc2
-# ignores the next connect, and the host doesn't see the camera again until
-# yet another connect. start, stop and the supervisor loop each disconnect,
-# so the last command is kept in $GADGET_STATE, shared by all three shells.
-# (soft_connect is write-only, and /sys/class/udc/*/state reads "not
-# attached" on this dwc2 even while the host has the camera enumerated.)
+# soft_connect is absolute: repeating either command is harmless. uvcd
+# opening /dev/video0 doesn't connect on its own after a disconnect here, so
+# the host only sees the camera once connect_gadget runs. Before g_webcam is
+# loaded there is no gadget driver and the write fails; nothing to do then.
 disconnect_gadget() {
 	resolve_soft_connect
 	[ -n "$SOFT_CONNECT" ] || return 0
-	[ "$(cat "$GADGET_STATE" 2>/dev/null)" = disconnect ] && return 0
-	echo disconnect >"$SOFT_CONNECT"
-	echo disconnect >"$GADGET_STATE"
+	echo disconnect >"$SOFT_CONNECT" 2>/dev/null
+	return 0
 }
 
-# Connect twice: a connect that lands too soon after a disconnect can still
-# be lost, and a connect while already connected is harmless (the host does
-# not re-enumerate).
 connect_gadget() {
 	resolve_soft_connect
 	[ -n "$SOFT_CONNECT" ] || return 0
-	echo connect >"$SOFT_CONNECT"
-	echo connect >"$GADGET_STATE"
-	sleep 1
-	# Unless stop disconnected in the meantime.
-	[ "$(cat "$GADGET_STATE" 2>/dev/null)" = connect ] && echo connect >"$SOFT_CONNECT"
+	echo connect >"$SOFT_CONNECT" 2>/dev/null
 	return 0
 }
 
@@ -106,11 +95,14 @@ case "$1" in
 			exit 0
 		fi
 		echo "Starting uvcd..."
-		# Only a restart needs the pause: it gives the host time to see the
-		# unplug before we reconnect. At boot g_webcam isn't loaded yet, nothing
-		# is attached, and a sleep here is pure delay before enumeration.
-		disconnect_gadget
-		grep -q '^g_webcam ' /proc/modules 2>/dev/null && sleep 1
+		# Only a restart needs this: the pause gives the host time to see the
+		# unplug before we reconnect. At boot g_webcam isn't loaded yet,
+		# nothing is attached, and the supervisor disconnects before it
+		# starts uvcd anyway.
+		if grep -q '^g_webcam ' /proc/modules 2>/dev/null; then
+			disconnect_gadget
+			sleep 1
+		fi
 		if [ -x /usr/sbin/usb-role ]; then
 			usb-role -m device 2>/dev/null
 		fi

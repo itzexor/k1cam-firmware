@@ -105,12 +105,6 @@ struct uvc_event {
  * frames (19 fps, bus-bound) and 255 ~2.4 MB, every one dropped. 160 is
  * already visibly oversharpened, so nothing useful is lost. */
 #define UVCD_SHARPNESS_MAX 180
-/* The gadget descriptor still advertises backlight compensation, but the
- * range is pinned to 0: at any strength the SDK's auto-exposure hunted
- * (frame brightness swinging 20x more than at 0) and clipped more. */
-#define UVCD_BACKLIGHT_MIN 0
-#define UVCD_BACKLIGHT_MAX 0
-#define UVCD_BACKLIGHT_DEF 0
 #define UVCD_POWER_LINE_MIN 0
 #define UVCD_POWER_LINE_MAX 2
 #define UVCD_POWER_LINE_DEF 0 /* off: anti-flicker holds exposure to 10 ms steps */
@@ -212,8 +206,6 @@ static int *control_value(gadget_t *g, uint8_t selector)
 		return &g->pipe->controls.saturation;
 	case UVC_PU_SHARPNESS_CONTROL:
 		return &g->pipe->controls.sharpness;
-	case UVC_PU_BACKLIGHT_COMPENSATION_CONTROL:
-		return &g->pipe->controls.backlight;
 	case UVC_PU_POWER_LINE_FREQUENCY_CONTROL:
 		return &g->pipe->controls.power_line_frequency;
 	case UVC_PU_GAMMA_CONTROL:
@@ -270,12 +262,6 @@ static int apply_control(gadget_t *g, uint8_t selector, int value)
 		if (value > UVCD_SHARPNESS_MAX)
 			value = UVCD_SHARPNESS_MAX;
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_sharpness, g->pipe->hal_ctx, value);
-	case UVC_PU_BACKLIGHT_COMPENSATION_CONTROL:
-		if (value < UVCD_BACKLIGHT_MIN)
-			value = UVCD_BACKLIGHT_MIN;
-		if (value > UVCD_BACKLIGHT_MAX)
-			value = UVCD_BACKLIGHT_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_backlight_comp, g->pipe->hal_ctx, value);
 	case UVC_PU_POWER_LINE_FREQUENCY_CONTROL:
 		if (value < UVCD_POWER_LINE_MIN)
 			value = UVCD_POWER_LINE_MIN;
@@ -464,8 +450,6 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 		      UVCD_CONTROL_MIN, UVCD_SHARPNESS_MAX, UVCD_CONTROL_DEF, sharpness),
 	UVCD_CTRL_ROW("hue", UVCD_CTRL_STANDARD, UVC_PU_HUE_CONTROL,
 		      UVCD_HUE_MIN, UVCD_HUE_MAX, UVCD_HUE_DEF, hue),
-	UVCD_CTRL_ROW("backlight", UVCD_CTRL_STANDARD, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL,
-		      UVCD_BACKLIGHT_MIN, UVCD_BACKLIGHT_MAX, UVCD_BACKLIGHT_DEF, backlight),
 	UVCD_CTRL_ROW("power-line-frequency", UVCD_CTRL_STANDARD, UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
 		      UVCD_POWER_LINE_MIN, UVCD_POWER_LINE_MAX, UVCD_POWER_LINE_DEF, power_line_frequency),
 	UVCD_CTRL_ROW("gamma", UVCD_CTRL_STANDARD, UVC_PU_GAMMA_CONTROL,

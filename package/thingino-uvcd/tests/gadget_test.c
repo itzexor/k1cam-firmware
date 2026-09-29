@@ -78,10 +78,11 @@ int main(void)
 	pthread_mutex_init(&p.frame.lock, NULL);
 	gadget_t g = {.pipe = &p};
 
-	/* Ranges that keep frames under the USB cap and AE steady; defog is
-	 * gone (selector 8 now stalls like any unknown one). */
+	/* Sharpness stops where frames still fit the USB cap. Backlight and
+	 * defog are gone, and their requests stall like any unknown one. */
 	assert(standard_ctrl_def(UVC_PU_SHARPNESS_CONTROL)->max == 180);
-	assert(standard_ctrl_def(UVC_PU_BACKLIGHT_COMPENSATION_CONTROL)->max == 0);
+	assert(standard_ctrl_def(UVC_PU_BACKLIGHT_COMPENSATION_CONTROL) == NULL);
+	assert(control_value(&g, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL) == NULL);
 	assert(custom_ctrl_def(8) == NULL && custom_control_value(&g, 8) == NULL);
 	config_mark_dirty(&g);
 	g.config_dirty_at -= 20000;

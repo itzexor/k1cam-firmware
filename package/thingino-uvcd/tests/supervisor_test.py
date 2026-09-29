@@ -22,7 +22,6 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
     root = Path(tmp)
     ready = root / "ready"
     pidfile = root / "supervisor.pid"
-    state = root / "gadget"
     # soft_connect stand-in: a FIFO, so every command is seen in order, not
     # just the last one written.
     connection = root / "connection"
@@ -51,7 +50,6 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
     source = source.replace("DAEMON=/usr/bin/uvcd", f"DAEMON={daemon}")
     source = source.replace("SUPERVISOR_PID=/var/run/uvcd-supervisor.pid", f"SUPERVISOR_PID={pidfile}")
     source = source.replace("READY=/var/run/uvcd.ready", f"READY={ready}")
-    source = source.replace("GADGET_STATE=/var/run/uvcd.gadget", f"GADGET_STATE={state}")
     script = root / "supervisor"
     script.write_text(source)
     env = dict(os.environ, SOFT_CONNECT=str(connection))
@@ -60,13 +58,13 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
     pidfile.write_text(str(proc.pid))
     child = None
     try:
-        until(lambda: commands.count("connect") == 2)
+        until(lambda: commands.count("connect") == 1)
         first = child = int(ready.read_text())
         os.kill(first, signal.SIGKILL)
         until(lambda: last() == "disconnect")
         until(lambda: ready.exists() and ready.read_text() and int(ready.read_text()) != first)
         child = int(ready.read_text())
-        until(lambda: commands.count("connect") == 4)
+        until(lambda: commands.count("connect") == 2)
         # Stop the way the init script does: it disconnects, then the
         # supervisor's trap would disconnect again. Neither may reconnect
         # or respawn.
@@ -82,12 +80,11 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
             pass
         else:
             raise AssertionError("supervisor left its daemon alive")
-        # Two disconnects in a row make the dwc2 swallow the next connect.
+        # Each daemon gets exactly one connect, after a disconnect.
+        assert commands[0] == "disconnect", commands
         for a, b in zip(commands, commands[1:]):
-            assert not (a == b == "disconnect"), f"double disconnect in {commands}"
-        # Every connect is sent twice.
-        runs = "".join("c" if c == "connect" else "d" for c in commands)
-        assert all(len(r) == 2 for r in runs.split("d") if r), f"connects not doubled: {commands}"
+            assert not (a == b == "connect"), f"connect repeated in {commands}"
+        assert commands.count("connect") == 2, commands
     finally:
         if proc.poll() is None:
             proc.kill()

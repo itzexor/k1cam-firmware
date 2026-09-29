@@ -101,7 +101,6 @@ struct uvcd_control_state {
 	int saturation;
 	int sharpness;
 	int hue;
-	int backlight;
 	int power_line_frequency;
 	int gamma;    /* gamma * 100, UVC/V4L2 convention (100 == 1.0) */
 	int wb_temp;  /* white balance, Kelvin */
