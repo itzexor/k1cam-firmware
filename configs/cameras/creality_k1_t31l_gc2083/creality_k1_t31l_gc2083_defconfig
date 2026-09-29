@@ -2,6 +2,7 @@
 # FRAG: soc-xburst1 core
 BR2_ETHERNET=n
 BR2_INGENIC_SOC_MODEL="t31l"
+BR2_ISP_CLK_200MHZ=y
 BR2_LINUX_KERNEL_CUSTOM_REPO_URL="$(BR2_EXTERNAL_THINGINO_PATH)/../thingino-linux"
 BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="e8aecd597fe3897ec4b8f8ff473cc9320c5ddfe2"
 BR2_PACKAGE_DROPBEAR=n
@@ -56,6 +57,13 @@ FLASH_SIZE_MB=8
 # only ever a device), PWM and LEDs (none on the board), libaudioProcess (no
 # mic), and the libimp-debug and Ingenic diag tools. thingino's system menu implies these rather than
 # selecting them so a board can turn them off.
+#
+# ISP clock: 200 MHz, as the stock firmware runs it. The module default is
+# 100 MHz, where the ISP can't upscale far: zoom broke past 131 at 1080p,
+# 250 at 1280x960 and 342 at 720p; at 200 MHz only 1080p stops, past 300.
+# uvcd reads the clock and caps zoom to match. Set here explicitly: the
+# menu's own default never reaches the module options (thingino.mk works
+# out isp_clk= before Kconfig defaults exist).
 #
 # Boot services: this board is a USB-powered webcam with no network, so
 # post-build.sh (appended to thingino's post-build script above, which still

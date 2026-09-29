@@ -54,11 +54,16 @@ struct uvcd_frame_info {
 	uint32_t max_size;    /* worst-case compressed frame size */
 	uint32_t h264_bitrate; /* bps, only used when format == H264 */
 	/* Highest zoom (x100) this output size can take. Zoom upscales a
-	 * sensor crop to the output, and past a per-size ratio the T31 scaler
-	 * fails: ISP errors on every frame (or a silent stall), no encoded
-	 * frames. Measured on the K1, with a margin. */
+	 * sensor crop to the output, and past a per-size ratio the ISP can't
+	 * keep up: errors on every frame (or a silent stall), no encoded
+	 * frames. The ratio depends on the ISP clock, so there is one cap for
+	 * UVCD_ISP_FAST_HZ and up (what the K1 firmware runs) and one for the
+	 * module's 100 MHz default. Measured on the K1, with a margin. */
 	uint16_t max_zoom;
+	uint16_t max_zoom_slow;
 };
+
+#define UVCD_ISP_FAST_HZ 200000000
 
 extern const struct uvcd_frame_info uvcd_frames[UVCD_NUM_FRAMES + 1];
 
@@ -213,6 +218,7 @@ typedef struct {
 	 * HAL bring-up. */
 	rss_sensor_config_t sensor;
 	int sensor_w, sensor_h;
+	int isp_clk_hz; /* tx-isp's isp_clk parameter; 0 if unknown */
 
 	/* Sensor + ISP + IMP system initialized (hal init done). Brought up by
 	 * uvcd_pipeline_start(), taken down by uvcd_pipeline_idle() once no

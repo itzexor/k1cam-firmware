@@ -162,17 +162,18 @@ int uvcd_awb_current_ct(uvcd_pipeline_t *p)
  * 180 cap, so this is headroom, not a target. It sizes the gadget's buffers
  * and the host's (dwMaxVideoFrameSize); a frame over it is dropped.
  *
- * max_zoom: last zoom that still streamed / first that broke the scaler:
- * 1080p 131/137, 1280x960 250/300, 720p 342/345; 800x600, 640x480 and
- * 640x360 all stream at 400. */
+ * max_zoom, max_zoom_slow: last zoom that still streamed / first that
+ * broke the ISP. At 200 MHz: 1080p 300/310, everything else streams at 400.
+ * At 100 MHz: 1080p 131/137, 1280x960 250/300, 720p 342/345; 800x600,
+ * 640x480 and 640x360 stream at 400. */
 const struct uvcd_frame_info uvcd_frames[UVCD_NUM_FRAMES + 1] = {
-	[0] = {0, 0, 0, 0, 0},
-	[UVCD_FRAME_1080P] = {1920, 1080, 2048 * 1024, 3000000, 125},
-	[UVCD_FRAME_1280X960] = {1280, 960, 1280 * 1024, 2400000, 240},
-	[UVCD_FRAME_720P] = {1280, 720, 1024 * 1024, 1800000, 330},
-	[UVCD_FRAME_800X600] = {800, 600, 512 * 1024, 1200000, 400},
-	[UVCD_FRAME_640X480] = {640, 480, 512 * 1024, 1000000, 400},
-	[UVCD_FRAME_360P] = {640, 360, 384 * 1024, 700000, 400},
+	[0] = {0, 0, 0, 0, 0, 0},
+	[UVCD_FRAME_1080P] = {1920, 1080, 2048 * 1024, 3000000, 290, 125},
+	[UVCD_FRAME_1280X960] = {1280, 960, 1280 * 1024, 2400000, 400, 240},
+	[UVCD_FRAME_720P] = {1280, 720, 1024 * 1024, 1800000, 400, 330},
+	[UVCD_FRAME_800X600] = {800, 600, 512 * 1024, 1200000, 400, 400},
+	[UVCD_FRAME_640X480] = {640, 480, 512 * 1024, 1000000, 400, 400},
+	[UVCD_FRAME_360P] = {640, 360, 384 * 1024, 700000, 400, 400},
 };
 
 const uint32_t uvcd_intervals[UVCD_NUM_INTERVALS] = {
@@ -339,6 +340,10 @@ static int hal_bring_up(uvcd_pipeline_t *p)
 	} else if (first) {
 		LOGI("sensor resolution: %dx%d", p->sensor_w, p->sensor_h);
 	}
+	/* Fixed while the module is loaded; it sets how far zoom can go. */
+	p->isp_clk_hz = read_procfs_int("/sys/module/tx_isp_t31/parameters/isp_clk", 10, 0);
+	if (first)
+		LOGI("ISP clock: %d MHz", p->isp_clk_hz / 1000000);
 	/* Until a channel says otherwise, the whole sensor is in view. */
 	p->view.x = 0;
 	p->view.y = 0;
@@ -599,10 +604,13 @@ static uint32_t fps_step(uint32_t fps, int dir, uint32_t ceiling)
 
 /* The zoom actually used at this output size. The control keeps what the
  * host asked for, so switching to a size that can take it gets it back. */
-static int effective_zoom(const struct uvcd_control_state *c, uint8_t frame)
+static int effective_zoom(const uvcd_pipeline_t *p, const struct uvcd_control_state *c,
+			  uint8_t frame)
 {
 	int zoom = c->zoom < UVCD_ZOOM_MIN ? UVCD_ZOOM_MIN : c->zoom;
-	return zoom > uvcd_frames[frame].max_zoom ? uvcd_frames[frame].max_zoom : zoom;
+	int max = p->isp_clk_hz >= UVCD_ISP_FAST_HZ ? uvcd_frames[frame].max_zoom
+						    : uvcd_frames[frame].max_zoom_slow;
+	return zoom > max ? max : zoom;
 }
 
 /* The part of the sensor image the host sees for output `frame`: the
@@ -613,7 +621,7 @@ static void compute_view(const uvcd_pipeline_t *p, const struct uvcd_control_sta
 {
 	int sw = p->sensor_w, sh = p->sensor_h;
 	int ow = uvcd_frames[frame].width, oh = uvcd_frames[frame].height;
-	int zoom = effective_zoom(c, frame);
+	int zoom = effective_zoom(p, c, frame);
 
 	int bw = sw, bh = (int)((int64_t)sw * oh / ow);
 	if (bh > sh) {
@@ -879,9 +887,10 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	/* Start on the view zoom/pan/tilt ask for; uvcd_apply_view() moves
 	 * it live from then on. */
 	int vx, vy, vw, vh;
-	if (effective_zoom(&p->controls, frame) < p->controls.zoom)
-		LOGI("zoom %d limited to %d at %ux%u (scaler upscale limit)", p->controls.zoom,
-		     effective_zoom(&p->controls, frame), fi->width, fi->height);
+	if (effective_zoom(p, &p->controls, frame) < p->controls.zoom)
+		LOGI("zoom %d limited to %d at %ux%u (ISP upscale limit at %d MHz)",
+		     p->controls.zoom, effective_zoom(p, &p->controls, frame), fi->width,
+		     fi->height, p->isp_clk_hz / 1000000);
 	compute_view(p, &p->controls, frame, &vx, &vy, &vw, &vh);
 	/* Never pass an invalid sensor-space rectangle to the ISP. */
 	if (vw <= 0 || vh <= 0 || vx < 0 || vy < 0 ||
