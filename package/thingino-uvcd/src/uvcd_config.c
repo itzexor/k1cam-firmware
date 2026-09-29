@@ -69,6 +69,24 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *out)
 	fclose(f);
 }
 
+/* Best-effort: make a create or rename in path's directory durable too. */
+static void fsync_dir(const char *path)
+{
+	char dir_path[280];
+	strncpy(dir_path, path, sizeof(dir_path) - 1);
+	dir_path[sizeof(dir_path) - 1] = '\0';
+	char *slash = strrchr(dir_path, '/');
+	if (slash)
+		*slash = '\0';
+	else
+		strcpy(dir_path, ".");
+	int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
+	if (dir_fd >= 0) {
+		fsync(dir_fd);
+		close(dir_fd);
+	}
+}
+
 int uvcd_config_save(const char *path, const struct uvcd_control_state *in)
 {
 	char tmp_path[280];
@@ -110,21 +128,36 @@ int uvcd_config_save(const char *path, const struct uvcd_control_state *in)
 		unlink(tmp_path);
 		return -1;
 	}
+	fsync_dir(path);
+	return 0;
+}
 
-	/* Best-effort: make the rename itself durable across a crash. */
-	char dir_path[280];
-	strncpy(dir_path, path, sizeof(dir_path) - 1);
-	dir_path[sizeof(dir_path) - 1] = '\0';
-	char *slash = strrchr(dir_path, '/');
-	if (slash)
-		*slash = '\0';
-	else
-		strcpy(dir_path, ".");
-	int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
-	if (dir_fd >= 0) {
-		fsync(dir_fd);
-		close(dir_fd);
+int uvcd_config_streak_read(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return 0;
+	int n;
+	if (fscanf(f, "%d", &n) != 1 || n < 1)
+		n = 1;
+	fclose(f);
+	return n;
+}
+
+int uvcd_config_streak_write(const char *path, int n)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+	if (fd < 0)
+		return -1;
+	char buf[16];
+	int len = snprintf(buf, sizeof(buf), "%d\n", n);
+	if (write(fd, buf, (size_t)len) != len || fsync(fd) != 0) {
+		int err = errno;
+		close(fd);
+		errno = err;
+		return -1;
 	}
-
+	close(fd);
+	fsync_dir(path);
 	return 0;
 }

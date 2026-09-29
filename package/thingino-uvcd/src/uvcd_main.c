@@ -128,24 +128,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Persist before any encoder operation so a reboot or SDK abort cannot
-	 * silently retry a crashing saved configuration. */
-	int dirty_fd = open(UVCD_CONFIG_DIRTY_PATH, O_WRONLY | O_CREAT | O_NOFOLLOW, 0644);
-	if (dirty_fd < 0) {
-		LOGE("cannot create config recovery marker: %s", strerror(errno));
-		uvcd_pipeline_deinit(&pipe_state);
-		return 1;
-	}
-	fsync(dirty_fd);
-	close(dirty_fd);
-	sync();
-
+	/* The crash guard is armed per stream (uvcd_gadget.c), not here: an
+	 * idle daemon can't be crashed by its controls, and a camera unplugged
+	 * while idle must keep its settings. */
 	LOGI("uvcd running, device=%s", device);
 	int ret = uvcd_gadget_run(&pipe_state, device);
 
 	uvcd_pipeline_deinit(&pipe_state);
-	if (ret == 0)
-		unlink(UVCD_CONFIG_DIRTY_PATH);
 	LOGI("uvcd shutting down");
 	if (uvcd_log_use_syslog)
 		closelog();

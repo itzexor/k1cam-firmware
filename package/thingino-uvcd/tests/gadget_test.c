@@ -5,10 +5,20 @@
 #include "../src/uvcd_gadget.c"
 
 static int saves, queued, idrs, restarts;
+static int unlinks, streak_writes, last_streak;
 
 int test_unlink(const char *path)
 {
 	(void)path;
+	unlinks++;
+	return 0;
+}
+
+int uvcd_config_streak_write(const char *path, int n)
+{
+	(void)path;
+	streak_writes++;
+	last_streak = n;
 	return 0;
 }
 static bool host_reading;
@@ -67,18 +77,37 @@ int main(void)
 	uvcd_pipeline_t p = {0};
 	pthread_mutex_init(&p.frame.lock, NULL);
 	gadget_t g = {.pipe = &p};
+
+	/* Ranges that keep frames under the USB cap and AE steady; defog is
+	 * gone (selector 8 now stalls like any unknown one). */
+	assert(standard_ctrl_def(UVC_PU_SHARPNESS_CONTROL)->max == 180);
+	assert(standard_ctrl_def(UVC_PU_BACKLIGHT_COMPENSATION_CONTROL)->max == 0);
+	assert(custom_ctrl_def(8) == NULL && custom_control_value(&g, 8) == NULL);
 	config_mark_dirty(&g);
 	g.config_dirty_at -= 20000;
 	config_flush(&g);
 	assert(saves == 0 && g.config_dirty); /* Idle values never persist. */
+	assert(streak_writes == 0 && unlinks == 0); /* ...and idle is never a crash. */
+
+	/* A stream is counted in the crash guard from its start, once, on top
+	 * of the streams before it that died unproven. */
+	p.unproven_streak = 1;
+	stream_guard_arm(&g);
+	stream_guard_arm(&g);
+	assert(streak_writes == 1 && last_streak == 2 && g.guard_armed);
+
 	g.streaming = true;
 	g.healthy_since_ms = monotonic_ms() - 9000;
 	g.last_frame_ms = monotonic_ms();
 	config_flush(&g);
-	assert(saves == 0);
+	assert(saves == 0 && g.guard_armed && unlinks == 0);
 	g.healthy_since_ms -= 2000;
 	config_flush(&g);
 	assert(saves == 1 && !g.config_dirty);
+	/* Proven healthy: the guard file goes and the streak resets. */
+	assert(!g.guard_armed && p.unproven_streak == 0 && unlinks == 1);
+	stream_guard_clear(&g);
+	assert(unlinks == 1); /* nothing armed, nothing to clear */
 	config_mark_dirty(&g);
 	assert(g.healthy_since_ms == 0);
 	config_flush(&g);
@@ -101,13 +130,25 @@ int main(void)
 	assert(g.streaming && queued == 1 && g.read_seq == 1 && idrs == 1);
 	assert(memcmp(data, output, sizeof(data)) == 0);
 
+	/* A frame bigger than the gadget buffer is dropped whole: never
+	 * truncated, and never answered by lowering the quality. */
+	uint8_t big[8] = {0};
 	g.cur_format = UVCD_FMT_MJPEG;
 	p.controls.mjpeg_quality = 80;
-	p.frame.jpeg_near_limit = true;
+	p.frame.data = big;
+	p.frame.len = sizeof(big);
+	p.frame.seq = 2;
+	int was_queued = queued, was_idrs = idrs;
 	deliver_frame(&g);
-	assert(restarts == 1 && p.mjpeg_quality_limit == 75);
-	assert(p.controls.mjpeg_quality == 80 && g.read_seq == 0);
+	assert(queued == was_queued && idrs == was_idrs + 1 && restarts == 0);
+	assert(g.read_seq == 2 && p.controls.mjpeg_quality == 80);
 	assert(g.healthy_since_ms == 0);
+	/* The next frame that fits goes out on the buffer the drop kept. */
+	p.frame.data = data;
+	p.frame.len = sizeof(data);
+	p.frame.seq = 3;
+	deliver_frame(&g);
+	assert(queued == was_queued + 1 && g.read_seq == 3);
 	assert(uvcd_ctrl_find("power-line-frequency")->def == 0);
 	assert(uvcd_ctrl_find("spatial-denoise")->def == 192);
 	puts("gadget regression tests passed");

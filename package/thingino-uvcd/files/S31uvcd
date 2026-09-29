@@ -4,6 +4,7 @@
 DAEMON=/usr/bin/uvcd
 SUPERVISOR_PID=/var/run/uvcd-supervisor.pid
 READY=/var/run/uvcd.ready
+GADGET_STATE=/var/run/uvcd.gadget
 
 # Poll a condition in 50ms steps. Every wait in start() is on the path to
 # the host seeing the camera, and polling in whole seconds rounds each one
@@ -68,14 +69,32 @@ resolve_soft_connect() {
 		SOFT_CONNECT=$(find /sys/devices -name soft_connect -path "*/dwc2/*" 2>/dev/null | head -1)
 }
 
+# Never disconnect twice in a row: after a second disconnect the Ingenic dwc2
+# ignores the next connect, and the host doesn't see the camera again until
+# yet another connect. start, stop and the supervisor loop each disconnect,
+# so the last command is kept in $GADGET_STATE, shared by all three shells.
+# (soft_connect is write-only, and /sys/class/udc/*/state reads "not
+# attached" on this dwc2 even while the host has the camera enumerated.)
 disconnect_gadget() {
 	resolve_soft_connect
-	[ -n "$SOFT_CONNECT" ] && echo disconnect >"$SOFT_CONNECT"
+	[ -n "$SOFT_CONNECT" ] || return 0
+	[ "$(cat "$GADGET_STATE" 2>/dev/null)" = disconnect ] && return 0
+	echo disconnect >"$SOFT_CONNECT"
+	echo disconnect >"$GADGET_STATE"
 }
 
+# Connect twice: a connect that lands too soon after a disconnect can still
+# be lost, and a connect while already connected is harmless (the host does
+# not re-enumerate).
 connect_gadget() {
 	resolve_soft_connect
-	[ -n "$SOFT_CONNECT" ] && echo connect >"$SOFT_CONNECT"
+	[ -n "$SOFT_CONNECT" ] || return 0
+	echo connect >"$SOFT_CONNECT"
+	echo connect >"$GADGET_STATE"
+	sleep 1
+	# Unless stop disconnected in the meantime.
+	[ "$(cat "$GADGET_STATE" 2>/dev/null)" = connect ] && echo connect >"$SOFT_CONNECT"
+	return 0
 }
 
 case "$1" in

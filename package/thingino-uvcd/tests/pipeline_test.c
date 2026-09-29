@@ -2,6 +2,20 @@
 #include <assert.h>
 #include "../src/uvcd_pipeline.c"
 
+/* Smallest sensor crop measured to stream at each output size (the last
+ * working zoom: 131, 250, 342, then 400 for the rest). One step past these
+ * made the T31 scaler fail. */
+static const struct {
+	int w, h;
+} proven[UVCD_NUM_FRAMES + 1] = {
+	[UVCD_FRAME_1080P] = {1464, 824},
+	[UVCD_FRAME_1280X960] = {576, 432},
+	[UVCD_FRAME_720P] = {560, 314},
+	[UVCD_FRAME_800X600] = {360, 270},
+	[UVCD_FRAME_640X480] = {360, 270},
+	[UVCD_FRAME_360P] = {480, 270},
+};
+
 static rss_fs_config_t fs;
 static rss_video_config_t enc;
 static uint32_t stream_size;
@@ -79,6 +93,14 @@ int main(void)
 	p.controls.mjpeg_quality = 80;
 	p.controls.h264_min_qp = p.controls.h264_max_qp = -1;
 	for (int frame = 1; frame <= UVCD_NUM_FRAMES; frame++) {
+		const struct uvcd_frame_info *fi = &uvcd_frames[frame];
+		/* The pump's copy holds any frame the gadget can send, and the
+		 * gadget takes about a byte per pixel. */
+		assert(fi->max_size <= UVCD_FRAME_BUF_CAP);
+		assert(fi->max_size >= (uint32_t)fi->width * fi->height);
+		assert(fi->max_zoom >= UVCD_ZOOM_MIN && fi->max_zoom <= UVCD_ZOOM_MAX);
+	}
+	for (int frame = 1; frame <= UVCD_NUM_FRAMES; frame++) {
 		for (int zoom = 100; zoom <= 400; zoom += 25) {
 			for (int pan = -UVCD_PANTILT_MAX; pan <= UVCD_PANTILT_MAX;
 			     pan += UVCD_PANTILT_MAX) {
@@ -94,6 +116,11 @@ int main(void)
 					assert(fs.fcrop.x + fs.fcrop.w <= 1920);
 					assert(fs.fcrop.y + fs.fcrop.h <= 1080);
 				}
+				/* Never a smaller crop, i.e. more upscale, than was
+				 * seen streaming on the K1 at this output size. */
+				int cw = fs.fcrop.enable ? fs.fcrop.w : 1920;
+				int ch = fs.fcrop.enable ? fs.fcrop.h : 1080;
+				assert(cw >= proven[frame].w && ch >= proven[frame].h);
 				assert(stream_size >= fs.width * fs.height * 4);
 				assert(stream_count == 1);
 				assert(enc.init_qp == 80);
@@ -107,15 +134,27 @@ int main(void)
 	assert(configure_channel(&p, UVCD_FMT_MJPEG, UVCD_FRAME_1280X960, 333333) == -EIO);
 	assert(fs.fcrop.x == 240 && fs.fcrop.y == 0);
 	assert(fs.fcrop.w == 1440 && fs.fcrop.h == 1080);
-	p.mjpeg_quality_limit = 65;
+	/* The requested JPEG quality goes to the encoder as is. */
+	p.controls.mjpeg_quality = 100;
 	assert(configure_channel(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -EIO);
-	assert(enc.init_qp == 65 && p.controls.mjpeg_quality == 80);
+	assert(enc.init_qp == 100);
+	p.controls.mjpeg_quality = 80;
 	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_1080P, 333333) == -EIO);
 	assert(enc.gop_length == 30 && enc.max_same_scene_cnt == 1);
 	assert(stream_size == uvcd_frames[UVCD_FRAME_1080P].max_size && stream_count == 2);
 	p.controls.h264_gop_frames = 17;
 	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
 	assert(enc.gop_length == 17 && enc.max_same_scene_cnt == 1);
+	/* Automatic min QP: 20, unless an explicit max QP is below it. */
+	assert(enc.min_qp == UVCD_H264_AUTO_MIN_QP && enc.max_qp == -1);
+	p.controls.h264_max_qp = 12;
+	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(enc.min_qp == 12 && enc.max_qp == 12);
+	p.controls.h264_min_qp = 30;
+	p.controls.h264_max_qp = 40;
+	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(enc.min_qp == 30 && enc.max_qp == 40);
+	p.controls.h264_min_qp = p.controls.h264_max_qp = -1;
 	int calls = encoder_calls;
 	destroyed = 0;
 	buffer_error = -ENOMEM;

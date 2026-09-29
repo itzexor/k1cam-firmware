@@ -63,7 +63,8 @@ struct uvc_event {
 #define UVCD_CUSTOM_TEMPER 5
 #define UVCD_CUSTOM_DPC 6
 #define UVCD_CUSTOM_DRC 7
-#define UVCD_CUSTOM_DEFOG 8
+/* 8 was defog strength: this SDK only applies it with defog enabled, which
+ * uvcd never did, so it had no effect at any value. Retired, not reused. */
 #define UVCD_CUSTOM_HIGHLIGHT 9
 /* Action control, not a setting: SET_CUR of a non-zero value restores every
  * control (standard and custom alike) to its compiled-in factory default.
@@ -99,8 +100,16 @@ struct uvc_event {
 #define UVCD_HUE_MIN -128
 #define UVCD_HUE_MAX 127
 #define UVCD_HUE_DEF 0
+/* Sharpness adds so much detail at the top of the range that MJPEG frames
+ * outgrow the USB frame cap: at 1080p and quality 100, 180 makes ~1.8 MB
+ * frames (19 fps, bus-bound) and 255 ~2.4 MB, every one dropped. 160 is
+ * already visibly oversharpened, so nothing useful is lost. */
+#define UVCD_SHARPNESS_MAX 180
+/* The gadget descriptor still advertises backlight compensation, but the
+ * range is pinned to 0: at any strength the SDK's auto-exposure hunted
+ * (frame brightness swinging 20x more than at 0) and clipped more. */
 #define UVCD_BACKLIGHT_MIN 0
-#define UVCD_BACKLIGHT_MAX 10
+#define UVCD_BACKLIGHT_MAX 0
 #define UVCD_BACKLIGHT_DEF 0
 #define UVCD_POWER_LINE_MIN 0
 #define UVCD_POWER_LINE_MAX 2
@@ -149,7 +158,7 @@ struct gadget_s {
 	 * Every accepted change marks the shadow dirty; the poll loop writes
 	 * it out after ten seconds of healthy streaming with stable settings. */
 	bool config_dirty;
-	bool recovery_confirmed;
+	bool guard_armed; /* this stream is counted in the crash guard file */
 	int64_t config_dirty_at;
 	int64_t healthy_since_ms;
 	int64_t last_frame_ms;
@@ -258,8 +267,8 @@ static int apply_control(gadget_t *g, uint8_t selector, int value)
 	case UVC_PU_SHARPNESS_CONTROL:
 		if (value < UVCD_CONTROL_MIN)
 			value = UVCD_CONTROL_MIN;
-		if (value > UVCD_CONTROL_MAX)
-			value = UVCD_CONTROL_MAX;
+		if (value > UVCD_SHARPNESS_MAX)
+			value = UVCD_SHARPNESS_MAX;
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_sharpness, g->pipe->hal_ctx, value);
 	case UVC_PU_BACKLIGHT_COMPENSATION_CONTROL:
 		if (value < UVCD_BACKLIGHT_MIN)
@@ -327,8 +336,6 @@ static int *custom_control_value(gadget_t *g, uint8_t selector)
 		return &g->pipe->controls.dpc;
 	case UVCD_CUSTOM_DRC:
 		return &g->pipe->controls.drc;
-	case UVCD_CUSTOM_DEFOG:
-		return &g->pipe->controls.defog;
 	case UVCD_CUSTOM_HIGHLIGHT:
 		return &g->pipe->controls.highlight;
 	case UVCD_CUSTOM_METERING:
@@ -406,8 +413,6 @@ static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_dpc_strength, g->pipe->hal_ctx, value);
 	case UVCD_CUSTOM_DRC:
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_drc_strength, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_DEFOG:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_defog_strength, g->pipe->hal_ctx, value);
 	case UVCD_CUSTOM_HIGHLIGHT:
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_highlight_depress, g->pipe->hal_ctx, value);
 	case UVCD_CUSTOM_METERING: {
@@ -456,7 +461,7 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 	UVCD_CTRL_ROW("saturation", UVCD_CTRL_STANDARD, UVC_PU_SATURATION_CONTROL,
 		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, saturation),
 	UVCD_CTRL_ROW("sharpness", UVCD_CTRL_STANDARD, UVC_PU_SHARPNESS_CONTROL,
-		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, sharpness),
+		      UVCD_CONTROL_MIN, UVCD_SHARPNESS_MAX, UVCD_CONTROL_DEF, sharpness),
 	UVCD_CTRL_ROW("hue", UVCD_CTRL_STANDARD, UVC_PU_HUE_CONTROL,
 		      UVCD_HUE_MIN, UVCD_HUE_MAX, UVCD_HUE_DEF, hue),
 	UVCD_CTRL_ROW("backlight", UVCD_CTRL_STANDARD, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL,
@@ -504,8 +509,6 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 		      0, 255, 128, dpc),
 	UVCD_CTRL_ROW("dynamic-range-compression", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DRC,
 		      0, 255, 128, drc),
-	UVCD_CTRL_ROW("defog-strength", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DEFOG,
-		      0, 255, 128, defog),
 	/* Not a 128-centred ratio like the knobs above: the SDK takes 0-10,
 	 * 0 = off. At the old 0-255/128 it ran flat out, exposing for the
 	 * brightest spot and leaving the rest of the picture black. */
@@ -521,6 +524,8 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 		      0, 16000, 0, h264_bitrate_kbps),
 	UVCD_CTRL_ROW("h264-rate-control", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_RATE_CONTROL,
 		      UVCD_H264_RC_CBR, UVCD_H264_RC_CAPPED_VBR, UVCD_H264_RC_CBR, h264_rate_control),
+	/* The T31 encoder rounds this up to whole seconds: at 30 fps, 10 and 15
+	 * give an IDR every 30 frames, 31 and 45 every 60. */
 	UVCD_CTRL_ROW("h264-gop-frames", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_GOP,
 		      0, 300, 0, h264_gop_frames),
 	UVCD_CTRL_ROW("h264-min-qp", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_MIN_QP,
@@ -588,6 +593,30 @@ static void config_mark_dirty(gadget_t *g)
 	g->healthy_since_ms = 0;
 }
 
+/* Crash guard. The encoder is where a bad setting takes the daemon (or the
+ * kernel) down, so each stream is counted in UVCD_CONFIG_DIRTY_PATH from
+ * its start until it proves healthy or stops cleanly. A crash leaves the
+ * count behind for uvcd_pipeline_init(). An idle camera writes nothing, so
+ * unplugging it is never taken for a crash. */
+static void stream_guard_arm(gadget_t *g)
+{
+	if (g->guard_armed)
+		return;
+	g->guard_armed = true;
+	if (uvcd_config_streak_write(UVCD_CONFIG_DIRTY_PATH, g->pipe->unproven_streak + 1) != 0)
+		LOGW("crash guard %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
+}
+
+static void stream_guard_clear(gadget_t *g)
+{
+	if (!g->guard_armed)
+		return;
+	g->guard_armed = false;
+	g->pipe->unproven_streak = 0;
+	if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
+		LOGW("clear %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
+}
+
 /* Persist only settings exercised by ten seconds of healthy streaming. */
 static void config_flush(gadget_t *g)
 {
@@ -599,14 +628,10 @@ static void config_flush(gadget_t *g)
 	    monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_SECS * 1000)
 		return;
 
-	/* A healthy saved configuration should survive ordinary USB power
-	 * removal. Only startup probation needs the persistent dirty marker;
-	 * subsequent unproven edits are kept in RAM until this same gate. */
-	if (!g->recovery_confirmed) {
-		if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
-			return;
-		g->recovery_confirmed = true;
-	}
+	/* Proven: the running controls, saved or about to be, are good. Later
+	 * edits stay in RAM until they pass this same gate, so a crash they
+	 * cause only loses them. */
+	stream_guard_clear(g);
 	if (!g->config_dirty)
 		return;
 
@@ -675,7 +700,6 @@ static void encoder_after_store(gadget_t *g, uint8_t selector)
 		encoder_restart(g, UVCD_FMT_H264);
 		break;
 	case UVCD_CUSTOM_MJPEG_QUALITY:
-		g->pipe->mjpeg_quality_limit = 0;
 		encoder_restart(g, UVCD_FMT_MJPEG);
 		break;
 	default:
@@ -1264,6 +1288,7 @@ static int start_streaming(gadget_t *g)
 	g->cur_interval = g->commit.dwFrameInterval;
 
 	/* Bring up the ISP/encoder pipeline for exactly what was negotiated */
+	stream_guard_arm(g);
 	if (uvcd_pipeline_start(g->pipe, g->cur_format, g->cur_frame, g->cur_interval) != 0) {
 		LOGE("pipeline start failed for fmt=%u frame=%u", g->cur_format, g->cur_frame);
 		_exit(1);
@@ -1291,6 +1316,7 @@ static int start_streaming(gadget_t *g)
 	if (ioctl(g->fd, VIDIOC_REQBUFS, &rb) < 0) {
 		LOGE("VIDIOC_REQBUFS: %s", strerror(errno));
 		uvcd_pipeline_stop(g->pipe);
+		stream_guard_clear(g);
 		return -1;
 	}
 	g->buf_count = rb.count;
@@ -1353,6 +1379,7 @@ err_unmap:
 	rb.memory = V4L2_MEMORY_MMAP;
 	ioctl(g->fd, VIDIOC_REQBUFS, &rb);
 	uvcd_pipeline_stop(g->pipe);
+	stream_guard_clear(g);
 	return -1;
 }
 
@@ -1381,6 +1408,8 @@ static void stop_streaming(gadget_t *g)
 	/* True on-demand: the channels go now, the sensor/ISP once
 	 * uvcd_pipeline_tick() sees no stream for UVCD_HAL_LINGER_MS. */
 	uvcd_pipeline_stop(g->pipe);
+	/* Only once teardown is over: it can hang after an ISP failure. */
+	stream_guard_clear(g);
 	LOGI("streaming stopped, pipeline released");
 }
 
@@ -1467,21 +1496,7 @@ static void deliver_frame(gadget_t *g)
 
 	pthread_mutex_lock(&g->pipe->frame.lock);
 	wseq = g->pipe->frame.seq;
-	bool near_limit = g->pipe->frame.jpeg_near_limit;
-	g->pipe->frame.jpeg_near_limit = false;
 	pthread_mutex_unlock(&g->pipe->frame.lock);
-	if (near_limit && g->cur_format == UVCD_FMT_MJPEG) {
-		int quality = g->pipe->controls.mjpeg_quality;
-		if (g->pipe->mjpeg_quality_limit > 0 && quality > g->pipe->mjpeg_quality_limit)
-			quality = g->pipe->mjpeg_quality_limit;
-		if (quality > 20) {
-			g->pipe->mjpeg_quality_limit = quality > 25 ? quality - 5 : 20;
-			LOGW("MJPEG near USB frame limit; reducing effective quality to %d",
-			     g->pipe->mjpeg_quality_limit);
-			encoder_restart(g, UVCD_FMT_MJPEG);
-			return;
-		}
-	}
 	if (g->read_seq >= wseq)
 		return;
 

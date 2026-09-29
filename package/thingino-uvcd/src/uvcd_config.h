@@ -25,4 +25,19 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *out);
  * seconds of healthy streaming. Idle changes remain in RAM. */
 int uvcd_config_save(const char *path, const struct uvcd_control_state *in);
 
+/* Crash guard (uvcd_gadget.c): while a stream has not yet proven healthy,
+ * UVCD_CONFIG_DIRTY_PATH holds how many streams in a row started without
+ * getting there. A crash leaves it behind; once it reaches
+ * UVCD_CONFIG_UNPROVEN_LIMIT at startup, the saved controls are set aside
+ * for factory ones. Idle time and clean stops leave no file. */
+#define UVCD_CONFIG_UNPROVEN_LIMIT 2
+
+/* 0 if there is no file. An empty or unreadable one counts as 1 (earlier
+ * builds wrote it empty). */
+int uvcd_config_streak_read(const char *path);
+
+/* Write n, durably: it has to survive a hang or a pulled plug. Returns 0 on
+ * success, -1 on failure (errno set). */
+int uvcd_config_streak_write(const char *path, int n);
+
 #endif /* UVCD_CONFIG_H */

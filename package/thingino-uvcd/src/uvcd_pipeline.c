@@ -157,14 +157,22 @@ int uvcd_awb_current_ct(uvcd_pipeline_t *p)
 	return (int)ct;
 }
 
+/* max_size is about 1 byte per pixel (at least 384 KB): MJPEG at quality
+ * 100 runs about 0.45 B/px on the K1, and 0.9 B/px with sharpness at its
+ * 180 cap, so this is headroom, not a target. It sizes the gadget's buffers
+ * and the host's (dwMaxVideoFrameSize); a frame over it is dropped.
+ *
+ * max_zoom: last zoom that still streamed / first that broke the scaler:
+ * 1080p 131/137, 1280x960 250/300, 720p 342/345; 800x600, 640x480 and
+ * 640x360 all stream at 400. */
 const struct uvcd_frame_info uvcd_frames[UVCD_NUM_FRAMES + 1] = {
-	[0] = {0, 0, 0, 0},
-	[UVCD_FRAME_1080P] = {1920, 1080, 1024 * 1024, 3000000},
-	[UVCD_FRAME_1280X960] = {1280, 960, 768 * 1024, 2400000},
-	[UVCD_FRAME_720P] = {1280, 720, 768 * 1024, 1800000},
-	[UVCD_FRAME_800X600] = {800, 600, 512 * 1024, 1200000},
-	[UVCD_FRAME_640X480] = {640, 480, 512 * 1024, 1000000},
-	[UVCD_FRAME_360P] = {640, 360, 384 * 1024, 700000},
+	[0] = {0, 0, 0, 0, 0},
+	[UVCD_FRAME_1080P] = {1920, 1080, 2048 * 1024, 3000000, 125},
+	[UVCD_FRAME_1280X960] = {1280, 960, 1280 * 1024, 2400000, 240},
+	[UVCD_FRAME_720P] = {1280, 720, 1024 * 1024, 1800000, 330},
+	[UVCD_FRAME_800X600] = {800, 600, 512 * 1024, 1200000, 400},
+	[UVCD_FRAME_640X480] = {640, 480, 512 * 1024, 1000000, 400},
+	[UVCD_FRAME_360P] = {640, 360, 384 * 1024, 700000, 400},
 };
 
 const uint32_t uvcd_intervals[UVCD_NUM_INTERVALS] = {
@@ -199,7 +207,8 @@ uint32_t uvcd_snap_interval(uint32_t interval)
 	return best;
 }
 
-#define UVCD_FRAME_BUF_CAP (1024 * 1024) /* 1MB scratch, covers worst-case 1080p I-frame */
+/* The pump's copy of the newest frame; at least the largest max_size. */
+#define UVCD_FRAME_BUF_CAP (2048 * 1024)
 
 static int read_procfs_int(const char *path, int base, int def)
 {
@@ -255,7 +264,6 @@ static void apply_isp_controls(uvcd_pipeline_t *p)
 	RSS_HAL_CALL(p->ops, isp_set_dpc_strength, p->hal_ctx, p->controls.dpc);
 	RSS_HAL_CALL(p->ops, isp_set_drc_strength, p->hal_ctx, p->controls.drc);
 	RSS_HAL_CALL(p->ops, isp_set_backlight_comp, p->hal_ctx, p->controls.backlight);
-	RSS_HAL_CALL(p->ops, isp_set_defog_strength, p->hal_ctx, p->controls.defog);
 	RSS_HAL_CALL(p->ops, isp_set_highlight_depress, p->hal_ctx, p->controls.highlight);
 	RSS_HAL_CALL(p->ops, isp_set_running_mode, p->hal_ctx, RSS_ISP_DAY);
 	RSS_HAL_CALL(p->ops, isp_set_bypass, p->hal_ctx, 1);
@@ -411,17 +419,30 @@ int uvcd_pipeline_init(uvcd_pipeline_t *p)
 	 * whenever the host changes one -- else the compiled-in neutral
 	 * defaults. They are held here and pushed to the ISP at every
 	 * bring-up (hal_bring_up), since the ISP itself only exists while a
-	 * host is streaming. */
-	if (access(UVCD_CONFIG_DIRTY_PATH, F_OK) == 0) {
-		LOGW("previous run did not exit cleanly; using factory controls");
+	 * host is streaming.
+	 *
+	 * The saved file only ever holds values proven by a healthy stream,
+	 * so one stream that died before proving itself (see the crash guard
+	 * in uvcd_gadget.c) costs only the changes it hadn't saved. Only a run
+	 * of them points at the saved values themselves. */
+	p->unproven_streak = uvcd_config_streak_read(UVCD_CONFIG_DIRTY_PATH);
+	if (p->unproven_streak >= UVCD_CONFIG_UNPROVEN_LIMIT) {
+		LOGW("%d streams in a row died before proving healthy; using factory controls",
+		     p->unproven_streak);
 		uvcd_config_defaults(&p->controls);
-		/* Keep the rejected values for diagnosis, but never reload them
-		 * after a clean idle shutdown of this recovery run. */
+		/* Keep the rejected values for diagnosis, but never reload them. */
 		if (rename(UVCD_CONFIG_PATH, UVCD_CONFIG_PATH ".rejected") != 0 && errno != ENOENT) {
 			LOGE("cannot quarantine unsafe config: %s", strerror(errno));
 			goto fail;
 		}
+		if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
+			LOGW("clear %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
+		p->unproven_streak = 0;
 	} else {
+		if (p->unproven_streak)
+			LOGW("previous stream died before proving healthy (%d of %d); "
+			     "using the last saved controls",
+			     p->unproven_streak, UVCD_CONFIG_UNPROVEN_LIMIT);
 		uvcd_config_load(UVCD_CONFIG_PATH, &p->controls);
 	}
 
@@ -488,9 +509,6 @@ static void *pump_thread(void *arg)
 			total += frame.nals[n].length;
 
 		pthread_mutex_lock(&p->frame.lock);
-		if (p->cur_format == UVCD_FMT_MJPEG &&
-		    total > uvcd_frames[p->cur_frame].max_size * 9 / 10)
-			p->frame.jpeg_near_limit = true;
 		if (total <= p->frame.size) {
 			uint32_t off = 0;
 			for (uint32_t n = 0; n < frame.nal_count; n++) {
@@ -577,6 +595,14 @@ static uint32_t fps_step(uint32_t fps, int dir, uint32_t ceiling)
 	return best;
 }
 
+/* The zoom actually used at this output size. The control keeps what the
+ * host asked for, so switching to a size that can take it gets it back. */
+static int effective_zoom(const struct uvcd_control_state *c, uint8_t frame)
+{
+	int zoom = c->zoom < UVCD_ZOOM_MIN ? UVCD_ZOOM_MIN : c->zoom;
+	return zoom > uvcd_frames[frame].max_zoom ? uvcd_frames[frame].max_zoom : zoom;
+}
+
 /* The part of the sensor image the host sees for output `frame`: the
  * largest centred rectangle of the output's aspect ratio (so 4:3 sizes are
  * cropped, not squashed), narrowed by zoom and moved by pan/tilt. */
@@ -585,7 +611,7 @@ static void compute_view(const uvcd_pipeline_t *p, const struct uvcd_control_sta
 {
 	int sw = p->sensor_w, sh = p->sensor_h;
 	int ow = uvcd_frames[frame].width, oh = uvcd_frames[frame].height;
-	int zoom = c->zoom < UVCD_ZOOM_MIN ? UVCD_ZOOM_MIN : c->zoom;
+	int zoom = effective_zoom(c, frame);
 
 	int bw = sw, bh = (int)((int64_t)sw * oh / ow);
 	if (bh > sh) {
@@ -851,6 +877,9 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	/* Start on the view zoom/pan/tilt ask for; uvcd_apply_view() moves
 	 * it live from then on. */
 	int vx, vy, vw, vh;
+	if (effective_zoom(&p->controls, frame) < p->controls.zoom)
+		LOGI("zoom %d limited to %d at %ux%u (scaler upscale limit)", p->controls.zoom,
+		     effective_zoom(&p->controls, frame), fi->width, fi->height);
 	compute_view(p, &p->controls, frame, &vx, &vy, &vw, &vh);
 	/* Never pass an invalid sensor-space rectangle to the ISP. */
 	if (vw <= 0 || vh <= 0 || vx < 0 || vy < 0 ||
@@ -892,9 +921,14 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	uint32_t bitrate = jpeg ? 0 : effective_h264_bitrate(p, frame);
 	int16_t min_qp = (int16_t)c->h264_min_qp;
 	int16_t max_qp = (int16_t)c->h264_max_qp;
-	int jpeg_quality = c->mjpeg_quality;
-	if (p->mjpeg_quality_limit > 0 && jpeg_quality > p->mjpeg_quality_limit)
-		jpeg_quality = p->mjpeg_quality_limit;
+
+	/* The HAL's own CBR floor is QP 34, which a still scene reaches at
+	 * well under the target: every bitrate from 1 to 8 Mbps came out at
+	 * ~0.7 Mbps at 720p. Automatic uses the floor it gives VBR instead,
+	 * so the target is what sets the rate. */
+	if (min_qp < 0)
+		min_qp = max_qp >= 0 && max_qp < UVCD_H264_AUTO_MIN_QP ? max_qp
+								  : UVCD_H264_AUTO_MIN_QP;
 
 	/* Crossed bounds would make channel creation fail, and when this runs
 	 * as an in-place restart the host is left with no frames at all. Fall
@@ -920,7 +954,7 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 		.max_same_scene_cnt = 1, /* SDK default 2 doubles the IDR interval */
 		/* On T31 a JPEG channel's quality *is* its initial QP, and it can
 		 * only be set here -- enc_set_jpeg_qp is unsupported on this SDK. */
-		.init_qp = jpeg ? (int16_t)jpeg_quality : -1,
+		.init_qp = jpeg ? (int16_t)c->mjpeg_quality : -1,
 		.min_qp = jpeg ? -1 : min_qp,
 		.max_qp = jpeg ? -1 : max_qp,
 		.ip_delta = -1,
@@ -931,7 +965,8 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	 * them explicitly before CreateChn and check errors. Keep one large
 	 * JPEG buffer because the pump copies/releases it immediately; two
 	 * would waste scarce reserved memory. Reset both options for H.264.
-	 * USB still has a smaller cap, protected by adaptive JPEG quality. */
+	 * USB has a smaller cap (max_size): a JPEG over it is dropped, which at
+	 * about 1 byte per pixel takes far more than quality 100 needs. */
 	uint32_t stream_bytes = jpeg ? (fi->width * fi->height * 4u + 65535u) & ~4095u
 				    : fi->max_size;
 	ret = RSS_HAL_CALL(p->ops, enc_set_max_stream_cnt, p->hal_ctx, UVCD_ENC_CHN,
@@ -1045,7 +1080,6 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 
 	p->frame.seq = 0;
 	p->frame.len = 0;
-	p->frame.jpeg_near_limit = false;
 	p->pump_run = 1;
 	if (pthread_create(&p->pump_tid, NULL, pump_thread, p) != 0) {
 		LOGE("pump thread create failed");

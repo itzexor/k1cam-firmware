@@ -53,6 +53,11 @@ struct uvcd_frame_info {
 	uint16_t height;
 	uint32_t max_size;    /* worst-case compressed frame size */
 	uint32_t h264_bitrate; /* bps, only used when format == H264 */
+	/* Highest zoom (x100) this output size can take. Zoom upscales a
+	 * sensor crop to the output, and past a per-size ratio the T31 scaler
+	 * fails: ISP errors on every frame (or a silent stall), no encoded
+	 * frames. Measured on the K1, with a margin. */
+	uint16_t max_zoom;
 };
 
 extern const struct uvcd_frame_info uvcd_frames[UVCD_NUM_FRAMES + 1];
@@ -119,7 +124,6 @@ struct uvcd_control_state {
 	int temper;
 	int dpc;
 	int drc;
-	int defog;
 	int highlight;
 
 	/* Encoder. Read by the pipeline when it creates the encoder channel;
@@ -127,7 +131,7 @@ struct uvcd_control_state {
 	int h264_bitrate_kbps; /* 0 = per-resolution default (uvcd_frames) */
 	int h264_rate_control; /* UVCD_H264_RC_* */
 	int h264_gop_frames;   /* 0 = one second at the negotiated frame rate */
-	int h264_min_qp;       /* -1 = SDK default */
+	int h264_min_qp;       /* -1 = UVCD_H264_AUTO_MIN_QP */
 	int h264_max_qp;       /* -1 = SDK default */
 	int h264_profile;      /* 0 = baseline, 1 = main, 2 = high */
 	int mjpeg_quality;     /* 1..100, higher is better */
@@ -164,6 +168,7 @@ struct uvcd_control_state {
 #define UVCD_H264_RC_CBR 0
 #define UVCD_H264_RC_VBR 1
 #define UVCD_H264_RC_CAPPED_VBR 2
+#define UVCD_H264_AUTO_MIN_QP 20 /* h264_min_qp -1 */
 
 /* Gamma is a 129-point curve in the HAL, but a single scalar in UVC/V4L2.
  * The ISP's factory curve is read once at init and used as the reference
@@ -195,7 +200,6 @@ struct uvcd_frame_buf {
 	uint64_t seq;      /* bumped on every publish; consumer tracks last seen */
 	int64_t ts_us;     /* capture time, CLOCK_MONOTONIC microseconds */
 	bool is_key;
-	bool jpeg_near_limit; /* sticky until the gadget consumes it, under lock */
 };
 
 /* --------------------------------------------------------------------------
@@ -237,7 +241,9 @@ typedef struct {
 	 * (or compiled-in defaults) at init, changed in place by the gadget's
 	 * control paths, and read here when the encoder channel is created. */
 	struct uvcd_control_state controls;
-	int mjpeg_quality_limit; /* runtime size protection; 0 = requested quality */
+	/* Streams in a row that started without proving healthy, from the
+	 * crash guard file (uvcd_config.h); 0 once one does. */
+	int unproven_streak;
 
 	/* The ISP's factory gamma curve, read once after HAL init. Scaling
 	 * this rather than synthesizing a curve from scratch keeps gamma=100
