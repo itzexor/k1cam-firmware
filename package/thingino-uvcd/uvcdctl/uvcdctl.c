@@ -22,7 +22,9 @@
  * Settings persist on their own -- the daemon writes them back whenever it
  * accepts a change. There is deliberately no "save" command.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -699,6 +701,10 @@ int main(int argc, char **argv)
 			int saved;
 			if (ctrl_saved(fd, &ctrl_defs[i], &saved) != 0 || saved == -32768)
 				continue;
+			/* uvcvideo presents CT_AE_MODE's UVC bitmap value 8 as
+			 * V4L2_EXPOSURE_APERTURE_PRIORITY (menu value 3). */
+			if (ctrl_defs[i].cid == V4L2_CID_EXPOSURE_AUTO && saved == 8)
+				saved = V4L2_EXPOSURE_APERTURE_PRIORITY;
 			if (ctrl_set(fd, &ctrl_defs[i], saved) != 0)
 				rc = 1;
 		}
