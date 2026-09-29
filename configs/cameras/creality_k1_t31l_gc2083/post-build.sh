@@ -125,7 +125,7 @@ export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export EDITOR=vi
 export PAGER=less
-export HISTFILE=/tmp/.bash_history
+export HISTFILE=/tmp/.ash_history
 export HISTSIZE=500
 export HISTFILESIZE=500
 
@@ -151,7 +151,7 @@ EOF
 cat >"$TARGET_DIR/usr/bin/k1-console" <<'EOF'
 #!/bin/sh
 export TERM=${TERM:-vt100}
-exec /bin/bash --login
+exec /bin/sh -l
 EOF
 chmod 0755 "$TARGET_DIR/usr/bin/k1-console"
 
@@ -166,7 +166,7 @@ chmod 0755 "$TARGET_DIR/usr/bin/k1-console"
 # enumeration. busybox init does not rate-limit respawns, so the entry
 # throttles itself: /dev/ttyGS0 only exists once uvcd's init script has loaded
 # g_webcam, and a getty that fails must not spin. -L ignores carrier; -w waits
-# for a clean CR/LF before starting Bash, discarding bytes queued while ACM was
+# for a clean CR/LF before starting ash, discarding bytes queued while ACM was
 # enumerating instead of feeding them to a live shell as commands.
 INITTAB="$TARGET_DIR/etc/inittab"
 sed -i '/ttyGS0/d' "$INITTAB"
