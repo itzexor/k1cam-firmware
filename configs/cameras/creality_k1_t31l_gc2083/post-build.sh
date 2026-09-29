@@ -1,9 +1,11 @@
 #!/bin/sh
 # post-build.sh -- trim this board's rootfs down to a USB webcam.
 #
-# Runs after thingino's scripts/rootfs_script.sh (see
+# Runs before thingino's scripts/rootfs_script.sh (see
 # BR2_ROOTFS_POST_BUILD_SCRIPT in the defconfig), with Buildroot's target
-# directory as $1.
+# directory as $1. This ordering removes BusyBox's generated S02klogd before
+# the global script validates init scripts; the replacement below uses the
+# short options supported by this build.
 #
 # The Creality K1 camera is USB-powered, has no network and no LEDs, and
 # answers to exactly one thing: a USB host opening it as a UVC webcam. What
@@ -11,7 +13,8 @@
 # about a second. So this removes every boot service that has no job on such
 # a device, rather than leaving them to run and exit.
 #
-# Most of these come from thingino's global overlay/, which every build gets
+# Most of these come from thingino's global overlay/, which Buildroot copies
+# before any post-build script and every build gets
 # unconditionally and which no Kconfig option controls -- setting a package
 # to =n in the defconfig does not stop its init script from being installed.
 # That is why this is done here, by file, instead of with config options.
@@ -35,7 +38,7 @@ INITD="$TARGET_DIR/etc/init.d"
 #   leds:         the board has none
 #   duplicate:    S02sysctl is busybox's own copy of S00sysctl
 for script in \
-	S30dropbear S50dropbear S40network S41ifplugd S43mounts S05dns \
+	S02klogd S30dropbear S50dropbear S40network S41ifplugd S43mounts S05dns \
 	S48webui-config S50mdnsd S91mqttsub \
 	F01datetime S01timezone S49ntpd \
 	S01syslogd S01seedrng S03mac S04hostname S50crond S94rc.local \
