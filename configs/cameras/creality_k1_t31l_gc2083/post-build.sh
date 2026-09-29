@@ -1,11 +1,11 @@
 #!/bin/sh
 # post-build.sh -- trim this board's rootfs down to a USB webcam.
 #
-# Runs before thingino's scripts/rootfs_script.sh (see
+# Runs before and after thingino's scripts/rootfs_script.sh (see
 # BR2_ROOTFS_POST_BUILD_SCRIPT in the defconfig), with Buildroot's target
-# directory as $1. This ordering removes BusyBox's generated S02klogd before
-# the global script validates init scripts; the replacement below uses the
-# short options supported by this build.
+# directory as $1. The first pass removes BusyBox's generated S02klogd before
+# the global script validates init scripts; the final pass removes generic
+# files that script recreates. Everything below is intentionally idempotent.
 #
 # The Creality K1 camera is USB-powered, has no network and no LEDs, and
 # answers to exactly one thing: a USB host opening it as a UVC webcam. What
