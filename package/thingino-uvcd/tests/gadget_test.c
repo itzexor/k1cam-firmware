@@ -125,6 +125,9 @@ int main(void)
 	assert(saves == 1 && last_saved.brightness == 150 && !g.config_dirty);
 	config_flush(&g, true);
 	assert(saves == 1); /* nothing pending */
+	/* Rewriting a value it already has changes nothing. */
+	assert(uvcd_ctrl_set(&g, brightness, 150, &applied) == 0 && applied == 150);
+	assert(!g.config_dirty);
 	assert(streak_writes == 0 && unlinks == 0); /* ...and idle is never a crash. */
 
 	/* A stream is counted in the crash guard from its start, once, on top
@@ -151,7 +154,9 @@ int main(void)
 	assert(good_saves == 1); /* proven once is enough */
 
 	/* A change mid-stream has to prove itself again before it is what a
-	 * crash falls back to. */
+	 * crash falls back to; a rewrite of the same value does not. */
+	assert(uvcd_ctrl_set(&g, brightness, 150, &applied) == 0);
+	assert(!g.guard_armed && streak_writes == 1);
 	assert(uvcd_ctrl_set(&g, brightness, 160, &applied) == 0);
 	assert(g.guard_armed && streak_writes == 2 && last_streak == 1);
 	assert(g.healthy_since_ms == 0 && p.good.brightness == 150);
@@ -206,13 +211,16 @@ int main(void)
 	assert(uvcd_ctrl_find("spatial-denoise")->def == 192);
 
 	/* Factory reset is written at once, and replaces the proven controls
-	 * so a later crash cannot bring back what it threw away. */
+	 * so a later crash cannot bring back what it threw away. Even when
+	 * nothing differs from factory, it leaves the file at factory. */
 	g.streaming = false;
 	int was_saves = saves, was_good = good_saves;
 	uvcd_ctrl_reset(&g);
 	assert(saves == was_saves + 1 && last_saved.brightness == 128 && !g.config_dirty);
 	assert(good_saves == was_good + 1 && last_good.brightness == 128);
 	assert(p.good.brightness == 128 && p.controls.brightness == 128);
+	uvcd_ctrl_reset(&g);
+	assert(saves == was_saves + 2 && good_saves == was_good + 2);
 
 	/* The retired explicit-save selectors answer like any unknown one. */
 	for (unsigned sel = 23; sel <= 25; sel++)

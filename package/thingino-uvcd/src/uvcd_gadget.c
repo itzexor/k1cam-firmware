@@ -788,8 +788,14 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 	if (ret != 0)
 		return -1;
 
-	*uvcd_ctrl_field(&g->pipe->controls, def) = value;
-	config_mark_dirty(g);
+	int *field = uvcd_ctrl_field(&g->pipe->controls, def);
+	/* Hosts rewrite values they already have (uvcvideo probes
+	 * power-line-frequency on every connect): nothing to persist or
+	 * re-prove then. */
+	if (*field != value) {
+		*field = value;
+		config_mark_dirty(g);
+	}
 	if (def->kind == UVCD_CTRL_CUSTOM)
 		encoder_after_store(g, (uint8_t)def->selector);
 	if (out_applied)
@@ -817,8 +823,10 @@ void uvcd_ctrl_reset(gadget_t *g)
 	if (g->restart_mjpeg)
 		encoder_restart(g, UVCD_FMT_MJPEG);
 
-	/* Written at once, and the old proven controls go with it: a crash
-	 * after a reset must not bring back what the reset threw away. */
+	/* Written at once, even if nothing changed, and the old proven
+	 * controls go with it: a crash after a reset must not bring back what
+	 * the reset threw away. */
+	g->config_dirty = true;
 	config_flush(g, true);
 	if (uvcd_config_save(UVCD_CONFIG_GOOD_PATH, &g->pipe->controls) != 0)
 		LOGW("persist %s: %s", UVCD_CONFIG_GOOD_PATH, strerror(errno));
