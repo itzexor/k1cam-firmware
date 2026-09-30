@@ -1,87 +1,60 @@
-Thingino
---------
+# k1cam
 
-Thingino (_/θinˈdʒiːno/_, _thin-jee-no_) is an open-source firmware for Ingenic SoC IP cameras.
+Replacement firmware for the USB webcam module of the Creality K1 3D printer
+(Ingenic T31L, GalaxyCore GC2083, 8 MiB SPI NOR). The camera enumerates as a
+standard UVC webcam (so far tested with Linux hosts), with:
 
-![Thingino Web UI][10]
+- MJPEG and H.264 at 1920x1080, 1280x960, 1280x720, 800x600, 640x480 and
+  640x360, 5 to 30 fps;
+- the usual image controls (brightness, contrast, white balance, exposure,
+  zoom and pan/tilt, ...) as standard UVC controls, and the ISP and encoder
+  settings that UVC has no control for on a vendor extension unit, reachable
+  with `uvcdctl` (package/k1cam-uvcd/uvcdctl);
+- settings that persist across reboots, with a factory reset;
+- a shell on the USB serial (ACM) port.
 
-### Supported Hardware
+The camera only runs its image pipeline while a program is streaming.
 
-Please find [the full list of supported cameras](docs/supported_hardware.md)
-in a separate document. Visit [our website][0] for an illustrated version of
-the list.
+## Build
 
----
+Needs a Linux x86_64 host with Buildroot's usual prerequisites, and the kernel
+sources checked out next to this tree as `../thingino-linux` (branch
+`k1cam`).
 
-### Thingino Repository Branches Explaned
-
-We've split the Thingino repository into two branches: stable and master, to better manage development and provide reliable releases for users.
-
-**Stable Branch**
-
-Provides a reliable, tested version of Thingino for general use. It includes carefully selected, stable changes. It uses the original ONVIF server and Prudynt with libconfig.
-The stable branch will receive critical fixes. New features will only be added once they are thoroughly tested and mature in the master branch.
-
-For users who want a dependable version of Thingino without needing to build or contribute to development.
-
-**Master Branch**
-
-The development hub for new features and experimental changes. Includes advanced features, and uses the new [raptor][13] streamer. These are still in development and may not be stable.
-
-Only for developers and contributors who can build the project themselves and actively participate in improving the code.
-
-> [!WARNING]
-> The master branch uses a highly experimental maineline U-Boot.
-> - Having access to the UART port on the camera and unbricking skills is **highly recommended** when building images from the master branch.
-
-This structure allows us to maintain a reliable version (stable) for most users while continuing to innovate and test new features (master). Critical fixes and matured features from master will be gradually integrated into stable for broader use.
-
-> [!NOTE]
-> If you’re not contributing to development, we recommend sticking with the stable branch.
-
-Thank you for using Thingino! For questions or contributions, please join our Discord community or check the GitHub issues page.
-
-### Building
-
-```
-git clone -b stable --recurse-submodules https://github.com/themactep/thingino-firmware
-cd thingino-firmware
-make update
+```sh
+git submodule update --init
 make
 ```
 
-Read [Building from sources][7] article for more info.
+The result is `output/k1cam/images/k1cam.bin`, a full image of the 8 MiB
+flash:
 
-### Documentation
+| partition | offset   | size     |                                  |
+| --------- | -------- | -------- | -------------------------------- |
+| boot      | 0x000000 | 320 KiB  | U-Boot                           |
+| env       | 0x050000 | 64 KiB   | U-Boot environment               |
+| backup    | 0x060000 | 64 KiB   |                                  |
+| kernel    | 0x070000 | 1600 KiB | Linux 3.10 uImage                |
+| rootfs    | 0x200000 | 1536 KiB | squashfs                         |
+| data      | 0x380000 | 4608 KiB | jffs2 overlay (settings)         |
 
-- [Firmware Image Structure](docs/firmware-image-structure.md) - Partition layout and image assembly
-- [Firmware Dumping](docs/firmware.md) - How to backup existing firmware
-- [Camera Recovery](docs/camera-recovery.md) - Recovering from failed updates
-- [Local Build Settings](docs/local-build-settings.md) - Layered user-specific settings from `THINGINO_USER_DIR/common`, per camera, and per device IP
+The layout is defined once, in `board/k1cam/uenv.txt`. See AGENTS.md for how
+the tree is organised.
 
-### Resources
+## Origins and licences
 
-- [Project Website][0]
-- [Project Wiki][1]
-- Buildroot Manual [HTML][5] [PDF][6]
-- [Discord channel][3]
-- [Telegram group][4]
+k1cam started from [thingino](https://github.com/themactep/thingino-firmware)'s
+firmware tree and keeps a small part of it (its Buildroot integration,
+system scripts and several packages, under their own names), under the MIT
+licence in LICENSE. k1cam is not affiliated with the thingino project.
 
-### GitHub CI Status
+Also used, fetched at pinned versions by the build:
 
-[![toolchain-x86_64][11]][8]
-[![firmware-stable][12]][9]
+- the Linux kernel from
+  [gtxaspec/thingino-linux](https://github.com/gtxaspec/thingino-linux)
+  (GPL-2.0), with k1cam's USB gadget changes on its `k1cam` branch;
+- Ingenic's ISP, encoder and sensor drivers and libraries, via thingino's
+  and gtxaspec's repositories (ingenic-sdk, ingenic-lib, raptor-hal);
+- [Buildroot](https://buildroot.org) (GPL-2.0) and U-Boot (GPL-2.0).
 
-[0]: https://thingino.com/
-[1]: https://github.com/themactep/thingino-firmware/wiki
-[3]: https://discord.gg/xDmqS944zr
-[4]: https://t.me/thingino
-[5]: https://buildroot.org/downloads/manual/manual.html
-[6]: https://nightly.buildroot.org/manual.pdf
-[7]: https://github.com/themactep/thingino-firmware/wiki/Building-from-sources
-[8]: https://github.com/themactep/thingino-firmware/actions/workflows/toolchain.yaml
-[9]: https://github.com/themactep/thingino-firmware/actions/workflows/firmware.yaml
-[10]: https://github.com/user-attachments/assets/5e74827c-47f9-4ea0-b523-d12a199a9974
-[11]: https://github.com/themactep/thingino-firmware/actions/workflows/toolchain-x86_64.yaml/badge.svg
-[12]: https://github.com/themactep/thingino-firmware/actions/workflows/firmware-stable.yml/badge.svg
-[13]: http://github.com/gtxaspec/raptor
+uvcd and uvcdctl (package/k1cam-uvcd) are GPL-3.0.

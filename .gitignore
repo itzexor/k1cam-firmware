@@ -24,13 +24,9 @@
 /user
 /output
 /overrides
-/package/thingino-webui/files/var/www/onvif/*_files
-/package/thingino-webui/files/var/www/onvif/*_service
 /retired
 /sdk
 /tmp
 /toolchain
 /trash
 /local.mk
-/.prereqs.done
-/.selected_camera*
