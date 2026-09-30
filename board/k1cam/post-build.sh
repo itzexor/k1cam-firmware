@@ -43,6 +43,9 @@ fi
 GIT_BRANCH=$(git -C "$EXTERNAL_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || printf detached)
 GIT_HASH=$(git -C "$EXTERNAL_DIR" show -s --format=%H)
 GIT_SHORT_HASH=$(printf '%.7s' "$GIT_HASH")
+# Say so when the image was built from uncommitted changes to tracked files.
+git -C "$EXTERNAL_DIR" diff --quiet HEAD -- 2>/dev/null || GIT_SHORT_HASH="$GIT_SHORT_HASH-dirty"
+KERNEL_COMMIT=$(sed -n 's/^BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="\(.*\)"$/\1/p' "${BR2_CONFIG:?}")
 GIT_TIME=$(TZ=UTC0 git -C "$EXTERNAL_DIR" show -s --date='format-local:%Y-%m-%d %H:%M:%S +0000' --format=%cd)
 BUILD_TIME=$(env -u SOURCE_DATE_EPOCH TZ=UTC date '+%Y-%m-%d %H:%M:%S %z')
 BUILD_EPOCH=$(date +%s)
@@ -65,6 +68,7 @@ BUILD_ID="$GIT_BRANCH+$GIT_SHORT_HASH, $BUILD_TIME"
 BUILD_TIME="$BUILD_TIME"
 COMMIT_ID="$GIT_BRANCH+$GIT_SHORT_HASH, $GIT_TIME"
 BOOTLOADER=isvp_t31l_sfcnor
+KERNEL_COMMIT=$KERNEL_COMMIT
 HOSTNAME=k1cam
 TIME_STAMP=$BUILD_EPOCH
 EOF
