@@ -20,11 +20,8 @@ define INGENIC_UCLIBC_INSTALL_STAGING_CMDS
 	$(INSTALL) -D -m 0644 $(@D)/libuclibcshim.a $(STAGING_DIR)/usr/lib/libuclibcshim.a
 endef
 
-# Raptor links the shim statically — skip .so on device when raptor is the streamer
-ifneq ($(BR2_PACKAGE_THINGINO_RAPTOR),y)
 define INGENIC_UCLIBC_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/libuclibcshim.so $(TARGET_DIR)/usr/lib/libuclibcshim.so
 endef
-endif
 
 $(eval $(generic-package))

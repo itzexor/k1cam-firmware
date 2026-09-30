@@ -1,2 +1,2 @@
-name: THINGINO
-desc: External Buildroot tree for Thingino firmware
+name: K1CAM
+desc: Buildroot external tree for the Creality K1 USB camera

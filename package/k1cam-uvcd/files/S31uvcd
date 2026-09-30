@@ -12,6 +12,22 @@ SUPERVISOR_PID=/var/run/uvcd-supervisor.pid
 READY=/var/run/uvcd.ready
 VIDEO=/dev/video0
 
+set_usb_device_mode() {
+	# Fixed T31 device-mode sequence; this board has no host-mode connector.
+	devmem 0x13500000 32 0x001100cc
+	devmem 0x10000040 32 0x0b000096
+	devmem 0x10000040 32 0x0b000FFF
+}
+
+read_serial() {
+	serial=
+	for address in 0x13540200 0x13540204 0x13540208 0x1354023C; do
+		value=$(devmem "$address" 2>/dev/null) || return 1
+		serial="$serial$(printf '%u' "$value")"
+	done
+	printf '%s\n' "$serial"
+}
+
 # Poll a condition in 50ms steps. Every wait in start() is on the path to
 # the host seeing the camera, and polling in whole seconds rounds each one
 # up to the next second. Usage: wait_for <max-steps> <command...>
@@ -130,9 +146,7 @@ case "$1" in
 			exit 0
 		fi
 		echo "Starting uvcd..."
-		if [ -x /usr/sbin/usb-role ]; then
-			usb-role -m device 2>/dev/null
-		fi
+		set_usb_device_mode
 		if [ ! -e "$VIDEO" ]; then
 			# g_webcam composes a CDC-ACM function alongside UVC on its own
 			# (webcam.c requests "acm" via the kernel's usbfunc: module
@@ -142,7 +156,7 @@ case "$1" in
 			# USB serial number: the SoC's efuse ID, so every camera has its
 			# own and two on one host get distinct /dev/v4l/by-id and
 			# /dev/serial/by-id names. Left out if it can't be read.
-			serial=$(soc -s 2>/dev/null)
+			serial=$(read_serial 2>/dev/null)
 			modprobe g_webcam ${serial:+iSerialNumber=$serial} || {
 				echo "Failed to load g_webcam"
 				exit 1

@@ -1,3 +1,0 @@
-# Avoid filling the connection tracking table on small-RAM devices
-# (0 disables, but we just set a generous ceiling)
-net.netfilter.nf_conntrack_max = 2048

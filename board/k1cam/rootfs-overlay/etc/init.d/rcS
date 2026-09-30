@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# Keep the kernel boot log on the UART, but from here on only errors and
+# worse: uvcd logs to /dev/kmsg and would otherwise flood the console.
+echo "3 3 1 3" >/proc/sys/kernel/printk
+
+# Shell glob order is the service order: S01, S11, S31, ...
+for i in /etc/init.d/S*; do
+	[ -x "$i" ] || continue
+	"$i" start
+done
+
+exit 0

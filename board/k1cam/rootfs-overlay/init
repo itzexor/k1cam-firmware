@@ -1,0 +1,32 @@
+#!/bin/sh
+
+die() {
+	echo "init: $*" >&2
+	exit 1
+}
+
+mount -t proc proc /proc || die "cannot mount /proc"
+mtd=$(awk -F: '/"data"/{print $1}' /proc/mtd)
+[ -n "$mtd" ] || die "data partition not found"
+block=$(printf '%s\n' "$mtd" | sed 's/^mtd/mtdblock/')
+# A missing mount point also fails the mount; never erase the data for that.
+[ -d /overlay ] && [ -d /rom ] || die "rootfs lacks /overlay or /rom"
+mount -t jffs2 -o noatime "/dev/$block" /overlay 2>/dev/null || {
+	echo "init: formatting empty data partition" >&2
+	flash_eraseall -j "/dev/$mtd" || die "cannot format data partition"
+	mount -t jffs2 -o noatime "/dev/$block" /overlay || die "cannot mount data partition"
+}
+
+# Linux 3.10 uses the original overlayfs interface. Keep the modern form as a
+# fallback so the root mount remains understandable if the kernel is updated.
+if ! mount -t overlayfs -o noatime,lowerdir=/,upperdir=/overlay overlay /mnt; then
+	mkdir -p /overlay/root /overlay/work
+	mount -t overlay -o noatime,lowerdir=/,upperdir=/overlay/root,workdir=/overlay/work overlay /mnt ||
+		die "cannot mount writable overlay"
+fi
+
+pivot_root /mnt /mnt/rom || die "cannot pivot root"
+mount -o noatime,move /rom/proc /proc
+mount -o noatime,move /rom/dev /dev
+mount -o noatime,move /rom/overlay /overlay
+exec /sbin/init "$@"

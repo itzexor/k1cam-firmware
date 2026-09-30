@@ -6,239 +6,27 @@ INGENIC_SDK_VERSION = 7b4b0f462780464f3de15ac82168df93922f5993
 INGENIC_SDK_LICENSE = GPL-2.0+
 INGENIC_SDK_LICENSE_FILES = LICENSE
 
-# Ensure thingino-core is installed before ingenic-sdk so thingino.json is available
-INGENIC_SDK_DEPENDENCIES = thingino-core host-thingino-jct
-
-# Optional ISP firmware version for sensor IQ selection. When set, IQ tuning is
-# taken from sensor-iq/<soc>/<version>/ (e.g. t23 2.10) instead of the flat
-# per-soc default. Empty selects the primary version.
-SENSOR_ISP_FW = $(call qstrip,$(BR2_SENSOR_ISP_FW))
-
-# Map thingino's config onto the SDK's own CONFIG_INGENIC_* component
-# switches, driven by the "SDK components" menu in this package's Config.in.
-# The SDK no longer reads BR2_* symbols itself.
-#
-# Each mapping forces an explicit y/n so the menu is authoritative: the
-# Config.in default already carries the SoC/kernel-correct value, and an
-# override there wins. Audio follows the top-level BR2_THINGINO_AUDIO
-# switch rather than a component-menu entry.
-INGENIC_SDK_COMPONENTS = \
-	CONFIG_INGENIC_ISP=$(if $(BR2_THINGINO_DEV_CAMERA),y,n) \
-	CONFIG_INGENIC_SENSOR=$(if $(BR2_THINGINO_DEV_CAMERA),y,n) \
-	CONFIG_INGENIC_AUDIO=$(if $(BR2_THINGINO_AUDIO),y,n) \
-	CONFIG_INGENIC_AVPU=$(if $(BR2_INGENIC_SDK_AVPU),y,n) \
-	CONFIG_INGENIC_SOC_NNA=$(if $(BR2_INGENIC_SDK_SOC_NNA),y,n) \
-	CONFIG_INGENIC_MPSYS=$(if $(BR2_INGENIC_SDK_MPSYS),y,n) \
-	CONFIG_INGENIC_JZ_DTRNG=$(if $(BR2_INGENIC_SDK_MPSYS),y,n) \
-	CONFIG_INGENIC_GPIO_USERKEYS=$(if $(BR2_INGENIC_SDK_GPIO_USERKEYS),y,n) \
-	CONFIG_INGENIC_JZ_AES=$(if $(BR2_INGENIC_SDK_JZ_AES),y,n) \
-	CONFIG_INGENIC_TCU_ALLOC=$(if $(BR2_INGENIC_SDK_TCU_ALLOC),y,n) \
-	CONFIG_INGENIC_PWM=$(if $(BR2_INGENIC_SDK_PWM),y,n) \
-	CONFIG_INGENIC_MOTOR=$(if $(BR2_INGENIC_SDK_MOTOR),y,n)
-
+# This external tree builds one fixed camera. Keep the SDK's component matrix
+# out of Kconfig and state the exact T31/GC2083 module set here.
 INGENIC_SDK_MODULE_MAKE_OPTS = \
-	SOC_FAMILY=$(SOC_FAMILY) \
-	KERNEL_VERSION=$(KERNEL_VERSION) \
+	SOC_FAMILY=t31 \
+	KERNEL_VERSION=3.10.14 \
 	INSTALL_MOD_PATH=$(TARGET_DIR) \
 	INSTALL_MOD_DIR=ingenic \
-	SENSOR_1_MODEL=$(SENSOR_1_MODEL) \
-	$(INGENIC_SDK_COMPONENTS) \
-	$(MULTI_SENSOR_ENABLED) \
-	$(MULTI_SENSOR_1_ENABLED) \
-	$(MULTI_SENSOR_2_ENABLED)
-
-ifeq ($(KERNEL_VERSION),3.10.14)
-INGENIC_SDK_EXTRA_CFLAGS = -DCONFIG_KERNEL_3_10
-else
-INGENIC_SDK_EXTRA_CFLAGS = -DCONFIG_KERNEL_4_4_94
-endif
-
-ifeq ($(BR2_MIPS_NAN_2008),y)
-INGENIC_SDK_EXTRA_CFLAGS += -mnan=legacy
-endif
-
-ifeq ($(BR2_INGENIC_SDK_ISP_TRACE),y)
-INGENIC_SDK_EXTRA_CFLAGS += -DCONFIG_JZ_ISP_TRACE
-define INGENIC_SDK_LINUX_CONFIG_FIXUPS
-	$(call KCONFIG_ENABLE_OPT,CONFIG_JZ_ISP_TRACE)
-endef
-endif
-
-INGENIC_SDK_MODULE_MAKE_OPTS += EXTRA_CFLAGS="$(INGENIC_SDK_EXTRA_CFLAGS)"
-
-# Per-camera IQ file overrides (paths relative to BR2_EXTERNAL root)
-ifneq ($(call qstrip,$(BR2_SENSOR_1_IQ_FILE)),)
-	SENSOR_1_IQ_OVERRIDE = $(BR2_EXTERNAL_THINGINO_PATH)/$(call qstrip,$(BR2_SENSOR_1_IQ_FILE))
-endif
-ifneq ($(call qstrip,$(BR2_SENSOR_2_IQ_FILE)),)
-	SENSOR_2_IQ_OVERRIDE = $(BR2_EXTERNAL_THINGINO_PATH)/$(call qstrip,$(BR2_SENSOR_2_IQ_FILE))
-endif
-
-# Old SDK's don't set the SOC in the IQ file name
-ifneq ($(SENSOR_1_MODEL),)
-	ifneq ($(filter $(SOC_FAMILY),t10 t20 t30),)
-		SENSOR_1_CONFIG_NAME = $(SENSOR_1_MODEL).bin
-	else
-		SENSOR_1_CONFIG_NAME = $(SENSOR_1_MODEL)-$(SOC_FAMILY).bin
-	endif
-
-	ifneq ($(BR2_THINGINO_IMAGE_SENSOR_QTY),1)
-		MULTI_SENSOR_ENABLED   = CONFIG_MULTI_SENSOR=1
-		SENSOR_1_CONFIG_NAME   = $(patsubst %s0,%,$(SENSOR_1_MODEL))-$(SOC_FAMILY).bin
-		SENSOR_1_BIN_NAME      = $(patsubst %s0,%,$(SENSOR_1_MODEL))
-		MULTI_SENSOR_1_ENABLED = SENSOR_1_MODEL=$(SENSOR_1_MODEL)
-		MULTI_SENSOR_2_ENABLED = SENSOR_2_MODEL=$(SENSOR_2_MODEL)
-		SENSOR_2_BIN_NAME      = $(patsubst %s1,%,$(SENSOR_2_MODEL))
-		SENSOR_2_CONFIG_NAME   = $(patsubst %s1,%,$(SENSOR_2_MODEL))-$(SOC_FAMILY).bin
-	else
-		MULTI_SENSOR_ENABLED =
-		SENSOR_1_BIN_NAME = $(SENSOR_1_MODEL)
-	endif
-endif
-
-LINUX_CONFIG_LOCALVERSION = \
-	$(shell awk -F "=" '/^CONFIG_LOCALVERSION=/ {print $$2}' $(BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE))
-
-TARGET_MODULES_PATH = $(TARGET_DIR)/usr/lib/modules/$(KERNEL_VERSION)$(call qstrip,$(LINUX_CONFIG_LOCALVERSION))
-
-# Use the host jct tool by absolute path, not a bare `which jct`: the
-# host PATH is not guaranteed to carry it, and a silent miss here drops
-# the button config with no error. host-thingino-jct is a build
-# dependency (below) so the tool exists when this runs.
-INGENIC_SDK_JCT = $(HOST_DIR)/bin/jct
-
-define GENERATE_GPIO_USERKEYS_CONFIG
-	if [ "$(BR2_INGENIC_SDK_GPIO_USERKEYS)" = "y" ] && [ -r $(TARGET_DIR)/etc/thingino.json ]; then \
-		if [ ! -x $(INGENIC_SDK_JCT) ]; then \
-			echo "ERROR: host jct tool missing: $(INGENIC_SDK_JCT)"; exit 1; \
-		fi; \
-		gpio_userkeys_config=""; \
-		button_reset=$$($(INGENIC_SDK_JCT) $(TARGET_DIR)/etc/thingino.json get gpio.button_reset 2>/dev/null); \
-		if [ -n "$$button_reset" ] && [ "$$button_reset" != "null" ]; then \
-			gpio_userkeys_config="28,$${button_reset},1"; \
-		fi; \
-		button_chime=$$($(INGENIC_SDK_JCT) $(TARGET_DIR)/etc/thingino.json get gpio.chime 2>/dev/null); \
-		if [ -n "$$button_chime" ] && [ "$$button_chime" != "null" ]; then \
-			gpio_userkeys_config="$${gpio_userkeys_config:+$$gpio_userkeys_config;}2,$${button_chime},1"; \
-		fi; \
-		if [ -n "$$gpio_userkeys_config" ]; then \
-			echo "gpio-userkeys gpio_config=\"$$gpio_userkeys_config\"" > $(TARGET_DIR)/etc/modules.d/gpio-userkeys; \
-		fi; \
-	fi
-endef
-
-# $(call INSTALL_SENSOR_BIN, model, bin_name, config_name, iq_override_path)
-define INSTALL_SENSOR_BIN
-	if [ "$(1)" != "" ] && [ "$(1)" != "none" ]; then \
-		$(if $(filter-out $(SENSOR_2_MODEL),$(1)),ln -sf /usr/share/sensor $(TARGET_DIR)/etc/sensor;) \
-		if [ -n "$(4)" ] && [ -f "$(4)" ]; then \
-			$(INSTALL) -D -m 0644 $(4) \
-				$(TARGET_DIR)/usr/share/sensor/$(3); \
-		else \
-			iqdir=$(@D)/sensor-iq/$(SOC_FAMILY); \
-			if [ -n "$(SENSOR_ISP_FW)" ] && [ -f $$iqdir/$(SENSOR_ISP_FW)/$(2).bin ]; then \
-				iqdir=$$iqdir/$(SENSOR_ISP_FW); \
-			fi; \
-			$(INSTALL) -D -m 0644 $$iqdir/$(2).bin \
-				$(TARGET_DIR)/usr/share/sensor/$(3); \
-			if [ -f $$iqdir/$(2)-cust.bin ]; then \
-				$(INSTALL) -D -m 0644 $$iqdir/$(2)-cust.bin \
-					$(TARGET_DIR)/usr/share/sensor/$(patsubst %.bin,$(2)-cust-$(SOC_FAMILY).bin,$(3)); \
-			fi; \
-		fi; \
-		if [ "$(1)" != "$(2)" ]; then \
-			ln -sf $(3) $(TARGET_DIR)/usr/share/sensor/$(1)-$(SOC_FAMILY).bin; \
-		fi; \
-		$(if $(filter-out $(SENSOR_2_MODEL),$(1)),echo $(1) > $(TARGET_DIR)/usr/share/sensor/model;) \
-	fi
-endef
-
-define GENERATE_MODULE_LOADER
-	$(INSTALL) -m 0755 -d $(TARGET_DIR)/etc/modules.d
-
-	if [ "$(BR2_THINGINO_AIP)" = "y" ]; then \
-		echo "ingenic-aip" > $(TARGET_DIR)/etc/modules.d/aip; \
-	fi
-
-	if [ "$(BR2_THINGINO_VIDEO_OUT)" = "y" ]; then \
-		echo "vde" > $(TARGET_DIR)/etc/modules.d/vde; \
-		echo "fb" > $(TARGET_DIR)/etc/modules.d/fb; \
-		echo "ipu $(IPU_CLK_SRC) $(IPU_CLK)" > $(TARGET_DIR)/etc/modules.d/ipu; \
-	fi
-
-	if [ "$(BR2_THINGINO_VDEC)" = "y" ]; then \
-		echo "vdec" > $(TARGET_DIR)/etc/modules.d/vdec; \
-	fi
-
-	if [ "$(BR2_THINGINO_HDMI_AUDIO)" = "y" ]; then \
-		echo "hdmi_audio" > $(TARGET_DIR)/etc/modules.d/hdmi_audio; \
-	fi
-
-	if [ "$(BR2_THINGINO_DEV_CAMERA)" = "y" ] && [ "$(SOC_FAMILY)" != "a1" ]; then \
-		if [ "$(SOC_FAMILY)" = "t23" ]; then \
-			echo tx_isp_$(SOC_FAMILY) $(ISP_CLK_SRC) $(ISP_CLK) $(ISP_CLKA_CLK_SRC) $(ISP_CLKA_CLK) $(ISP_DAY_NIGHT_SWITCH_DROP_FRAME_NUM) $(ISP_CH0_PRE_DEQUEUE_TIME) $(ISP_CH0_PRE_DEQUEUE_INTERRUPT_PROCESS) $(ISP_CH0_PRE_DEQUEUE_VALID_LINES) $(ISP_CH1_DEQUEUE_DELAY_TIME) $(ISP_MIPI_SWITCH_GPIO) $(ISP_DIRECT_MODE) $(ISP_IVDC_MEM_LINE) $(ISP_IVDC_THRESHOLD_LINE) $(ISP_CONFIG_HZ) $(ISP_MEMOPT) $(ISP_PRINT_LEVEL) $(BR2_ISP_PARAMS) > $(TARGET_DIR)/etc/modules.d/20-isp; \
-		elif [ "$(SOC_FAMILY)" = "t30" ]; then \
-			echo tx_isp_$(SOC_FAMILY) $(ISP_CLK) $(ISP_PRINT_LEVEL) $(ISP_ISPW) $(ISP_ISPH) $(ISP_ISPTOP) $(ISP_ISPLEFT) $(ISP_ISPCROP) $(ISP_ISPCROPWH) $(ISP_ISPCROPTL) $(ISP_ISPSCALER) $(ISP_ISPSCALERWH) $(ISP_ISP_M1_BUFS) $(ISP_ISP_M2_BUFS) $(BR2_ISP_PARAMS) > $(TARGET_DIR)/etc/modules.d/20-isp; \
-		elif [ "$(SOC_FAMILY)" = "t41" ]; then \
-			echo tx_isp_$(SOC_FAMILY) $(ISP_CLK_SRC) $(ISP_CLK) $(ISP_CLKA_CLK_SRC) $(ISP_CLKA_CLK) $(ISP_CLKS_CLK_SRC) $(ISP_CLKS_CLK) $(ISP_DIRECT_MODE) $(ISP_MEMOPT) $(BR2_ISP_PARAMS) > $(TARGET_DIR)/etc/modules.d/20-isp; \
-		else \
-			echo tx_isp_$(SOC_FAMILY) $(ISP_CLK) $(ISP_DAY_NIGHT_SWITCH_DROP_FRAME_NUM) $(ISP_CH0_PRE_DEQUEUE_TIME) $(ISP_CH0_PRE_DEQUEUE_INTERRUPT_PROCESS) $(ISP_CH0_PRE_DEQUEUE_VALID_LINES) $(ISP_CH1_DEQUEUE_DELAY_TIME) $(ISP_MEMOPT) $(ISP_PRINT_LEVEL) $(BR2_ISP_PARAMS) > $(TARGET_DIR)/etc/modules.d/20-isp; \
-		fi \
-	fi
-
-	if [ "$(BR2_INGENIC_SDK_AVPU)" = "y" ]; then \
-		echo "avpu $(AVPU_CLK_SRC) $(AVPU_CLK)" > $(TARGET_DIR)/etc/modules.d/10-avpu; \
-	fi
-
-	if [ "$(BR2_INGENIC_SDK_PWM)" = "y" ]; then \
-		echo "pwm_core tcu_channels=0,1,3" >> $(TARGET_DIR)/etc/modules.d/pwm; \
-		echo "pwm_hal" >> $(TARGET_DIR)/etc/modules.d/pwm; \
-	fi
-
-	if [ "$(SOC_FAMILY)" = "t40" ] || [ "$(SOC_FAMILY)" = "t41" ]; then \
-		echo "mpsys-driver" >> $(TARGET_DIR)/etc/modules.d/mpsys; \
-	fi
-
-	if [ "$(BR2_THINGINO_NNA)" = "y" ] || [ "$(SOC_FAMILY)" = "t40" ] || [ "$(SOC_FAMILY)" = "t41" ]; then \
-		echo "soc-nna" >> $(TARGET_DIR)/etc/modules.d/nna; \
-	fi
-
-	if [ "$(BR2_INGENIC_SDK_JZ_AES)" = "y" ]; then \
-		echo "jz-aes" >> $(TARGET_DIR)/etc/modules.d/jz-aes; \
-	fi
-
-	if [ -n "$(SENSOR_1_MODEL)" ] && [ "$(SENSOR_1_MODEL)" != "none" ]; then \
-		if [ -n "$(SENSOR_2_MODEL)" ] && [ "$(SENSOR_2_MODEL)" != "none" ]; then \
-			echo "sensor_$(SENSOR_1_MODEL)_$(SOC_FAMILY) $(SENSOR_1_PARAMS)" > $(TARGET_DIR)/etc/modules.d/30-sensor_1; \
-		else \
-			echo "sensor_$(SENSOR_1_MODEL)_$(SOC_FAMILY) $(SENSOR_1_PARAMS)" > $(TARGET_DIR)/etc/modules.d/30-sensor; \
-		fi; \
-	fi
-
-	if [ -n "$(SENSOR_2_MODEL)" ] && [ "$(SENSOR_2_MODEL)" != "none" ]; then \
-		echo "sensor_$(SENSOR_2_MODEL)_$(SOC_FAMILY) $(SENSOR_2_PARAMS)" > $(TARGET_DIR)/etc/modules.d/30-sensor_2; \
-	fi
-endef
-
-define INSTALL_AUDIO_SUPPORT
-	gpio_speaker=$(BR2_THINGINO_AUDIO_GPIO); \
-	if [ -z "$$gpio_speaker" ]; then \
-		spk_gpio=-1; \
-		spk_level=-1; \
-	else \
-		spk_gpio=$$gpio_speaker; \
-		if [ "$(BR2_THINGINO_AUDIO_GPIO_LOW)" = "y" ]; then \
-			spk_level=0; \
-		else \
-			spk_level=1; \
-		fi; \
-	fi; \
-	echo "audio spk_gpio=$$spk_gpio spk_level=$$spk_level $(BR2_THINGINO_AUDIO_PARAMS)" > $(TARGET_DIR)/etc/modules.d/40-audio
-
-	[ -f $(@D)/config/webrtc_profile.ini ] && $(INSTALL) -D -m 0644 $(@D)/config/webrtc_profile.ini $(TARGET_DIR)/etc/
-
-	$(INSTALL) -D -m 0755 $(INGENIC_SDK_PKGDIR)/files/speaker-ctrl $(TARGET_DIR)/usr/sbin/speaker-ctrl
-endef
+	SENSOR_1_MODEL=gc2083 \
+	CONFIG_INGENIC_ISP=y \
+	CONFIG_INGENIC_SENSOR=y \
+	CONFIG_INGENIC_AVPU=y \
+	CONFIG_INGENIC_AUDIO=n \
+	CONFIG_INGENIC_SOC_NNA=n \
+	CONFIG_INGENIC_MPSYS=n \
+	CONFIG_INGENIC_JZ_DTRNG=n \
+	CONFIG_INGENIC_GPIO_USERKEYS=n \
+	CONFIG_INGENIC_JZ_AES=n \
+	CONFIG_INGENIC_TCU_ALLOC=n \
+	CONFIG_INGENIC_PWM=n \
+	CONFIG_INGENIC_MOTOR=n \
+	EXTRA_CFLAGS="-DCONFIG_KERNEL_3_10"
 
 define INGENIC_SDK_INSTALL_TARGET_CMDS
 	krel="$$( $(MAKE) -s -C $(LINUX_DIR) kernelrelease 2>/dev/null )"; \
@@ -248,19 +36,22 @@ define INGENIC_SDK_INSTALL_TARGET_CMDS
 		[ -d "$$root" ] || continue; \
 		libdir="$$root/lib"; \
 		if [ "$(BR2_ROOTFS_MERGED_USR)" = "y" ]; then libdir="$$root/usr/lib"; fi; \
-		find "$$libdir/modules" -mindepth 1 -maxdepth 1 -type d ! -name "$$krel" -exec rm -rf {} + 2>/dev/null || true; \
+		find "$$libdir/modules" -mindepth 1 -maxdepth 1 -type d ! -name "$$krel" \
+			-exec rm -rf {} + 2>/dev/null || true; \
 		$(INSTALL) -m 0755 -d "$$libdir/modules/$$krel"; \
 		touch "$$libdir/modules/$$krel/modules.builtin.modinfo"; \
 	done
 
-	if [ -n "$(SENSOR_1_MODEL)" ]; then \
-		$(call INSTALL_SENSOR_BIN,$(SENSOR_1_MODEL),$(SENSOR_1_BIN_NAME),$(SENSOR_1_CONFIG_NAME),$(SENSOR_1_IQ_OVERRIDE)); \
-		$(call INSTALL_SENSOR_BIN,$(SENSOR_2_MODEL),$(SENSOR_2_BIN_NAME),$(SENSOR_2_CONFIG_NAME),$(SENSOR_2_IQ_OVERRIDE)); \
-	fi
+	$(INSTALL) -D -m 0644 $(@D)/sensor-iq/t31/gc2083.bin \
+		$(TARGET_DIR)/usr/share/sensor/gc2083-t31.bin
+	ln -sfn /usr/share/sensor $(TARGET_DIR)/etc/sensor
+	echo gc2083 > $(TARGET_DIR)/usr/share/sensor/model
 
-	$(GENERATE_MODULE_LOADER)
-	$(GENERATE_GPIO_USERKEYS_CONFIG)
-	[ "$(BR2_THINGINO_AUDIO)" = "y" ] && $(INSTALL_AUDIO_SUPPORT)
+	$(INSTALL) -m 0755 -d $(TARGET_DIR)/etc/modules.d
+	echo "avpu" > $(TARGET_DIR)/etc/modules.d/10-avpu
+	echo "tx_isp_t31 isp_clk=200000000 isp_memopt=1 print_level=1" \
+		> $(TARGET_DIR)/etc/modules.d/20-isp
+	echo "sensor_gc2083_t31" > $(TARGET_DIR)/etc/modules.d/30-sensor
 endef
 
 $(eval $(kernel-module))

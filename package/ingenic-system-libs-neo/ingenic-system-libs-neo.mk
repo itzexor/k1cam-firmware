@@ -18,23 +18,12 @@ define INGENIC_SYSTEM_LIBS_NEO_INSTALL_STAGING_CMDS
 endef
 
 define INGENIC_SYSTEM_LIBS_NEO_INSTALL_TARGET_CMDS
-	$(if $(BR2_PACKAGE_INGENIC_SYSTEM_LIBS_NEO_LIBALOG),
-		$(INSTALL) -D -m 0755 $(@D)/libalog.so $(TARGET_DIR)/usr/lib/libalog.so
-	)
-	$(if $(BR2_PACKAGE_INGENIC_SYSTEM_LIBS_NEO_LIBSYSUTILS),
-		$(INSTALL) -D -m 0755 $(@D)/libsysutils.so $(TARGET_DIR)/usr/lib/libsysutils.so
-	)
+	$(INSTALL) -D -m 0755 $(@D)/libalog.so $(TARGET_DIR)/usr/lib/libalog.so
 endef
 
 define INGENIC_SYSTEM_LIBS_NEO_FINALIZE_TARGET
-	$(if $(BR2_PACKAGE_INGENIC_SYSTEM_LIBS_NEO_LIBALOG),
-		$(INSTALL) -m 0755 $(BUILD_DIR)/ingenic-system-libs-neo-$(INGENIC_SYSTEM_LIBS_NEO_VERSION)/libalog.so \
-			$(TARGET_DIR)/usr/lib/libalog.so
-	)
-	$(if $(BR2_PACKAGE_INGENIC_SYSTEM_LIBS_NEO_LIBSYSUTILS),
-		$(INSTALL) -m 0755 $(BUILD_DIR)/ingenic-system-libs-neo-$(INGENIC_SYSTEM_LIBS_NEO_VERSION)/libsysutils.so \
-			$(TARGET_DIR)/usr/lib/libsysutils.so
-	)
+	$(INSTALL) -m 0755 $(BUILD_DIR)/ingenic-system-libs-neo-$(INGENIC_SYSTEM_LIBS_NEO_VERSION)/libalog.so \
+		$(TARGET_DIR)/usr/lib/libalog.so
 endef
 INGENIC_SYSTEM_LIBS_NEO_TARGET_FINALIZE_HOOKS += INGENIC_SYSTEM_LIBS_NEO_FINALIZE_TARGET
 

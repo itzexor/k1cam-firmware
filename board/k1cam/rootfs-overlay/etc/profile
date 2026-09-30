@@ -1,0 +1,22 @@
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export EDITOR=vi
+export PAGER=less
+export HISTFILE=/tmp/.ash_history
+export HISTSIZE=500
+export HISTFILESIZE=500
+
+alias logs='dmesg'
+alias uvlog='dmesg | grep uvcd'
+alias controls='uvcdctl list'
+alias ll='ls -alF'
+
+if [ -n "$PS1" ]; then
+	printf '\033[1;36mCreality K1 USB camera\033[0m  '
+	printf 'uvcd: '
+	pidof uvcd >/dev/null && printf '\033[1;32mrunning\033[0m\n' || printf '\033[1;31mstopped\033[0m\n'
+	printf '  controls   current control values\n'
+	printf '  uvlog      uvcd log buffer\n'
+	printf '  sinfo      sensor information\n\n'
+	export PS1='\[\e[38;5;208m\]k1\[\e[0m\]:\[\e[38;5;153m\]\w\[\e[0m\]# '
+fi

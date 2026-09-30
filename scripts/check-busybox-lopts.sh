@@ -3,7 +3,7 @@
 # Post-build check: ensure no init script passes long options to busybox
 # applets whose long-option support is compiled out.
 #
-# Thingino disables CONFIG_LONG_OPTS globally and per-applet
+# k1cam disables CONFIG_LONG_OPTS globally and per-applet.
 # FEATURE_*_LONG_OPTIONS. Scripts that use --long-option syntax with these
 # applets will fail at runtime with "invalid option -- -".
 #
@@ -29,7 +29,7 @@ fi
 FOUND=0
 
 # ---------------------------------------------------------------------------
-# start-stop-daemon — long options disabled in our busybox config
+# start-stop-daemon -- long options disabled in our busybox config
 # ---------------------------------------------------------------------------
 SSD_LONG_OPTS="start|stop|background|make-pidfile|pidfile|exec|test|quiet|oknodo|verbose|nicelevel|user|name|signal|chuid|chdir|startas|output|remove-pidfile"
 

@@ -1,0 +1,14 @@
+# ipv4
+127.0.0.1	localhost
+127.0.1.1	k1cam
+
+# github
+140.82.112.3	github.com
+140.82.112.4	github.com
+185.199.108.133	raw.githubusercontent.com objects.githubusercontent.com
+185.199.109.133	raw.githubusercontent.com objects.githubusercontent.com
+185.199.110.133	raw.githubusercontent.com objects.githubusercontent.com
+185.199.111.133	raw.githubusercontent.com objects.githubusercontent.com
+
+# telegram
+149.154.167.220		api.telegram.org

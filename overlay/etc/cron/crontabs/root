@@ -1,4 +1,0 @@
-# see https://github.com/themactep/thingino-firmware/wiki/Cron-jobs
-
-# reboot camera nightly @ 3:00
-#0 3 * * * reboot -f

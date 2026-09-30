@@ -1,0 +1,23 @@
+# see https://git.busybox.net/busybox/tree/examples/inittab for help
+
+::sysinit:/bin/sh -c 'if ! grep -q nfs /proc/mounts; then /bin/mount -o remount,rw /; fi'
+::sysinit:/bin/mkdir -p /dev/pts
+::sysinit:/bin/mkdir -p /dev/shm
+::sysinit:/bin/mount -a
+::sysinit:/bin/mkdir -p /run/lock/subsys
+null::sysinit:/bin/ln -sf /proc/self/fd /dev/fd
+null::sysinit:/bin/ln -sf /proc/self/fd/0 /dev/stdin
+null::sysinit:/bin/ln -sf /proc/self/fd/1 /dev/stdout
+null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
+::sysinit:/bin/hostname -F /etc/hostname
+::sysinit:/etc/init.d/K99watchdog start
+::sysinit:/etc/init.d/rcS
+console::respawn:/sbin/getty -L console 0 vt100
+# USB ACM emergency console; wait for uvcd to create the gadget tty. Run it on
+# null, not the console: init resets the console's termios whenever it starts
+# something there, which breaks a login in progress on the UART.
+null::respawn:/bin/sh -c 'while [ ! -e /dev/ttyGS0 ]; do sleep 1; done; /sbin/getty -L -w -n -l /usr/bin/k1-console ttyGS0 0 vt100; sleep 1'
+# Keep the webcam daemon alive whenever the system is running.
+null::respawn:/etc/init.d/S31uvcd supervise
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -f

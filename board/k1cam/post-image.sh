@@ -17,7 +17,8 @@ set -eu
 
 BOARD_DIR=$(cd "$(dirname "$0")" && pwd)
 UENV="$BOARD_DIR/uenv.txt"
-ERASE_BLOCK=65536
+# The SFC NOR driver erases in 32 KiB blocks (mtd erasesize), not 64 KiB.
+ERASE_BLOCK=32768
 
 cd "${BINARIES_DIR:?}"
 
@@ -67,7 +68,7 @@ fits rootfs rootfs.squashfs "$rootfs_size"
 
 "$HOST_DIR/bin/mkenvimage" -s "$env_size" -o u-boot-env.bin "$UENV"
 
-# The overlay starts out holding just an empty /opt, as thingino's did.
+# The writable data partition starts with an empty /opt.
 overlay=$(mktemp -d)
 trap 'rm -rf "$overlay"' EXIT
 mkdir "$overlay/opt"

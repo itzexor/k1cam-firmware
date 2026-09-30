@@ -1,0 +1,53 @@
+#!/bin/sh
+
+DAEMON="/usr/sbin/watchdog"
+DAEMON_ARGS="-T 60 /dev/watchdog"
+PIDFILE="/var/run/watchdog.pid"
+
+start_daemon() {
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $@
+}
+
+stop_daemon() {
+	if [ -f "$PIDFILE" ]; then
+		start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON"
+		status=$?
+		rm -f "$PIDFILE"
+		return $status
+	fi
+
+	start-stop-daemon -K -x "$DAEMON"
+}
+
+start() {
+	printf '%s\n' "Starting watchdog"
+
+	# shellcheck disable=SC2086
+	start_daemon $DAEMON_ARGS
+}
+
+stop() {
+	printf '%s\n' "Stopping watchdog"
+
+	stop_daemon
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop | kill)
+		stop
+		;;
+	restart)
+		stop
+		sleep 1
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0

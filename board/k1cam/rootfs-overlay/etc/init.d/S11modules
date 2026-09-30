@@ -1,0 +1,41 @@
+#!/bin/sh
+
+load_modules() {
+	file=$1
+	[ -r "$file" ] || return 0
+
+	while read -r module args; do
+		case "$module" in
+			"" | "#"*) continue ;;
+		esac
+		printf '%s\n' "- Loading $module $args"
+		modprobe $module $args
+	done <$file
+}
+
+start() {
+	printf '%s\n' "Loading kernel modules"
+
+	load_modules /etc/modules
+	[ -d /etc/modules.d ] && for conf in /etc/modules.d/*; do
+		load_modules $conf
+	done
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		true
+		;;
+	restart)
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0

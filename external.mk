@@ -1,8 +1,5 @@
 # k1cam's build variables first: the packages below read them as they are
 # parsed.
-include $(BR2_EXTERNAL_THINGINO_PATH)/k1cam.mk
+include $(BR2_EXTERNAL_K1CAM_PATH)/board/k1cam/uboot.mk
 
-ifneq ($(BR2_SOC_INGENIC_DUMMY),y)
-# include makefiles from packages
-include $(sort $(wildcard $(BR2_EXTERNAL)/package/*/*.mk))
-endif
+include $(sort $(wildcard $(BR2_EXTERNAL_K1CAM_PATH)/package/*/*.mk))

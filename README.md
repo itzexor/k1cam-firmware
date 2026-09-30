@@ -17,9 +17,9 @@ The camera only runs its image pipeline while a program is streaming.
 
 ## Build
 
-Needs a Linux x86_64 host with Buildroot's usual prerequisites, and the kernel
-sources checked out next to this tree as `../thingino-linux` (branch
-`k1cam`).
+Needs a Linux x86_64 host with Buildroot's usual prerequisites. The kernel
+sources are fetched automatically: the thingino-linux fork's commit pinned in
+the defconfig, from its `k1cam` branch.
 
 ```sh
 git submodule update --init
@@ -44,15 +44,15 @@ the tree is organised.
 ## Origins and licences
 
 k1cam started from [thingino](https://github.com/themactep/thingino-firmware)'s
-firmware tree and keeps a small part of it (its Buildroot integration,
-system scripts and several packages, under their own names), under the MIT
-licence in LICENSE. k1cam is not affiliated with the thingino project.
+firmware tree and retains a few upstream camera packages under their original
+names, under the MIT licence in LICENSE. Its board configuration, rootfs and
+runtime are K1-specific. k1cam is not affiliated with the thingino project.
 
-Also used, fetched at pinned versions by the build:
+Also used and fetched by the build:
 
 - the Linux kernel from
-  [gtxaspec/thingino-linux](https://github.com/gtxaspec/thingino-linux)
-  (GPL-2.0), with k1cam's USB gadget changes on its `k1cam` branch;
+  [itzexor/thingino-linux](https://github.com/itzexor/thingino-linux)
+  (GPL-2.0), branch `k1cam`, with k1cam's USB gadget changes;
 - Ingenic's ISP, encoder and sensor drivers and libraries, via thingino's
   and gtxaspec's repositories (ingenic-sdk, ingenic-lib, raptor-hal);
 - [Buildroot](https://buildroot.org) (GPL-2.0) and U-Boot (GPL-2.0).

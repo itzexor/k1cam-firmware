@@ -1,7 +1,0 @@
-config BR2_PACKAGE_LOGCAT_MINI
-	bool "logcat-mini"
-	default y
-	help
-	  Replacement tool for reading Android logging
-	  facility, which is used by Ingenic IMP libraries.
-	  Reduced features for space savings.

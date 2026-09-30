@@ -1,8 +1,7 @@
 config BR2_PACKAGE_K1CAM_UVCD
 	bool "k1cam-uvcd"
 	select BR2_PACKAGE_THINGINO_RAPTOR_HAL
-	select BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM
-	select BR2_PACKAGE_THINGINO_SYSTEM_USB_ROLE
+	select BR2_PACKAGE_THINGINO_SENSOR_INFO
 	help
 	  Minimal fixed-function UVC webcam daemon for T31 + GC2083.
 
