@@ -1,9 +1,16 @@
 #!/bin/sh
 # S31uvcd -- minimal on-demand ISP -> UVC webcam daemon (T31 + GC2083 only)
+#
+# init runs the supervisor from inittab ("S31uvcd supervise", added by the
+# board's post-build script) and respawns it, and the supervisor respawns
+# uvcd, so nothing can leave uvcd stopped: that would take the USB gadget
+# down, and with it the ACM console someone may be typing into. "start"
+# only loads the gadget; "stop" outside shutdown amounts to a restart.
 
 DAEMON=/usr/bin/uvcd
 SUPERVISOR_PID=/var/run/uvcd-supervisor.pid
 READY=/var/run/uvcd.ready
+VIDEO=/dev/video0
 
 # Poll a condition in 50ms steps. Every wait in start() is on the path to
 # the host seeing the camera, and polling in whole seconds rounds each one
@@ -24,7 +31,35 @@ uvcd_ready() {
 	[ -s "$READY" ] && kill -0 "$(cat "$READY")" 2>/dev/null
 }
 
+pid_gone() {
+	! kill -0 "$1" 2>/dev/null
+}
+
+# Wait until a pid has exited, up to max-steps of 50ms.
+wait_gone() {
+	wait_for "$1" pid_gone "$2"
+}
+
+# A supervisor is done once the pidfile no longer names it: its trap removes
+# the file last thing, and init's next supervisor writes its own pid.
+supervisor_gone() {
+	[ "$(cat "$SUPERVISOR_PID" 2>/dev/null)" != "$1" ]
+}
+
 supervise() {
+	echo $$ >"$SUPERVISOR_PID"
+	# A supervisor killed with SIGKILL leaves its uvcd running: never start
+	# a second one next to it.
+	stray=$(cat "$READY" 2>/dev/null)
+	if [ -n "$stray" ] && grep -q "$DAEMON" "/proc/$stray/cmdline" 2>/dev/null; then
+		kill "$stray" 2>/dev/null
+		wait_gone 100 "$stray" || kill -KILL "$stray" 2>/dev/null
+	fi
+	# At boot init only gets here after rcS, which loaded g_webcam; if that
+	# failed, wait rather than spin (init does not rate-limit respawns).
+	while [ ! -e "$VIDEO" ]; do
+		sleep 1
+	done
 	child=
 	sleeper=
 	trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; disconnect_gadget; if [ -n "$child" ]; then
@@ -38,7 +73,7 @@ supervise() {
 	while :; do
 		disconnect_gadget
 		rm -f "$READY"
-		"$DAEMON" -s -d /dev/video0 &
+		"$DAEMON" -s -d "$VIDEO" &
 		child=$!
 		if wait_for 200 uvcd_ready; then
 			connect_gadget
@@ -95,18 +130,10 @@ case "$1" in
 			exit 0
 		fi
 		echo "Starting uvcd..."
-		# Only a restart needs this: the pause gives the host time to see the
-		# unplug before we reconnect. At boot g_webcam isn't loaded yet,
-		# nothing is attached, and the supervisor disconnects before it
-		# starts uvcd anyway.
-		if grep -q '^g_webcam ' /proc/modules 2>/dev/null; then
-			disconnect_gadget
-			sleep 1
-		fi
 		if [ -x /usr/sbin/usb-role ]; then
 			usb-role -m device 2>/dev/null
 		fi
-		if [ ! -e /dev/video0 ]; then
+		if [ ! -e "$VIDEO" ]; then
 			# g_webcam composes a CDC-ACM function alongside UVC on its own
 			# (webcam.c requests "acm" via the kernel's usbfunc: module
 			# alias); this is belt-and-suspenders in case that autoload
@@ -121,32 +148,31 @@ case "$1" in
 				exit 1
 			}
 		fi
-		if ! wait_for 100 test -e /dev/video0; then
+		if ! wait_for 100 test -e "$VIDEO"; then
 			echo "UVC video device not available"
 			exit 1
 		fi
-		start-stop-daemon -S -b -m -p "$SUPERVISOR_PID" -x /bin/sh -- "$0" supervise
-		# uvcd must have /dev/video0 open and its UVC events subscribed before
-		# the gadget connects, or the host's first SETUP requests go unanswered.
-		if ! wait_for 200 uvcd_ready; then
-			echo "uvcd failed to start"
-			exit 1
-		fi
+		# The supervisor itself is init's (see the top of this file). It
+		# connects the gadget once uvcd has the video node open and its UVC
+		# events subscribed, so the host's first SETUP requests are answered.
 		;;
 	stop)
+		# Run from the ACM console, the supervisor's disconnect hangs up the
+		# shell that ran this; finish anyway.
+		trap '' HUP
 		echo "Stopping uvcd..."
-		disconnect_gadget
+		# The supervisor disconnects the gadget itself as it goes. Doing it
+		# here first would hang this script up before it got to kill the
+		# supervisor, leaving uvcd running and the camera disconnected with
+		# nothing to reconnect it.
 		if [ -s "$SUPERVISOR_PID" ]; then
 			supervisor=$(cat "$SUPERVISOR_PID")
-			if ! kill "$supervisor" 2>/dev/null; then
-				rm -f "$SUPERVISOR_PID"
-			fi
-			wait_for 160 test ! -e "$SUPERVISOR_PID" || exit 1
-		else
-			start-stop-daemon -K -x "$DAEMON"
+			kill "$supervisor" 2>/dev/null
+			wait_for 160 supervisor_gone "$supervisor" || exit 1
 		fi
 		;;
 	restart)
+		trap '' HUP
 		"$0" stop && "$0" start
 		;;
 	*)

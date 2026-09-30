@@ -22,6 +22,8 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
     root = Path(tmp)
     ready = root / "ready"
     pidfile = root / "supervisor.pid"
+    video = root / "video0"
+    video.touch()
     # soft_connect stand-in: a FIFO, so every command is seen in order, not
     # just the last one written.
     connection = root / "connection"
@@ -50,12 +52,23 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
     source = source.replace("DAEMON=/usr/bin/uvcd", f"DAEMON={daemon}")
     source = source.replace("SUPERVISOR_PID=/var/run/uvcd-supervisor.pid", f"SUPERVISOR_PID={pidfile}")
     source = source.replace("READY=/var/run/uvcd.ready", f"READY={ready}")
+    source = source.replace("VIDEO=/dev/video0", f"VIDEO={video}")
     script = root / "supervisor"
     script.write_text(source)
     env = dict(os.environ, SOFT_CONNECT=str(connection))
-    proc = subprocess.Popen(["sh", str(script), "supervise"], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    pidfile.write_text(str(proc.pid))
+    def supervise():
+        # What init's respawn entry runs.
+        return subprocess.Popen(["sh", str(script), "supervise"], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    proc = supervise()
     child = None
     try:
         until(lambda: commands.count("connect") == 1)
@@ -65,26 +78,33 @@ with tempfile.TemporaryDirectory(prefix="uvcd-supervisor-") as tmp:
         until(lambda: ready.exists() and ready.read_text() and int(ready.read_text()) != first)
         child = int(ready.read_text())
         until(lambda: commands.count("connect") == 2)
-        # Stop the way the init script does: it disconnects, then the
-        # supervisor's trap would disconnect again. Neither may reconnect
-        # or respawn.
+        assert int(pidfile.read_text()) == proc.pid
+        # A supervisor killed outright leaves its daemon running. The one
+        # init starts next must end it before starting its own, never run
+        # two.
+        orphan = child
+        proc.kill()
+        proc.wait()
+        assert alive(orphan)
+        proc = supervise()
+        until(lambda: not alive(orphan))
+        until(lambda: ready.exists() and ready.read_text() and int(ready.read_text()) != orphan)
+        child = int(ready.read_text())
+        until(lambda: commands.count("connect") == 3)
+        # Stop the way the init script does: the supervisor's trap
+        # disconnects, and with no init here nothing respawns it.
         subprocess.run(["sh", str(script), "stop"], env=env, check=True, timeout=15,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         assert proc.wait(timeout=3) == 0
         time.sleep(0.2)
         assert last() == "disconnect"
         assert not ready.exists() and not pidfile.exists()
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise AssertionError("supervisor left its daemon alive")
+        until(lambda: not alive(child))
         # Each daemon gets exactly one connect, after a disconnect.
         assert commands[0] == "disconnect", commands
         for a, b in zip(commands, commands[1:]):
             assert not (a == b == "connect"), f"connect repeated in {commands}"
-        assert commands.count("connect") == 2, commands
+        assert commands.count("connect") == 3, commands
     finally:
         if proc.poll() is None:
             proc.kill()

@@ -171,9 +171,17 @@ chmod 0755 "$TARGET_DIR/usr/bin/k1-console"
 # g_webcam, and a getty that fails must not spin. -L ignores carrier; -w waits
 # for a clean CR/LF before starting ash, discarding bytes queued while ACM was
 # enumerating instead of feeding them to a live shell as commands.
+#
+# uvcd's supervisor is init's too, so nothing can leave uvcd stopped: the
+# gadget, and the ACM console with it, only exists while uvcd runs, so a
+# stop typed into that console would otherwise cut the camera off until a
+# power cycle. Killed outside shutdown, init starts a new supervisor at once;
+# at shutdown it respawns nothing and rcK stops uvcd cleanly.
 INITTAB="$TARGET_DIR/etc/inittab"
-sed -i '/ttyGS0/d' "$INITTAB"
+sed -i '/creality_k1_t31l_gc2083\/post-build.sh/d; /ttyGS0/d; /S31uvcd supervise/d' "$INITTAB"
 cat >>"$INITTAB" <<'EOF'
 # USB ACM emergency console (added by creality_k1_t31l_gc2083/post-build.sh)
 ::respawn:/bin/sh -c 'while [ ! -e /dev/ttyGS0 ]; do sleep 1; done; /sbin/getty -L -w -n -l /usr/bin/k1-console ttyGS0 0 vt100; sleep 1'
+# uvcd supervisor (added by creality_k1_t31l_gc2083/post-build.sh)
+null::respawn:/etc/init.d/S31uvcd supervise
 EOF
