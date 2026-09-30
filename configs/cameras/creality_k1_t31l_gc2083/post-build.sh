@@ -143,7 +143,7 @@ if [ -n "$PS1" ]; then
 	printf '\033[1;36mCreality K1 USB camera\033[0m  '
 	printf 'uvcd: '
 	pidof uvcd >/dev/null && printf '\033[1;32mrunning\033[0m\n' || printf '\033[1;31mstopped\033[0m\n'
-	printf '  controls   saved/live controls\n'
+	printf '  controls   current control values\n'
 	printf '  uvlog      uvcd log buffer\n'
 	printf '  uvlogf     follow uvcd logs\n'
 	printf '  sinfo      sensor information\n\n'

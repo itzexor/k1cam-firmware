@@ -2,11 +2,11 @@
  * uvcd.h -- minimal fixed-function ISP -> UVC webcam daemon
  *
  * Single process, single sensor (GC2083 on T31), single active video
- * pipeline. No SHM rings, no IPC, no control socket -- state transitions
- * are driven only by standard UVC PROBE/COMMIT/STREAMON/STREAMOFF requests
- * from the USB host, and settings arrive only as UVC controls. The daemon
- * saves those itself to UVCD_CONFIG_PATH and reloads them at startup
- * (uvcd_config.c). When no host is streaming, the framesource and encoder
+ * pipeline. No SHM rings, no IPC -- state transitions are driven only by
+ * standard UVC PROBE/COMMIT/STREAMON/STREAMOFF requests from the USB host,
+ * and settings arrive as UVC controls (or from the camera's own shell over
+ * the local socket in uvcd_ctl.c). The daemon saves every accepted change
+ * itself to UVCD_CONFIG_PATH and reloads it at startup (uvcd_config.c). When no host is streaming, the framesource and encoder
  * channels are torn down at once, and the sensor, ISP and IMP system follow
  * after UVCD_HAL_LINGER_MS: an idle camera does no imaging work at all.
  */
@@ -242,12 +242,13 @@ typedef struct {
 	uint8_t ae_weight_ref[15][15];
 	bool ae_weight_ref_valid;
 
-	/* Live controls start at factory defaults. Saved controls are a sparse
-	 * overlay, applied at startup only when explicitly enabled. */
+	/* The one runtime copy of every control -- loaded from UVCD_CONFIG_PATH
+	 * (or compiled-in defaults) at init, changed in place by the gadget's
+	 * control paths, and read here when the encoder channel is created. */
 	struct uvcd_control_state controls;
-	struct uvcd_control_state saved;
-	uint64_t saved_mask;
-	bool apply_on_boot;
+	/* The controls last proven by a healthy stream, as in
+	 * UVCD_CONFIG_GOOD_PATH: what a crash falls back to. */
+	struct uvcd_control_state good;
 	/* Streams in a row that started without proving healthy, from the
 	 * crash guard file (uvcd_config.h); 0 once one does. */
 	int unproven_streak;

@@ -1,5 +1,5 @@
-/* Host regression tests for the crash guard file. Link with --gc-sections
- * to discard the control-table paths this doesn't exercise. */
+/* Host regression tests for the config and crash guard files. Link with
+ * --gc-sections to discard the control-table paths this doesn't exercise. */
 #include <assert.h>
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -36,6 +36,16 @@ static void write_raw(const char *path, const char *text)
 	fclose(f);
 }
 
+static bool file_is(const char *path, const char *text)
+{
+	char buf[256] = {0};
+	FILE *f = fopen(path, "r");
+	assert(f);
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	return n == strlen(text) && memcmp(buf, text, n) == 0;
+}
+
 int main(void)
 {
 	char dir[] = "/tmp/uvcd-config-test-XXXXXX";
@@ -55,17 +65,23 @@ int main(void)
 	write_raw(path, "-3\n");
 	assert(uvcd_config_streak_read(path) == 1);
 
+	/* Only what differs from the default is written. */
 	struct uvcd_control_state saved, loaded;
 	uvcd_config_defaults(&saved);
 	saved.brightness = 150;
-	assert(uvcd_config_save(path, &saved, 1, true) == 0);
-	uint64_t mask;
-	bool boot;
-	uvcd_config_load(path, &loaded, &mask, &boot);
-	assert(mask == 1 && boot && loaded.brightness == 150 && loaded.contrast == 128);
-	write_raw(path, "brightness=200\ncontrast=99\n");
-	uvcd_config_load(path, &loaded, &mask, &boot);
-	assert(mask == 3 && !boot && loaded.brightness == 200 && loaded.contrast == 99);
+	assert(uvcd_config_save(path, &saved) == 0);
+	assert(file_is(path, "brightness=150\n"));
+	uvcd_config_load(path, &loaded);
+	assert(loaded.brightness == 150 && loaded.contrast == 128);
+	saved.brightness = 128;
+	assert(uvcd_config_save(path, &saved) == 0);
+	assert(file_is(path, ""));
+
+	/* Out-of-range values clamp; unknown keys (like the apply-on-boot flag
+	 * of the retired explicit save model) are skipped. */
+	write_raw(path, "apply-on-boot=0\nbrightness=200\ncontrast=999\n");
+	uvcd_config_load(path, &loaded);
+	assert(loaded.brightness == 200 && loaded.contrast == 255);
 
 	unlink(path);
 	rmdir(dir);

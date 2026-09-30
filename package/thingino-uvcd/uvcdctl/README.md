@@ -18,15 +18,11 @@ uvcdctl list
 uvcdctl describe [control]
 uvcdctl get <control>
 uvcdctl set <control> <value>
-uvcdctl set --transient <control> <value>
-uvcdctl save <control>
-uvcdctl apply
-uvcdctl boot [on|off]
 uvcdctl keyframe
 uvcdctl reset
 ```
 
-`list` displays every control's ID, current value, saved value, range, and default. On a
+`list` displays every control's ID, current value, range, and default. On a
 terminal, values that differ from the default are highlighted (set `NO_COLOR`
 to turn this off).
 `describe` explains what each control's values mean; it reads nothing from the
@@ -42,14 +38,18 @@ Control names and numeric IDs are accepted by `get`, `set`, and `describe`.
 
 ## Persistence
 
-Generic V4L2/UVC changes are transient. `uvcdctl set` changes the live value
-and saves that control; `set --transient` changes only the live value, and
-`save` stores the current live value. Saved values are applied on demand by
-`apply`, or at startup after `boot on`. The camera otherwise boots with its
-factory values.
+Every change persists, whichever program makes it: `uvcdctl`, `v4l2-ctl`, or
+an application's own camera settings. The camera writes accepted changes to
+`/etc/uvcd.conf` about two seconds after the last one and loads the file at
+startup. There is no save step.
 
-`reset` restores every control live, clears all saved values, and turns boot
-application off.
+`reset` restores every control to its factory default and persists that
+immediately.
+
+If a stream dies within ten seconds of starting, or of a change made while it
+runs, the camera assumes the newest settings caused it. It restarts with the
+settings the last healthy stream used, and after a second such failure in a
+row, with factory defaults.
 
 ## Build
 
@@ -67,7 +67,6 @@ uvcdctl get spatial-denoise
 uvcdctl set 23 200            # same control, by ID
 uvcdctl set h264-bitrate-kbps 6000
 uvcdctl set rotation 180      # camera mounted upside down
-uvcdctl boot on               # apply saved values on future boots
 uvcdctl set zoom 200          # 2x digital zoom, then move it:
 uvcdctl set pan 18000
 uvcdctl keyframe

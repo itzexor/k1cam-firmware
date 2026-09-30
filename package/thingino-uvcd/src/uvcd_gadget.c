@@ -92,9 +92,8 @@ struct uvc_event {
  * Camera Terminal's Roll control, but V4L2 has no control for it, so Linux
  * hosts could never reach it there. */
 #define UVCD_CUSTOM_ROTATION 22
-#define UVCD_CUSTOM_SAVE 23
-#define UVCD_CUSTOM_APPLY_ON_BOOT 24
-#define UVCD_CUSTOM_SAVED_QUERY 25
+/* 23-25 were save, apply-on-boot and saved-query, from a short-lived
+ * explicit save model. Retired, not reused: controls persist on their own. */
 #define UVCD_CUSTOM_GAIN_MIN 0
 #define UVCD_CUSTOM_GAIN_MAX 160
 
@@ -152,6 +151,11 @@ struct gadget_s {
 	uint8_t last_unit; /* entity ID, for control-interface requests */
 	uint8_t last_request;
 
+	/* Controls are persistent by default -- there is no explicit SAVE.
+	 * Every accepted change marks the shadow dirty; the poll loop writes
+	 * it out once changes have settled for UVCD_CONFIG_SETTLE_MS. */
+	bool config_dirty;
+	int64_t config_dirty_at;
 	bool guard_armed; /* this stream is counted in the crash guard file */
 	int64_t healthy_since_ms;
 	int64_t last_frame_ms;
@@ -163,7 +167,6 @@ struct gadget_s {
 	bool restart_h264, restart_mjpeg;
 
 	uint64_t read_seq;
-	uint16_t saved_query_ref;
 };
 
 static void fill_streaming_control(struct uvc_streaming_control *ctrl, uint8_t format_idx,
@@ -559,24 +562,26 @@ static const struct uvcd_ctrl_def *standard_ctrl_def(uint8_t selector)
 	return ctrl_def_by_selector(UVCD_CTRL_STANDARD, selector);
 }
 
-static const struct uvcd_ctrl_def *ctrl_def_ref(uint16_t ref)
-{
-	uvcd_ctrl_kind_t kind = (uvcd_ctrl_kind_t)(ref >> 8);
-	return kind <= UVCD_CTRL_CAMERA ? ctrl_def_by_selector(kind, ref & 0xff) : NULL;
-}
-
 /* --------------------------------------------------------------------------
- * Explicit persistence and the healthy-stream crash guard. */
+ * Persistence. There is no SAVE command on any control path: a control that
+ * the host successfully changed is expected to still be in effect after a
+ * reboot, so the write-back is the daemon's job, not the caller's. Streaming
+ * or idle, a change is written once changes have settled (a slider sends a
+ * burst of them); only a factory reset is written at once.
+ */
+#define UVCD_CONFIG_SETTLE_MS 2000
 #define UVCD_CONFIG_HEALTHY_MS 10000
 #define UVCD_FRAME_TIMEOUT_MS 5000
 
 static int64_t monotonic_ms(void);
 
 /* Crash guard. The encoder is where a bad setting takes the daemon (or the
- * kernel) down, so each stream is counted in UVCD_CONFIG_DIRTY_PATH from
- * its start until it proves healthy or stops cleanly. A crash leaves the
- * count behind for uvcd_pipeline_init(). An idle camera writes nothing, so
- * unplugging it is never taken for a crash. */
+ * kernel) down, so a stream is counted in UVCD_CONFIG_DIRTY_PATH from its
+ * start, and again from any change made while it runs, until it proves
+ * healthy or stops cleanly. A crash leaves the count behind for
+ * uvcd_pipeline_init(), which then goes back to the controls the last
+ * healthy stream proved (UVCD_CONFIG_GOOD_PATH). An idle camera writes
+ * nothing, so unplugging it is never taken for a crash. */
 static void stream_guard_arm(gadget_t *g)
 {
 	if (g->guard_armed)
@@ -596,14 +601,48 @@ static void stream_guard_clear(gadget_t *g)
 		LOGW("clear %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
 }
 
-/* Persist only settings exercised by ten seconds of healthy streaming. */
+/* Ten seconds of healthy streaming prove the running controls: they become
+ * what a later crash falls back to. */
 static void stream_guard_tick(gadget_t *g)
 {
-	if (!g->streaming || !g->healthy_since_ms ||
+	if (!g->guard_armed || !g->streaming || !g->healthy_since_ms ||
 	    monotonic_ms() - g->healthy_since_ms < UVCD_CONFIG_HEALTHY_MS ||
 	    monotonic_ms() - g->last_frame_ms >= 1000)
 		return;
+	if (memcmp(&g->pipe->good, &g->pipe->controls, sizeof(g->pipe->good)) != 0) {
+		if (uvcd_config_save(UVCD_CONFIG_GOOD_PATH, &g->pipe->controls) != 0)
+			LOGW("persist %s: %s", UVCD_CONFIG_GOOD_PATH, strerror(errno));
+		else
+			g->pipe->good = g->pipe->controls;
+	}
 	stream_guard_clear(g);
+}
+
+static void config_mark_dirty(gadget_t *g)
+{
+	g->config_dirty = true;
+	g->config_dirty_at = monotonic_ms();
+	/* Mid-stream, the change still has to prove itself. */
+	if (g->streaming) {
+		g->healthy_since_ms = 0;
+		stream_guard_arm(g);
+	}
+}
+
+/* Write pending changes once they have settled, or now if force. */
+static void config_flush(gadget_t *g, bool force)
+{
+	if (!g->config_dirty ||
+	    (!force && monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_MS))
+		return;
+	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls) != 0)
+		/* Don't spin retrying a write that keeps failing (read-only
+		 * rootfs, full flash): drop the flag and let the next accepted
+		 * control change arm another attempt. */
+		LOGW("persist %s: %s", UVCD_CONFIG_PATH, strerror(errno));
+	else
+		LOGI("controls persisted to %s", UVCD_CONFIG_PATH);
+	g->config_dirty = false;
 }
 
 const struct uvcd_ctrl_def *uvcd_ctrl_find(const char *name)
@@ -750,75 +789,12 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 		return -1;
 
 	*uvcd_ctrl_field(&g->pipe->controls, def) = value;
+	config_mark_dirty(g);
 	if (def->kind == UVCD_CTRL_CUSTOM)
 		encoder_after_store(g, (uint8_t)def->selector);
 	if (out_applied)
 		*out_applied = value;
 	return 0;
-}
-
-static size_t ctrl_index(const struct uvcd_ctrl_def *def)
-{
-	return (size_t)(def - uvcd_ctrl_defs);
-}
-
-int uvcd_ctrl_save(gadget_t *g, const struct uvcd_ctrl_def *def)
-{
-	size_t i = ctrl_index(def);
-	*uvcd_ctrl_field(&g->pipe->saved, def) = uvcd_ctrl_get(g, def);
-	g->pipe->saved_mask |= UINT64_C(1) << i;
-	/* Pan and tilt are one UVC control and must be saved atomically. */
-	if (def->kind == UVCD_CTRL_CAMERA && def->selector == UVC_CT_PANTILT_ABSOLUTE_CONTROL) {
-		for (size_t j = 0; j < UVCD_CTRL_DEF_COUNT; j++)
-			if (uvcd_ctrl_defs[j].kind == def->kind &&
-			    uvcd_ctrl_defs[j].selector == def->selector) {
-				*uvcd_ctrl_field(&g->pipe->saved, &uvcd_ctrl_defs[j]) =
-					uvcd_ctrl_get(g, &uvcd_ctrl_defs[j]);
-				g->pipe->saved_mask |= UINT64_C(1) << j;
-			}
-	}
-	return uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->saved, g->pipe->saved_mask,
-				g->pipe->apply_on_boot);
-}
-
-int uvcd_ctrl_apply_saved(gadget_t *g)
-{
-	int rc = 0;
-	g->defer_encoder_restart = true;
-	g->restart_h264 = g->restart_mjpeg = false;
-	for (size_t i = 0; i < UVCD_CTRL_DEF_COUNT; i++) {
-		if (!(g->pipe->saved_mask & (UINT64_C(1) << i)))
-			continue;
-		int applied;
-		if (uvcd_ctrl_set(g, &uvcd_ctrl_defs[i],
-				  *uvcd_ctrl_field(&g->pipe->saved, &uvcd_ctrl_defs[i]), &applied) != 0)
-			rc = -1;
-	}
-	g->defer_encoder_restart = false;
-	if (g->restart_h264)
-		encoder_restart(g, UVCD_FMT_H264);
-	if (g->restart_mjpeg)
-		encoder_restart(g, UVCD_FMT_MJPEG);
-	return rc;
-}
-
-int uvcd_set_apply_on_boot(gadget_t *g, bool on)
-{
-	g->pipe->apply_on_boot = on;
-	return uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->saved, g->pipe->saved_mask, on);
-}
-
-bool uvcd_get_apply_on_boot(gadget_t *g)
-{
-	return g->pipe->apply_on_boot;
-}
-
-bool uvcd_ctrl_get_saved(gadget_t *g, const struct uvcd_ctrl_def *def, int *value)
-{
-	if (!(g->pipe->saved_mask & (UINT64_C(1) << ctrl_index(def))))
-		return false;
-	*value = *uvcd_ctrl_field(&g->pipe->saved, def);
-	return true;
 }
 
 int uvcd_ctrl_keyframe(gadget_t *g)
@@ -841,10 +817,13 @@ void uvcd_ctrl_reset(gadget_t *g)
 	if (g->restart_mjpeg)
 		encoder_restart(g, UVCD_FMT_MJPEG);
 
-	g->pipe->saved_mask = 0;
-	g->pipe->apply_on_boot = false;
-	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->saved, 0, false) != 0)
-		LOGW("reset config: %s", strerror(errno));
+	/* Written at once, and the old proven controls go with it: a crash
+	 * after a reset must not bring back what the reset threw away. */
+	config_flush(g, true);
+	if (uvcd_config_save(UVCD_CONFIG_GOOD_PATH, &g->pipe->controls) != 0)
+		LOGW("persist %s: %s", UVCD_CONFIG_GOOD_PATH, strerror(errno));
+	else
+		g->pipe->good = g->pipe->controls;
 	LOGI("factory reset: all controls restored to defaults");
 }
 
@@ -854,12 +833,8 @@ static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	uint8_t selector = req->wValue >> 8;
 	int16_t value;
 	uint16_t len;
-	int boot_value = g->pipe->apply_on_boot ? 1 : 0;
-	bool is_action = (selector == UVCD_CUSTOM_RESET || selector == UVCD_CUSTOM_H264_KEYFRAME ||
-			  selector == UVCD_CUSTOM_SAVE || selector == UVCD_CUSTOM_SAVED_QUERY);
+	bool is_action = (selector == UVCD_CUSTOM_RESET || selector == UVCD_CUSTOM_H264_KEYFRAME);
 	int *current = is_action ? NULL : custom_control_value(g, selector);
-	if (selector == UVCD_CUSTOM_APPLY_ON_BOOT)
-		current = &boot_value;
 
 	if (!is_action && current == NULL) {
 		resp->length = -1;
@@ -885,12 +860,7 @@ static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	case UVC_GET_MAX:
 	case UVC_GET_RES:
 	case UVC_GET_DEF:
-		if (selector == UVCD_CUSTOM_SAVED_QUERY && req->bRequest == UVC_GET_CUR) {
-			const struct uvcd_ctrl_def *def = ctrl_def_ref(g->saved_query_ref);
-			value = -32768;
-			if (def && (g->pipe->saved_mask & (UINT64_C(1) << ctrl_index(def))))
-				value = *uvcd_ctrl_field(&g->pipe->saved, def);
-		} else if (is_action) {
+		if (is_action) {
 			/* Write-only in spirit: 0..1 with nothing to read back. */
 			value = req->bRequest == UVC_GET_MAX ? 1 :
 				req->bRequest == UVC_GET_RES ? 1 : 0;
@@ -1273,21 +1243,6 @@ static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 		if (xu && g->last_cs == UVCD_CUSTOM_H264_KEYFRAME) {
 			if (value != 0 && uvcd_enc_request_keyframe(g->pipe) != 0)
 				LOGW("keyframe request failed");
-			return;
-		}
-		if (xu && g->last_cs == UVCD_CUSTOM_SAVE) {
-			const struct uvcd_ctrl_def *def = ctrl_def_ref((uint16_t)value);
-			if (!def || uvcd_ctrl_save(g, def) != 0)
-				LOGW("save control failed");
-			return;
-		}
-		if (xu && g->last_cs == UVCD_CUSTOM_SAVED_QUERY) {
-			g->saved_query_ref = (uint16_t)value;
-			return;
-		}
-		if (xu && g->last_cs == UVCD_CUSTOM_APPLY_ON_BOOT) {
-			if (uvcd_set_apply_on_boot(g, value != 0) != 0)
-				LOGW("apply-on-boot write failed");
 			return;
 		}
 
@@ -1727,12 +1682,14 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 		}
 
 		stream_guard_tick(&g);
+		config_flush(&g, false);
 		uvcd_pipeline_tick(p);
 	}
 
 	unlink("/var/run/uvcd.ready");
 	uvcd_ctl_close(ctl_fd);
 	stop_streaming(&g);
+	config_flush(&g, true);
 	if (g.fd >= 0)
 		close(g.fd);
 	return uvcd_running ? -1 : 0;

@@ -1,11 +1,14 @@
 /*
  * uvcd_config.c -- load/save /etc/uvcd.conf
  *
- * Flat "name=value" lines, one per control, no sections -- uvcd has a
- * single sensor and a single set of controls, so the INI sections
- * raptor.conf needs don't apply here. Field access goes through
- * uvcd_ctrl_field()/uvcd_ctrl_find() (uvcd_gadget.h) so this file never
- * needs to know the struct uvcd_control_state layout by name.
+ * Flat "name=value" lines, one per control that differs from its factory
+ * default, no sections -- uvcd has a single sensor and a single set of
+ * controls, so the INI sections raptor.conf needs don't apply here. Leaving
+ * defaults out keeps the file to what was actually changed, and lets a
+ * later firmware's better default reach every control nobody touched.
+ * Field access goes through uvcd_ctrl_field()/uvcd_ctrl_find()
+ * (uvcd_gadget.h) so this file never needs to know the struct
+ * uvcd_control_state layout by name.
  */
 
 #include "uvcd_config.h"
@@ -27,12 +30,9 @@ void uvcd_config_defaults(struct uvcd_control_state *out)
 	}
 }
 
-void uvcd_config_load(const char *path, struct uvcd_control_state *saved,
-		      uint64_t *saved_mask, bool *apply_on_boot)
+void uvcd_config_load(const char *path, struct uvcd_control_state *out)
 {
-	uvcd_config_defaults(saved);
-	*saved_mask = 0;
-	*apply_on_boot = false;
+	uvcd_config_defaults(out);
 
 	FILE *f = fopen(path, "r");
 	if (!f)
@@ -51,10 +51,6 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *saved,
 		const char *key = line;
 		const char *val = eq + 1;
 
-		if (strcmp(key, "apply-on-boot") == 0) {
-			*apply_on_boot = atoi(val) != 0;
-			continue;
-		}
 		const struct uvcd_ctrl_def *def = uvcd_ctrl_find(key);
 		if (!def) {
 			LOGW("%s: unknown key '%s', ignoring", path, key);
@@ -71,8 +67,7 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *saved,
 			v = def->min;
 		if (v > def->max)
 			v = def->max;
-		*uvcd_ctrl_field(saved, def) = (int)v;
-		*saved_mask |= UINT64_C(1) << (size_t)(def - uvcd_ctrl_at(0));
+		*uvcd_ctrl_field(out, def) = (int)v;
 	}
 	fclose(f);
 }
@@ -95,8 +90,7 @@ static void fsync_dir(const char *path)
 	}
 }
 
-int uvcd_config_save(const char *path, const struct uvcd_control_state *saved,
-		     uint64_t saved_mask, bool apply_on_boot)
+int uvcd_config_save(const char *path, const struct uvcd_control_state *in)
 {
 	char tmp_path[280];
 	int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
@@ -117,13 +111,11 @@ int uvcd_config_save(const char *path, const struct uvcd_control_state *saved,
 	}
 
 	int werr = 0;
-	if (fprintf(f, "apply-on-boot=%d\n", apply_on_boot ? 1 : 0) < 0)
-		werr = 1;
-	for (size_t i = 0; !werr && i < uvcd_ctrl_count(); i++) {
-		if (!(saved_mask & (UINT64_C(1) << i)))
-			continue;
+	for (size_t i = 0; i < uvcd_ctrl_count(); i++) {
 		const struct uvcd_ctrl_def *def = uvcd_ctrl_at(i);
-		int value = *uvcd_ctrl_field((struct uvcd_control_state *)saved, def);
+		int value = *uvcd_ctrl_field((struct uvcd_control_state *)in, def);
+		if (value == def->def)
+			continue;
 		if (fprintf(f, "%s=%d\n", def->name, value) < 0) {
 			werr = 1;
 			break;

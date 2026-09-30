@@ -6,7 +6,11 @@
 
 #include "uvcd.h"
 
+#ifndef UVCD_CONFIG_PATH /* the host tests point it elsewhere */
 #define UVCD_CONFIG_PATH "/etc/uvcd.conf"
+#endif
+/* The controls last proven by a healthy stream (see the crash guard). */
+#define UVCD_CONFIG_GOOD_PATH UVCD_CONFIG_PATH ".good"
 #define UVCD_CONFIG_DIRTY_PATH UVCD_CONFIG_PATH ".dirty"
 
 /* Seed *out with every control's compiled-in default. */
@@ -15,23 +19,22 @@ void uvcd_config_defaults(struct uvcd_control_state *out);
 /* Seed *out with defaults, then override from path if it exists. A missing
  * file, or missing/unrecognized/out-of-range keys within it, are not
  * errors -- the corresponding field is just left at its default. */
-void uvcd_config_load(const char *path, struct uvcd_control_state *saved,
-		      uint64_t *saved_mask, bool *apply_on_boot);
+void uvcd_config_load(const char *path, struct uvcd_control_state *out);
 
 /* Atomically write *in to path as flat "name=value" lines (temp file +
- * fsync + rename). Returns 0 on success, -1 on failure (errno set).
+ * fsync + rename), leaving out values equal to their default. Returns 0 on
+ * success, -1 on failure (errno set).
  *
  * Controls are persistent by default, so there is no host-visible SAVE:
- * uvcd_gadget.c calls this after accepted changes have survived ten
- * seconds of healthy streaming. Idle changes remain in RAM. */
-int uvcd_config_save(const char *path, const struct uvcd_control_state *saved,
-		     uint64_t saved_mask, bool apply_on_boot);
+ * uvcd_gadget.c calls this shortly after any accepted change. */
+int uvcd_config_save(const char *path, const struct uvcd_control_state *in);
 
 /* Crash guard (uvcd_gadget.c): while a stream has not yet proven healthy,
  * UVCD_CONFIG_DIRTY_PATH holds how many streams in a row started without
- * getting there. A crash leaves it behind; once it reaches
- * UVCD_CONFIG_UNPROVEN_LIMIT at startup, the saved controls are set aside
- * for factory ones. Idle time and clean stops leave no file. */
+ * getting there. A crash leaves it behind. At startup, one such stream
+ * sends the controls back to UVCD_CONFIG_GOOD_PATH; at
+ * UVCD_CONFIG_UNPROVEN_LIMIT they go to factory. Idle time and clean stops
+ * leave no file. */
 #define UVCD_CONFIG_UNPROVEN_LIMIT 2
 
 /* 0 if there is no file. An empty or unreadable one counts as 1 (earlier

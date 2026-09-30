@@ -20,7 +20,6 @@
 
 #include "uvcd.h"
 #include "uvcd_config.h"
-#include "uvcd_gadget.h"
 
 /* --------------------------------------------------------------------------
  * Controls whose HAL representation isn't a plain scalar.
@@ -378,6 +377,49 @@ static void hal_shut_down(uvcd_pipeline_t *p)
 	LOGI("sensor + ISP down (no stream for %d ms)", UVCD_HAL_LINGER_MS);
 }
 
+/* Controls persist by default -- the daemon writes the file back shortly
+ * after any accepted change -- else the compiled-in neutral defaults. They
+ * are held in p->controls and pushed to the ISP at every bring-up
+ * (hal_bring_up), since the ISP itself only exists while a host is
+ * streaming.
+ *
+ * A stream that died before proving healthy (see the crash guard in
+ * uvcd_gadget.c) points at whatever changed since the last healthy one, so
+ * go back to the controls that stream proved. Only a run of them points at
+ * those too. */
+static int load_controls(uvcd_pipeline_t *p)
+{
+	uvcd_config_load(UVCD_CONFIG_GOOD_PATH, &p->good);
+	p->unproven_streak = uvcd_config_streak_read(UVCD_CONFIG_DIRTY_PATH);
+	if (p->unproven_streak >= UVCD_CONFIG_UNPROVEN_LIMIT) {
+		LOGW("%d streams in a row died before proving healthy; using factory controls",
+		     p->unproven_streak);
+		uvcd_config_defaults(&p->controls);
+		p->good = p->controls;
+		/* Keep the rejected values for diagnosis, but never reload them. */
+		if (rename(UVCD_CONFIG_PATH, UVCD_CONFIG_PATH ".rejected") != 0 && errno != ENOENT) {
+			LOGE("cannot quarantine unsafe config: %s", strerror(errno));
+			return -1;
+		}
+		if (unlink(UVCD_CONFIG_GOOD_PATH) != 0 && errno != ENOENT)
+			LOGW("clear %s: %s", UVCD_CONFIG_GOOD_PATH, strerror(errno));
+		if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
+			LOGW("clear %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
+		p->unproven_streak = 0;
+	} else if (p->unproven_streak) {
+		LOGW("previous stream died before proving healthy (%d of %d); "
+		     "using the last proven controls",
+		     p->unproven_streak, UVCD_CONFIG_UNPROVEN_LIMIT);
+		p->controls = p->good;
+		/* Or the next start would load the suspect values again. */
+		if (uvcd_config_save(UVCD_CONFIG_PATH, &p->controls) != 0)
+			LOGW("persist %s: %s", UVCD_CONFIG_PATH, strerror(errno));
+	} else {
+		uvcd_config_load(UVCD_CONFIG_PATH, &p->controls);
+	}
+	return 0;
+}
+
 int uvcd_pipeline_init(uvcd_pipeline_t *p)
 {
 	memset(p, 0, sizeof(*p));
@@ -423,31 +465,8 @@ int uvcd_pipeline_init(uvcd_pipeline_t *p)
 	LOGI("sensor: %s i2c=0x%02x bus=%d boot=%d", sensor->name, sensor->i2c_addr,
 	     sensor->i2c_adapter, sensor->default_boot);
 
-	/* Saved controls are a sparse overlay. Factory values remain live unless
-	 * apply-on-boot was explicitly enabled and the crash guard permits it. */
-	uvcd_config_defaults(&p->controls);
-	uvcd_config_load(UVCD_CONFIG_PATH, &p->saved, &p->saved_mask, &p->apply_on_boot);
-	p->unproven_streak = uvcd_config_streak_read(UVCD_CONFIG_DIRTY_PATH);
-	if (p->unproven_streak >= UVCD_CONFIG_UNPROVEN_LIMIT) {
-		LOGW("%d streams in a row died before proving healthy; disabling saved controls at boot",
-		     p->unproven_streak);
-		p->apply_on_boot = false;
-		if (uvcd_config_save(UVCD_CONFIG_PATH, &p->saved, p->saved_mask, false) != 0)
-			LOGW("disable apply-on-boot: %s", strerror(errno));
-		if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
-			LOGW("clear %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
-		p->unproven_streak = 0;
-	} else if (p->apply_on_boot) {
-		if (p->unproven_streak)
-			LOGW("previous stream died before proving healthy (%d of %d); "
-			     "using saved controls",
-			     p->unproven_streak, UVCD_CONFIG_UNPROVEN_LIMIT);
-		for (size_t i = 0; i < uvcd_ctrl_count(); i++)
-			if (p->saved_mask & (UINT64_C(1) << i)) {
-				const struct uvcd_ctrl_def *def = uvcd_ctrl_at(i);
-				*uvcd_ctrl_field(&p->controls, def) = *uvcd_ctrl_field(&p->saved, def);
-			}
-	}
+	if (load_controls(p) != 0)
+		goto fail;
 
 	/* Nothing else: the sensor, ISP and IMP system come up on the first
 	 * stream (uvcd_pipeline_start), so an unused camera never starts them

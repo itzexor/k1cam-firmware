@@ -46,9 +46,6 @@
 #define UVCD_XU_UNIT_ID 4
 #define UVCD_XU_RESET_SELECTOR 10
 #define UVCD_XU_KEYFRAME_SELECTOR 20
-#define UVCD_XU_SAVE_SELECTOR 23
-#define UVCD_XU_BOOT_SELECTOR 24
-#define UVCD_XU_SAVED_SELECTOR 25
 #define UVCD_SOCKET_PATH "/var/run/uvcd.sock"
 /* Probe selector for device discovery: one of the original nine, so an
  * older camera is still recognised (and then reports what it lacks). */
@@ -164,10 +161,7 @@ static void usage(FILE *out, const char *prog)
 		"usage: %s [--device PATH] <command> [args]\n"
 		"commands:\n"
 		"  get <key>          read one control\n"
-		"  set [-t] <key> <value>  change and save (or transient with -t)\n"
-		"  save <key>         save the current live value\n"
-		"  apply              apply all saved values now\n"
-		"  boot [on|off]      show or change apply-on-boot mode\n"
+		"  set <key> <value>  change one control (persists automatically)\n"
 		"  list               show every control's id, value, range and default\n"
 		"  describe [key]     explain what a control's values mean (all if no key)\n"
 		"  reset              restore factory defaults\n"
@@ -176,53 +170,6 @@ static void usage(FILE *out, const char *prog)
 		"<key> is a control name or its numeric id (see list).\n"
 		"The camera is found automatically; override with --device /dev/videoN.\n",
 		prog);
-}
-
-static int xu_query(int fd, uint8_t selector, uint8_t query, int16_t *value);
-
-static unsigned standard_selector(uint32_t cid)
-{
-	switch (cid) {
-	case V4L2_CID_BRIGHTNESS: return 2;
-	case V4L2_CID_CONTRAST: return 3;
-	case V4L2_CID_POWER_LINE_FREQUENCY: return 5;
-	case V4L2_CID_HUE: return 6;
-	case V4L2_CID_SATURATION: return 7;
-	case V4L2_CID_SHARPNESS: return 8;
-	case V4L2_CID_GAMMA: return 9;
-	case V4L2_CID_WHITE_BALANCE_TEMPERATURE: return 10;
-	case V4L2_CID_AUTO_WHITE_BALANCE: return 11;
-	case V4L2_CID_EXPOSURE_AUTO: return 2;
-	case V4L2_CID_EXPOSURE_AUTO_PRIORITY: return 3;
-	case V4L2_CID_EXPOSURE_ABSOLUTE: return 4;
-	case V4L2_CID_ZOOM_ABSOLUTE: return 11;
-	case V4L2_CID_PAN_ABSOLUTE:
-	case V4L2_CID_TILT_ABSOLUTE: return 13;
-	default: return 0;
-	}
-}
-
-static uint16_t ctrl_ref(const struct ctrl_def *def)
-{
-	unsigned kind = def->kind == CTRL_CUSTOM ? 1 : def->kind == CTRL_CAMERA ? 2 : 0;
-	unsigned selector = def->kind == CTRL_CUSTOM ? def->selector : standard_selector(def->cid);
-	return (uint16_t)((kind << 8) | selector);
-}
-
-static int ctrl_save(int fd, const struct ctrl_def *def)
-{
-	int16_t ref = (int16_t)ctrl_ref(def);
-	return xu_query(fd, UVCD_XU_SAVE_SELECTOR, UVC_SET_CUR, &ref);
-}
-
-static int ctrl_saved(int fd, const struct ctrl_def *def, int *value)
-{
-	int16_t ref = (int16_t)ctrl_ref(def), v;
-	if (xu_query(fd, UVCD_XU_SAVED_SELECTOR, UVC_SET_CUR, &ref) ||
-	    xu_query(fd, UVCD_XU_SAVED_SELECTOR, UVC_GET_CUR, &v))
-		return -1;
-	*value = v;
-	return 0;
 }
 
 static int xioctl(int fd, unsigned long request, void *arg)
@@ -437,8 +384,8 @@ static int cmd_list(int fd)
 	bool color = isatty(STDOUT_FILENO) && !getenv("NO_COLOR");
 	const char *hl_on = color ? "\033[1;33m" : "";
 	const char *hl_off = color ? "\033[0m" : "";
-	printf("%3s  %-28s %-4s %6s %6s %6s %7s %7s\n", "ID", "NAME", "UNIT", "VALUE", "MIN", "MAX",
-	       "DEFAULT", "SAVED");
+	printf("%3s  %-28s %-4s %6s %6s %6s %7s\n", "ID", "NAME", "UNIT", "VALUE", "MIN", "MAX",
+	       "DEFAULT");
 	for (size_t i = 0; i < CTRL_COUNT; i++) {
 		const struct ctrl_def *def = &ctrl_defs[i];
 		const char *kind = def->kind == CTRL_CUSTOM ? "xu" :
@@ -458,15 +405,8 @@ static int cmd_list(int fd)
 			continue;
 		}
 		bool changed = value != dv;
-		int saved;
-		bool has_saved = ctrl_saved(fd, def, &saved) == 0 && saved != -32768;
-		char saved_text[16];
-		if (has_saved)
-			snprintf(saved_text, sizeof(saved_text), "%d", saved);
-		else
-			strcpy(saved_text, "-");
-		printf("%3u  %-28s %-4s %s%6d%s %6d %6d %7d %7s\n", def->id, def->name, kind,
-		       changed ? hl_on : "", value, changed ? hl_off : "", min, max, dv, saved_text);
+		printf("%3u  %-28s %-4s %s%6d%s %6d %6d %7d\n", def->id, def->name, kind,
+		       changed ? hl_on : "", value, changed ? hl_off : "", min, max, dv);
 	}
 	return rc;
 }
@@ -591,7 +531,6 @@ int main(int argc, char **argv)
 	 * depends on whether a camera happens to be plugged in. */
 	const char *key = NULL;
 	int value = 0;
-	bool transient = false;
 
 	if (strcmp(cmd, "get") == 0) {
 		if (argi >= argc) {
@@ -600,10 +539,6 @@ int main(int argc, char **argv)
 		}
 		key = argv[argi];
 	} else if (strcmp(cmd, "set") == 0) {
-		if (argi < argc && (!strcmp(argv[argi], "-t") || !strcmp(argv[argi], "--transient"))) {
-			transient = true;
-			argi++;
-		}
 		if (argi + 1 >= argc) {
 			usage(stderr, argv[0]);
 			return 2;
@@ -613,25 +548,16 @@ int main(int argc, char **argv)
 			fprintf(stderr, "uvcdctl: '%s' is not a number\n", argv[argi + 1]);
 			return 2;
 		}
-	} else if (strcmp(cmd, "save") == 0) {
-		if (argi >= argc) {
-			usage(stderr, argv[0]);
-			return 2;
-		}
-		key = argv[argi];
 	} else if (strcmp(cmd, "describe") == 0) {
 		key = argi < argc ? argv[argi] : NULL;
-	} else if (strcmp(cmd, "boot") == 0) {
-		key = argi < argc ? argv[argi] : NULL;
-	} else if (strcmp(cmd, "list") != 0 &&
-		   strcmp(cmd, "apply") != 0 && strcmp(cmd, "reset") != 0 &&
+	} else if (strcmp(cmd, "list") != 0 && strcmp(cmd, "reset") != 0 &&
 		   strcmp(cmd, "keyframe") != 0) {
 		usage(stderr, argv[0]);
 		return 2;
 	}
 
 	const struct ctrl_def *def = NULL;
-	if (key && strcmp(cmd, "boot")) {
+	if (key) {
 		def = find_ctrl(key);
 		if (!def) {
 			fprintf(stderr, "uvcdctl: unknown control '%s'\n", key);
@@ -652,20 +578,13 @@ int main(int argc, char **argv)
 
 	if (!device && access(UVCD_SOCKET_PATH, F_OK) == 0) {
 		char request[160];
-		if (!strcmp(cmd, "get") || !strcmp(cmd, "save"))
-			snprintf(request, sizeof(request), "%s %s", cmd, def->name);
+		if (!strcmp(cmd, "get"))
+			snprintf(request, sizeof(request), "get %s", def->name);
 		else if (!strcmp(cmd, "set"))
 			snprintf(request, sizeof(request), "set %s %d", def->name, value);
-		else if (!strcmp(cmd, "boot") && key)
-			snprintf(request, sizeof(request), "boot %s", key);
 		else
 			snprintf(request, sizeof(request), "%s", cmd);
-		int rc = socket_command(request);
-		if (rc == 0 && !strcmp(cmd, "set") && !transient) {
-			snprintf(request, sizeof(request), "save %s", def->name);
-			rc = socket_command(request);
-		}
-		return rc;
+		return socket_command(request);
 	}
 
 	char chosen[64];
@@ -681,10 +600,6 @@ int main(int argc, char **argv)
 			print_value(def, v);
 	} else if (strcmp(cmd, "set") == 0) {
 		rc = ctrl_set(fd, def, value) != 0 ? 1 : 0;
-		if (rc == 0 && !transient && ctrl_save(fd, def) != 0) {
-			fprintf(stderr, "uvcdctl: save %s: %s\n", def->name, strerror(errno));
-			rc = 1;
-		}
 		if (rc == 0) {
 			int v;
 			/* Echo what actually took effect: the daemon clamps. */
@@ -692,36 +607,6 @@ int main(int argc, char **argv)
 				print_value(def, v);
 			else
 				print_value(def, value);
-		}
-	} else if (strcmp(cmd, "save") == 0) {
-		rc = ctrl_save(fd, def) != 0;
-	} else if (strcmp(cmd, "apply") == 0) {
-		rc = 0;
-		for (size_t i = 0; i < CTRL_COUNT; i++) {
-			int saved;
-			if (ctrl_saved(fd, &ctrl_defs[i], &saved) != 0 || saved == -32768)
-				continue;
-			/* uvcvideo presents CT_AE_MODE's UVC bitmap value 8 as
-			 * V4L2_EXPOSURE_APERTURE_PRIORITY (menu value 3). */
-			if (ctrl_defs[i].cid == V4L2_CID_EXPOSURE_AUTO && saved == 8)
-				saved = V4L2_EXPOSURE_APERTURE_PRIORITY;
-			if (ctrl_set(fd, &ctrl_defs[i], saved) != 0)
-				rc = 1;
-		}
-	} else if (strcmp(cmd, "boot") == 0) {
-		int16_t boot;
-		if (key) {
-			if (strcmp(key, "on") && strcmp(key, "off")) {
-				fprintf(stderr, "uvcdctl: boot expects on or off\n");
-				rc = 2;
-			} else {
-				boot = !strcmp(key, "on");
-				rc = xu_query(fd, UVCD_XU_BOOT_SELECTOR, UVC_SET_CUR, &boot) != 0;
-			}
-		} else {
-			rc = xu_query(fd, UVCD_XU_BOOT_SELECTOR, UVC_GET_CUR, &boot) != 0;
-			if (!rc)
-				printf("%s\n", boot ? "on" : "off");
 		}
 	} else if (strcmp(cmd, "list") == 0) {
 		rc = cmd_list(fd);

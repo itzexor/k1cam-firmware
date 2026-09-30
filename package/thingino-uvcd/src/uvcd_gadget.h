@@ -51,14 +51,12 @@ int uvcd_ctrl_get(gadget_t *g, const struct uvcd_ctrl_def *def);
 
 /* Clamp to [def->min, def->max], push to the HAL (when it is up -- else the
  * value is only stored, for the next bring-up), and update the shadow on
- * success. Returns 0 with *out_applied set to the value actually applied,
- * or -1 if the HAL rejected it (shadow left unchanged). */
+ * success, which persists shortly after. Returns 0 with *out_applied set to
+ * the value actually applied, or -1 if the HAL rejected it (shadow left
+ * unchanged). */
 int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *out_applied);
-int uvcd_ctrl_save(gadget_t *g, const struct uvcd_ctrl_def *def);
-int uvcd_ctrl_apply_saved(gadget_t *g);
-int uvcd_set_apply_on_boot(gadget_t *g, bool on);
-bool uvcd_get_apply_on_boot(gadget_t *g);
-bool uvcd_ctrl_get_saved(gadget_t *g, const struct uvcd_ctrl_def *def, int *value);
+
+/* Ask the H.264 encoder for an IDR frame now. */
 int uvcd_ctrl_keyframe(gadget_t *g);
 
 /* Restore every control to its compiled-in factory default and persist the

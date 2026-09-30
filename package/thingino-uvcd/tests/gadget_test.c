@@ -4,7 +4,8 @@
 #define unlink test_unlink
 #include "../src/uvcd_gadget.c"
 
-static int saves, queued, idrs, restarts;
+static int saves, good_saves, queued, idrs, restarts;
+static struct uvcd_control_state last_saved, last_good;
 static int unlinks, streak_writes, last_streak;
 
 int test_unlink(const char *path)
@@ -29,14 +30,23 @@ void uvcd_log(int level, const char *fmt, ...)
 	(void)fmt;
 }
 
-int uvcd_config_save(const char *path, const struct uvcd_control_state *c,
-		     uint64_t mask, bool boot)
+void uvcd_config_defaults(struct uvcd_control_state *out)
 {
-	(void)path;
-	(void)c;
-	(void)mask;
-	(void)boot;
-	saves++;
+	memset(out, 0, sizeof(*out));
+	for (size_t i = 0; i < UVCD_CTRL_DEF_COUNT; i++)
+		*uvcd_ctrl_field(out, &uvcd_ctrl_defs[i]) = uvcd_ctrl_defs[i].def;
+}
+
+int uvcd_config_save(const char *path, const struct uvcd_control_state *c)
+{
+	if (!strcmp(path, UVCD_CONFIG_GOOD_PATH)) {
+		good_saves++;
+		last_good = *c;
+	} else {
+		assert(!strcmp(path, UVCD_CONFIG_PATH));
+		saves++;
+		last_saved = *c;
+	}
 	return 0;
 }
 
@@ -100,14 +110,21 @@ int main(void)
 	assert(standard_ctrl_def(UVC_PU_BACKLIGHT_COMPENSATION_CONTROL) == NULL);
 	assert(control_value(&g, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL) == NULL);
 	assert(custom_ctrl_def(8) == NULL && custom_control_value(&g, 8) == NULL);
+	uvcd_config_defaults(&p.controls);
+	p.good = p.controls;
 	int applied;
 	const struct uvcd_ctrl_def *brightness = uvcd_ctrl_find("brightness");
+
+	/* Every change persists, idle ones too, once a burst has settled. */
+	assert(uvcd_ctrl_set(&g, brightness, 140, &applied) == 0 && applied == 140);
 	assert(uvcd_ctrl_set(&g, brightness, 150, &applied) == 0 && applied == 150);
-	assert(saves == 0 && p.saved_mask == 0); /* Generic sets are transient. */
-	assert(uvcd_ctrl_save(&g, brightness) == 0);
-	assert(saves == 1 && p.saved_mask != 0 && p.saved.brightness == 150);
-	p.controls.brightness = 128;
-	assert(uvcd_ctrl_apply_saved(&g) == 0 && p.controls.brightness == 150);
+	config_flush(&g, false);
+	assert(saves == 0 && g.config_dirty);
+	g.config_dirty_at -= UVCD_CONFIG_SETTLE_MS;
+	config_flush(&g, false);
+	assert(saves == 1 && last_saved.brightness == 150 && !g.config_dirty);
+	config_flush(&g, true);
+	assert(saves == 1); /* nothing pending */
 	assert(streak_writes == 0 && unlinks == 0); /* ...and idle is never a crash. */
 
 	/* A stream is counted in the crash guard from its start, once, on top
@@ -121,13 +138,33 @@ int main(void)
 	g.healthy_since_ms = monotonic_ms() - 9000;
 	g.last_frame_ms = monotonic_ms();
 	stream_guard_tick(&g);
-	assert(saves == 1 && g.guard_armed && unlinks == 0);
+	assert(good_saves == 0 && g.guard_armed && unlinks == 0);
 	g.healthy_since_ms -= 2000;
 	stream_guard_tick(&g);
-	/* Proven healthy: the guard file goes and the streak resets. */
+	/* Proven healthy: the running controls become what a crash falls
+	 * back to, the guard file goes and the streak resets. */
+	assert(good_saves == 1 && last_good.brightness == 150 && p.good.brightness == 150);
 	assert(!g.guard_armed && p.unproven_streak == 0 && unlinks == 1);
 	stream_guard_clear(&g);
 	assert(unlinks == 1); /* nothing armed, nothing to clear */
+	stream_guard_tick(&g);
+	assert(good_saves == 1); /* proven once is enough */
+
+	/* A change mid-stream has to prove itself again before it is what a
+	 * crash falls back to. */
+	assert(uvcd_ctrl_set(&g, brightness, 160, &applied) == 0);
+	assert(g.guard_armed && streak_writes == 2 && last_streak == 1);
+	assert(g.healthy_since_ms == 0 && p.good.brightness == 150);
+	g.healthy_since_ms = monotonic_ms() - UVCD_CONFIG_HEALTHY_MS;
+	stream_guard_tick(&g);
+	assert(good_saves == 2 && p.good.brightness == 160 && !g.guard_armed);
+	/* ...and a clean stop before then does not prove it. */
+	assert(uvcd_ctrl_set(&g, brightness, 170, &applied) == 0 && g.guard_armed);
+	stream_guard_clear(&g);
+	assert(good_saves == 2 && p.good.brightness == 160);
+	g.config_dirty_at -= UVCD_CONFIG_SETTLE_MS;
+	config_flush(&g, false);
+	assert(last_saved.brightness == 170);
 
 	uint8_t data[] = {1, 2, 3, 4}, output[4] = {0};
 	p.frame.data = data;
@@ -167,6 +204,19 @@ int main(void)
 	assert(queued == was_queued + 1 && g.read_seq == 3);
 	assert(uvcd_ctrl_find("power-line-frequency")->def == 0);
 	assert(uvcd_ctrl_find("spatial-denoise")->def == 192);
+
+	/* Factory reset is written at once, and replaces the proven controls
+	 * so a later crash cannot bring back what it threw away. */
+	g.streaming = false;
+	int was_saves = saves, was_good = good_saves;
+	uvcd_ctrl_reset(&g);
+	assert(saves == was_saves + 1 && last_saved.brightness == 128 && !g.config_dirty);
+	assert(good_saves == was_good + 1 && last_good.brightness == 128);
+	assert(p.good.brightness == 128 && p.controls.brightness == 128);
+
+	/* The retired explicit-save selectors answer like any unknown one. */
+	for (unsigned sel = 23; sel <= 25; sel++)
+		assert(custom_ctrl_def(sel) == NULL && custom_control_value(&g, sel) == NULL);
 	puts("gadget regression tests passed");
 	pthread_mutex_destroy(&p.frame.lock);
 	return 0;
