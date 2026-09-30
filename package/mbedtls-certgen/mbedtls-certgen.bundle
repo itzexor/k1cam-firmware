@@ -1,3 +1,0 @@
-# Files included in the mbedtls-certgen bundle
-# Paths relative to target root (/)
-usr/bin/mbedtls-certgen

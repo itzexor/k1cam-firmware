@@ -1,6 +1,0 @@
-config BR2_PACKAGE_LOGCAT
-	bool "logcat"
-	default n
-	help
-	  Full featured userspace programs for reading the Android logging
-	  facility, which is used by Ingenic IMP libraries.

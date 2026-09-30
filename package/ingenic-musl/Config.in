@@ -1,5 +1,0 @@
-config BR2_PACKAGE_INGENIC_MUSL
-	bool "ingenic-musl"
-	depends on BR2_TOOLCHAIN_USES_MUSL
-	help
-	  Shared library implementing musl compatability with the Ingenic IMP platform

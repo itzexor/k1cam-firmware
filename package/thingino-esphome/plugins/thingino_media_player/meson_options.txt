@@ -1,5 +1,0 @@
-option('enable_wake_word',
-  type: 'boolean',
-  value: false,
-  description: 'Enable wake word detection support (requires TFLite Micro and ESP MicroSpeech Features)'
-)

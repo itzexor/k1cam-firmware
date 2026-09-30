@@ -1,4 +1,0 @@
-config BR2_PACKAGE_INGENIC_DIAG_TOOLS
-	bool "Ingenic Diagnostic Tools"
-	help
-	  Userspace program for manipulating GPIOs

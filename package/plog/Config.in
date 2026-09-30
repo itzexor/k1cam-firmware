@@ -1,6 +1,0 @@
-config BR2_PACKAGE_PLOG
-	bool "plog"
-	help
-	  Portable C++ logging library (header-only).
-
-	  https://github.com/SergiusTheBest/plog

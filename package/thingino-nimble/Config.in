@@ -1,3 +1,0 @@
-config BR2_PACKAGE_THINGINO_NIMBLE
-	bool "Apache Nimble 4.2 implementation (Bluetooth) for ATBM chips"
-

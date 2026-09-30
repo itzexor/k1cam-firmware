@@ -1,4 +1,0 @@
-config BR2_PACKAGE_THINGINO_DEVSCRIPTS
-	bool "thingino-devscripts"
-	help
-	  Miscelaneous development scripts to run on the camera side.

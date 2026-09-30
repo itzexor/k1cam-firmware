@@ -1,7 +1,0 @@
-config BR2_PACKAGE_TELEGRAMBOT
-	bool "telegrambot"
-	select BR2_PACKAGE_THINGINO_JCT
-	select BR2_PACKAGE_THINGINO_LIBCURL
-	help
-	  Minimal Telegram bot daemon in C for embedded systems.
-
