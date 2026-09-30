@@ -446,20 +446,28 @@ static int cmd_reset(int fd)
 	 * control's value until the host itself writes it. Without this
 	 * resync, `v4l2-ctl` (and our own `get`) would keep reporting the
 	 * pre-reset values. Writing each queried default back is a no-op on
-	 * the device and refreshes the host's cache. */
+	 * the device and refreshes the host's cache.
+	 *
+	 * uvcvideo refuses writes to white-balance-temperature and
+	 * exposure-time while their auto control is on, so walk the table
+	 * backwards: each comes before the auto control that governs it. One
+	 * still refused is inactive: the camera has reset it, and only the
+	 * host's copy can lag until it is next set. */
 	int rc = 0;
-	for (size_t i = 0; i < CTRL_COUNT; i++) {
+	for (size_t i = CTRL_COUNT; i-- > 0;) {
 		const struct ctrl_def *def = &ctrl_defs[i];
-		int min, max, dv;
 
 		if (def->kind == CTRL_CUSTOM)
 			continue;
-		if (ctrl_range(fd, def, &min, &max, &dv) != 0) {
+		struct v4l2_queryctrl q = {.id = def->cid};
+		if (xioctl(fd, VIDIOC_QUERYCTRL, &q) < 0) {
 			rc = 1;
 			continue;
 		}
-		struct v4l2_control c = {.id = def->cid, .value = dv};
-		if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0) {
+		if (q.flags & V4L2_CTRL_FLAG_INACTIVE)
+			continue;
+		struct v4l2_control c = {.id = def->cid, .value = q.default_value};
+		if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0 && errno != EACCES) {
 			fprintf(stderr, "uvcdctl: resync %s: %s\n", def->name, strerror(errno));
 			rc = 1;
 		}
