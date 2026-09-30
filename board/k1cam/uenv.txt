@@ -6,10 +6,10 @@ serialport=ttyS1
 root=/dev/mtdblock4
 kern_addr=0x70000
 kern_size=0x190000
-data_addr=0x380000
-data_size=0x480000
+data_addr=0x480000
+data_size=0x380000
 flash_len=0x800000
-mtdparts=jz_sfc:320k(boot),64k(env),64k(backup),1600k(kernel),1536k(rootfs),4608k(data),8192k@0(all)
+mtdparts=jz_sfc:320k(boot),64k(env),64k(backup),1600k(kernel),2560k(rootfs),3584k(data),8192k@0(all)
 bootcmd=sf probe;setenv bootargs mem=${osmem} rmem=${rmem}  console=${serialport},${baudrate}n8 panic=${panic_timeout} root=${root} rootfstype=${rootfstype} init=${init} mtdparts=${mtdparts};sf read ${loadaddr} ${kern_addr} ${kern_size};bootm ${loadaddr}
 osmem=41M@0x0
 rmem=23M@0x2900000

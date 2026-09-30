@@ -35,8 +35,8 @@ flash:
 | env       | 0x050000 | 64 KiB   | U-Boot environment               |
 | backup    | 0x060000 | 64 KiB   |                                  |
 | kernel    | 0x070000 | 1600 KiB | Linux 3.10 uImage                |
-| rootfs    | 0x200000 | 1536 KiB | squashfs                         |
-| data      | 0x380000 | 4608 KiB | jffs2 overlay (settings)         |
+| rootfs    | 0x200000 | 2560 KiB | squashfs                         |
+| data      | 0x480000 | 3584 KiB | jffs2 overlay (settings)         |
 
 The layout is defined once, in `board/k1cam/uenv.txt`. See AGENTS.md for how
 the tree is organised.
