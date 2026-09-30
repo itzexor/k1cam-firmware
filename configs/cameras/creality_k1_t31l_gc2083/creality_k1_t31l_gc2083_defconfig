@@ -36,7 +36,6 @@ BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/crea
 BR2_SENSOR_1_NAME="gc2083"
 BR2_THINGINO_AUDIO=n
 BR2_THINGINO_DEV_WEBCAM=y
-BR2_THINGINO_GPIO_LIST="18O"
 BR2_THINGINO_PACKAGES=n
 FLASH_SIZE_MB=8
 
@@ -83,11 +82,15 @@ FLASH_SIZE_MB=8
 # minus everything this board does not have: no IR, no motor, no mic,
 # no Wi-Fi, no Ethernet.
 #
-# GPIO: stock U-Boot sets "gpio_default=18O". That env var only exists in the
-# legacy 2013.07 U-Boot; core.fragment pins 2026.07, where it is a no-op. The
-# equivalent here is BR2_THINGINO_GPIO_LIST, same <pin><O|o> token syntax --
-# it writes "18 high" to /etc/gpio.conf, applied by S05gpio before S11modules
-# loads the sensor driver.
+# GPIO: stock U-Boot sets "gpio_default=18O". GPIO 18 (PA18) is the GC2083
+# reset line, and the sensor driver (reset_gpio=18) requests it and pulses
+# reset on every probe. Do not set it in BR2_THINGINO_GPIO_LIST: S05gpio
+# exports the pin through sysfs and keeps it claimed, so the first probe
+# after boot fails to request it and skips the reset ("gpio request fail
+# 18" with a stack dump). The driver then frees the pin on remove, which
+# also drops the export, so only the first stream ran on an unreset sensor.
+# Left alone, PA18 is an input that reads high, so the sensor is still out
+# of reset before its first probe, as with the stock gpio_default.
 #
 # Runtime: uvcd only -- a standalone T31+GC2083 UVC webcam daemon, not raptor.
 # Fuses ISP/encoder bring-up and the UVC gadget bridge into one process, no
