@@ -1,6 +1,6 @@
 # uvcdctl
 
-`uvcdctl` is a Linux command-line utility for configuring `thingino-uvcd`
+`uvcdctl` is a Linux command-line utility for configuring `k1cam-uvcd`
 cameras through V4L2 and UVC controls. It uses one V4L2 device file and
 supports standard V4L2 controls and UVC Extension Unit controls.
 

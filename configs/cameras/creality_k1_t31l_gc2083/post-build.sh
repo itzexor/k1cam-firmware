@@ -185,3 +185,22 @@ cat >>"$INITTAB" <<'EOF'
 # uvcd supervisor (added by creality_k1_t31l_gc2083/post-build.sh)
 null::respawn:/etc/init.d/S31uvcd supervise
 EOF
+
+# Identity. This image is k1cam: built on thingino's tree, not affiliated
+# with it, so it must not introduce itself as Thingino. thingino's
+# rootfs_script.sh writes its own name, version, CPE, logo and home page
+# into os-release; the pass after it replaces those (ID_LIKE credits the
+# base). The rest -- build IDs, SoC, the IMAGE_ID the release scripts read --
+# stays. Only once that script has run: before it, os-release is still
+# Buildroot's, which it re-prefixes with BUILDROOT_.
+OS_RELEASE="$TARGET_DIR/usr/lib/os-release"
+if grep -q '^ID=thingino$' "$OS_RELEASE" 2>/dev/null; then
+	sed -i \
+		-e 's/^NAME=Thingino$/NAME=k1cam/' \
+		-e 's/^ID=thingino$/ID=k1cam/' \
+		-e 's/^PRETTY_NAME=.*/PRETTY_NAME="k1cam"/' \
+		-e 's/^ID_LIKE=buildroot$/ID_LIKE="thingino buildroot"/' \
+		-e '/^\(VERSION\|VERSION_ID\|VERSION_CODENAME\|CPE_NAME\|LOGO\|HOME_URL\)=/d' \
+		"$OS_RELEASE"
+fi
+printf 'k1cam\n\n' >"$TARGET_DIR/etc/issue"

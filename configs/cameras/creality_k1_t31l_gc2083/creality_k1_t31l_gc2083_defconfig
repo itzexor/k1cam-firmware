@@ -4,34 +4,18 @@ BR2_ETHERNET=n
 BR2_INGENIC_SOC_MODEL="t31l"
 BR2_ISP_CLK_200MHZ=y
 BR2_LINUX_KERNEL_CUSTOM_REPO_URL="$(BR2_EXTERNAL_THINGINO_PATH)/../thingino-linux"
-BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="7d52895b8e0d55a640da74a2c1c61f8751f1434a"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="4727879284cf8f1314e1fd66740573ef70efd057"
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/busybox.fragment"
 BR2_PACKAGE_DROPBEAR=n
 BR2_PACKAGE_IFUPDOWN_SCRIPTS=n
-BR2_PACKAGE_INGENIC_DIAG_TOOLS=n
-BR2_PACKAGE_INGENIC_PWM=n
-BR2_PACKAGE_LIBIMP_DEBUG=n
+BR2_PACKAGE_K1CAM_UVCD=y
 BR2_PACKAGE_MDNSD=n
 BR2_PACKAGE_MDNSD_HTTP_SERVICE=n
-BR2_PACKAGE_TELEGRAMBOT=n
-BR2_PACKAGE_THINGINO_AGENT=n
-BR2_PACKAGE_THINGINO_DIAG=n
-BR2_PACKAGE_THINGINO_HA=n
 BR2_PACKAGE_THINGINO_KOPT_DWC2=y
 BR2_PACKAGE_THINGINO_KOPT_DWC2_OTG=y
 BR2_PACKAGE_THINGINO_KOPT_IPV6=n
 BR2_PACKAGE_THINGINO_KOPT_LEDS=n
 BR2_PACKAGE_THINGINO_KOPT_USB_GADGET_ONLY=y
-BR2_PACKAGE_THINGINO_LIBCURL=n
-BR2_PACKAGE_THINGINO_MOSQUITTO_20X=n
-BR2_PACKAGE_THINGINO_SSL_NONE=y
-BR2_PACKAGE_THINGINO_STREAMER_NONE=y
-BR2_PACKAGE_THINGINO_SYSUPGRADE=n
-BR2_PACKAGE_THINGINO_UVCD=y
-BR2_PACKAGE_THINGINO_VPN_NONE=y
-BR2_PACKAGE_THINGINO_VPN_WIREGUARD=n
-BR2_PACKAGE_THINGINO_WEBSERVER_NONE=y
-BR2_PACKAGE_USBNET=n
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/post-build.sh $(BR2_EXTERNAL_THINGINO_PATH)/scripts/rootfs_script.sh $(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/creality_k1_t31l_gc2083/post-build.sh"
 BR2_SENSOR_1_NAME="gc2083"
 BR2_THINGINO_AUDIO=n
@@ -39,25 +23,31 @@ BR2_THINGINO_DEV_WEBCAM=y
 BR2_THINGINO_PACKAGES=n
 FLASH_SIZE_MB=8
 
-# Kernel: our fork of gtxaspec/thingino-linux, checked out as a sibling of
-# this repo (../thingino-linux) and pinned by SHA. The uvcd gadget
-# descriptors are a commit on its creality-k1-uvcd branch, not a patch here.
-# The BR2_LINUX_KERNEL_CUSTOM_REPO_* lines above override core.fragment,
-# which is applied before this file. Pinning also replaces upstream's
-# `git ls-remote` branch lookup, so the kernel only changes when that SHA
-# does -- bump it after committing to the fork.
+# k1cam: the USB UVC webcam module of the Creality K1 3D printer (T31L,
+# GC2083, 8 MB NOR). Built on thingino's Buildroot tree; the closest thingino
+# board is vanhua_l34_t31l_gc2083_eth, minus everything this one lacks: no IR,
+# motor, mic, Wi-Fi or Ethernet.
 #
-# Streamer: none of thingino's. uvcd is enabled directly as a package
-# (BR2_PACKAGE_THINGINO_UVCD), not through the streamer choice, so this
-# camera does not depend on that menu.
+# Kernel: our fork of gtxaspec/thingino-linux, checked out as a sibling of
+# this repo (../thingino-linux) and pinned by SHA. The gadget descriptors
+# (drivers/usb/gadget/webcam.c) are commits on its k1cam branch, not patches
+# here. The BR2_LINUX_KERNEL_CUSTOM_REPO_* lines override core.fragment, which
+# is applied before this file, and pinning replaces its `git ls-remote`
+# branch lookup: the kernel only changes when that SHA does, so bump it after
+# committing to the fork.
+#
+# Webcam: k1cam-uvcd (package/k1cam-uvcd), a standalone T31+GC2083 UVC webcam
+# daemon rather than one of thingino's streamers. It selects the raptor HAL
+# (and through it libimp and the sensor driver named by BR2_SENSOR_1_NAME),
+# BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM and USB role switching, so
+# thingino's webcam fragment (raptor.conf keys, RTSP/WebRTC selects) is not
+# applied. The sensor, ISP and encoder only run while a host streams.
 #
 # Packages: no network, so nothing that talks to one is built: no SSL
-# library (the ssl fragment is left out and the SSL choice is None), no
-# dropbear, curl, IPv6 (kernel or odhcp6c/netifd), package manager, or web
-# UI (webserver none). Also off: host-mode USB ethernet drivers (the port is
-# only ever a device), PWM and LEDs (none on the board), libaudioProcess (no
-# mic), and the libimp-debug and Ingenic diag tools. thingino's system menu implies these rather than
-# selecting them so a board can turn them off.
+# library, dropbear, curl, IPv6, package manager or web UI. Also off: host-
+# mode USB ethernet drivers (the port is only ever a device) and LEDs (none
+# on the board). thingino's system menu implies these rather than selecting
+# them, so a board can turn them off.
 #
 # ISP clock: 200 MHz, as the stock firmware runs it. The module default is
 # 100 MHz, where the ISP can't upscale far: zoom broke past 131 at 1080p,
@@ -67,20 +57,11 @@ FLASH_SIZE_MB=8
 # out isp_clk= before Kconfig defaults exist).
 #
 # Boot services: this board is a USB-powered webcam with no network, so
-# post-build.sh (appended to thingino's post-build script above, which still
-# runs first) removes the network, time, sysadmin and LED services that
-# thingino's global overlay installs unconditionally, and moves the USB ACM
-# console under init's supervision. Kconfig cannot do this -- those scripts
-# are not owned by any package option.
-#
-# uvcd selects BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM directly, so the
-# webcam fragment (raptor.conf keys, RWC/RAD/WEBRTC/TLS selects -- none of
-# which uvcd reads or needs) is intentionally not applied here.
-#
-# USB UVC webcam module from the Creality K1 3D printer.
-# Closest sibling is vanhua_l34_t31l_gc2083_eth (same SoC, sensor, 8MB NOR),
-# minus everything this board does not have: no IR, no motor, no mic,
-# no Wi-Fi, no Ethernet.
+# post-build.sh (run both before and after thingino's rootfs_script.sh)
+# removes the network, time, sysadmin and LED services that thingino's
+# global overlay installs unconditionally, and puts the USB ACM console and
+# uvcd's supervisor under init. Kconfig cannot do this -- those scripts are
+# not owned by any package option.
 #
 # GPIO: stock U-Boot sets "gpio_default=18O". GPIO 18 (PA18) is the GC2083
 # reset line, and the sensor driver (reset_gpio=18) requests it and pulses
@@ -91,21 +72,3 @@ FLASH_SIZE_MB=8
 # also drops the export, so only the first stream ran on an unreset sensor.
 # Left alone, PA18 is an input that reads high, so the sensor is still out
 # of reset before its first probe, as with the stock gpio_default.
-#
-# Runtime: uvcd only -- a standalone T31+GC2083 UVC webcam daemon, not raptor.
-# Fuses ISP/encoder bring-up and the UVC gadget bridge into one process, no
-# SHM ring, no raptor-common/IPC, no control socket, no config file. Encoder
-# channel is created on UVC COMMIT and destroyed on STREAMOFF/DISCONNECT, so
-# no ISP/encoder cycles run with no host attached. See package/thingino-uvcd.
-#
-# Sensor .so is still pulled independently of the streamer choice: uvcd
-# selects BR2_PACKAGE_THINGINO_RAPTOR_HAL -> ..._HAL_INGENIC -> INGENIC_LIB,
-# which builds the sensor driver from BR2_SENSOR_1_NAME regardless of which
-# streamer/daemon links against it.
-#
-# Hardware status: enumerates on a Linux host as "Raptor Webcam: UVC Camera",
-# MJPEG 1920x1080 @ 30fps. Still unverified: sustained frame capture (the
-# descriptors above come from the gadget, not from rvd), /dev/ttyGS0 (see the
-# getty loop in S31raptor-webcam), serialport (common.uenv.txt defaults to
-# ttyS1), and image orientation (add BR2_SENSOR_1_PARAMS="shvflip=1" if
-# inverted, as vanhua_h33 does).

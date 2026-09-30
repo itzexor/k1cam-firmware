@@ -1,5 +1,5 @@
 /*
- * uvcdctl -- host-side control CLI for thingino-uvcd
+ * uvcdctl -- host-side control CLI for k1cam-uvcd
  *
  * Everything goes over the UVC control paths on a single V4L2 fd. There is
  * no side channel and no libusb:
@@ -268,7 +268,7 @@ static int open_device(const char *explicit_path, char *chosen, size_t chosen_le
 		close(fd);
 	}
 
-	fprintf(stderr, "uvcdctl: no thingino-uvcd camera found (use --device /dev/videoN)\n");
+	fprintf(stderr, "uvcdctl: no k1cam camera found (use --device /dev/videoN)\n");
 	return -1;
 }
 

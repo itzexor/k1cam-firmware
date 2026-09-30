@@ -114,7 +114,7 @@ source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-raptor-hal/Config.in"
 source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-sensor-info/Config.in"
 source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-system/Config.in"
 source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-system/Config.ingenic.in"
-source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-uvcd/Config.in"
+source "$BR2_EXTERNAL_THINGINO_PATH/package/k1cam-uvcd/Config.in"
 source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-uboot/Config.in"
 endif
 

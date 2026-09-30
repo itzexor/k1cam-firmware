@@ -1,5 +1,5 @@
-config BR2_PACKAGE_THINGINO_UVCD
-	bool "thingino-uvcd"
+config BR2_PACKAGE_K1CAM_UVCD
+	bool "k1cam-uvcd"
 	select BR2_PACKAGE_THINGINO_RAPTOR_HAL
 	select BR2_PACKAGE_THINGINO_KOPT_GADGET_WEBCAM
 	select BR2_PACKAGE_THINGINO_SYSTEM_USB_ROLE
@@ -10,6 +10,5 @@ config BR2_PACKAGE_THINGINO_UVCD
 	  process. Standard image controls are exposed on the UVC
 	  Processing Unit; nonstandard ISP controls on Extension Unit 4.
 
-	  Enabled directly by the camera defconfig rather than through
-	  the thingino streamer choice. Requires the uvcd gadget
-	  descriptors in the kernel's g_webcam.
+	  Requires the uvcd gadget descriptors in the kernel's
+	  g_webcam.
