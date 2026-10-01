@@ -42,7 +42,13 @@ define INGENIC_SDK_INSTALL_TARGET_CMDS
 		touch "$$libdir/modules/$$krel/modules.builtin.modinfo"; \
 	done
 
-	$(INSTALL) -D -m 0644 $(@D)/sensor-iq/t31/gc2083.bin \
+	# The K1's own sensor tuning, not the SDK's sensor-iq/t31/gc2083.bin:
+	# Creality's August 2026 GC2083 tuning (black level, colour matrix,
+	# softer demosaic, refined denoise), with the SDK tuning's gamma curve
+	# (BT.709-like; Creality's lifts blacks into haze) and the auto-exposure
+	# target lowered to suit that curve. Tuned against a phone raw of a
+	# reference scene in the printer chamber.
+	$(INSTALL) -D -m 0644 $(INGENIC_SDK_PKGDIR)/gc2083-t31.bin \
 		$(TARGET_DIR)/usr/share/sensor/gc2083-t31.bin
 	ln -sfn /usr/share/sensor $(TARGET_DIR)/etc/sensor
 	echo gc2083 > $(TARGET_DIR)/usr/share/sensor/model

@@ -100,6 +100,10 @@ struct uvc_event {
 #define UVCD_CONTROL_MIN 0
 #define UVCD_CONTROL_MAX 255
 #define UVCD_CONTROL_DEF 128
+/* Measured on the K1 with the shipped sensor tuning against a reference
+ * scene: 128 leaves colour at ~0.84 of a phone raw's chroma, 136 matches it
+ * (~1.04); the curve is steep above 128 (150 is already ~1.36). */
+#define UVCD_SATURATION_DEF 136
 #define UVCD_HUE_MIN -128
 #define UVCD_HUE_MAX 127
 #define UVCD_HUE_DEF 0
@@ -448,7 +452,7 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 	UVCD_CTRL_ROW("contrast", UVCD_CTRL_STANDARD, UVC_PU_CONTRAST_CONTROL,
 		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, contrast),
 	UVCD_CTRL_ROW("saturation", UVCD_CTRL_STANDARD, UVC_PU_SATURATION_CONTROL,
-		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_CONTROL_DEF, saturation),
+		      UVCD_CONTROL_MIN, UVCD_CONTROL_MAX, UVCD_SATURATION_DEF, saturation),
 	UVCD_CTRL_ROW("sharpness", UVCD_CTRL_STANDARD, UVC_PU_SHARPNESS_CONTROL,
 		      UVCD_CONTROL_MIN, UVCD_SHARPNESS_MAX, UVCD_CONTROL_DEF, sharpness),
 	UVCD_CTRL_ROW("hue", UVCD_CTRL_STANDARD, UVC_PU_HUE_CONTROL,
