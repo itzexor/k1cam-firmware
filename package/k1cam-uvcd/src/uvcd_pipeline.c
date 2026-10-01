@@ -574,6 +574,45 @@ struct uvcd_imp_expr { /* IMPISPExpr, s_attr side of the union */
 	uint16_t pad;  /* the union is 12 bytes (its g_attr side) */
 };
 
+struct uvcd_imp_csc { /* IMPISPCscAttr */
+	int mode;      /* IMPISPCscCgMode, below */
+	int coef[9];   /* custom 3x3 matrix, used in USER mode only */
+	int offset[2]; /* UV, Y */
+	int y_clip[2]; /* max, min */
+	int c_clip[2]; /* max, min */
+};
+
+enum { /* IMPISPCscCgMode */
+	UVCD_CSC_BT601_FULL,
+	UVCD_CSC_BT601_CLIP,
+	UVCD_CSC_BT709_FULL,
+	UVCD_CSC_BT709_CLIP,
+};
+
+/* Make the ISP's YUV what the stream says it is. The T31 encoder tags
+ * H.264 as BT.709 limited range and gives no way to change that, while the
+ * ISP comes up producing BT.601 full range: every decoder then stretched
+ * 16..235 to 0..255, crushing ~40% of a dim scene to black and clipping
+ * whites. JPEG decoders assume BT.601 full range (JFIF), the ISP default.
+ * The clip limits are left as read (255/0), so blown highlights land a
+ * little above 235; decoders clip those to white anyway. */
+static void apply_csc(uvcd_pipeline_t *p, uint8_t format)
+{
+	struct uvcd_imp_csc c = {0};
+	int was = -1;
+
+	if (RSS_HAL_CALL(p->ops, isp_get_csc_attr, p->hal_ctx, &c) == RSS_OK)
+		was = c.mode;
+	c.mode = format == UVCD_FMT_H264 ? UVCD_CSC_BT709_CLIP : UVCD_CSC_BT601_FULL;
+	if (c.mode == was)
+		return;
+	int ret = RSS_HAL_CALL(p->ops, isp_set_csc_attr, p->hal_ctx, &c);
+	if (ret != RSS_OK)
+		LOGW("ISP CSC mode %d rejected (%d)", c.mode, ret);
+	else
+		LOGI("ISP CSC mode %d -> %d", was, c.mode);
+}
+
 /* Exposure priority: with auto-exposure out of frame time and leaning on
  * gain, slow the sensor down a step so it can expose longer instead; once
  * the gain is low and the exposure would fit a faster frame, speed back up.
@@ -1075,6 +1114,7 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	ret = configure_channel(p, format, frame, interval);
 	if (ret != RSS_OK)
 		return ret;
+	apply_csc(p, format);
 	p->configured = true;
 	p->cur_format = format;
 	p->cur_frame = frame;
