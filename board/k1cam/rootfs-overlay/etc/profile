@@ -17,7 +17,7 @@ if [ -n "$PS1" ]; then
 	(
 		. /etc/os-release
 		printf '  image  %s\n' "$BUILD_ID"
-		printf '  kernel %.12s, %s\n\n' "$KERNEL_COMMIT" "$(uname -v)"
+		printf '  kernel %s, %s\n\n' "$KERNEL_COMMIT" "$(uname -v)"
 	)
 	printf '  uvcdctl list | describe [ctl]    controls: values, ranges, meanings\n'
 	printf '  uvcdctl get <ctl> | set <ctl> <v> | reset | keyframe\n'
