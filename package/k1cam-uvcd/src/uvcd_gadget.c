@@ -489,11 +489,13 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_GAIN_MAX, 160, max_again),
 	UVCD_CTRL_ROW("max-digital-gain", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_DGAIN,
 		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_GAIN_MAX, 80, max_dgain),
-	/* Above the tuning's own 128: measured on the K1 indoors (AE at ~20x
-	 * gain), 192 cuts temporal noise ~37% for ~10% edge detail and makes
-	 * MJPEG frames ~20% smaller; 0-128 look alike. */
+	/* Off: in the printer chamber the sensor runs at no gain, so noise is
+	 * already low, and denoise erases the fine texture being watched.
+	 * Measured there on time-averaged frames, 96/128/192 cost a textured bed
+	 * 31/49/63% of its detail and printed line art 6/13/21%, for noise
+	 * 1.32 -> 1.09/0.94/0.80. */
 	UVCD_CTRL_ROW("spatial-denoise", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_SINTER,
-		      0, 255, 192, sinter),
+		      0, 255, 0, sinter),
 	UVCD_CTRL_ROW("temporal-denoise", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_TEMPER,
 		      0, 255, 128, temper),
 	UVCD_CTRL_ROW("defective-pixel-correction", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DPC,
@@ -505,8 +507,11 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 	 * brightest spot and leaving the rest of the picture black. */
 	UVCD_CTRL_ROW("highlight-suppression", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_HIGHLIGHT,
 		      0, 10, 0, highlight),
+	/* Center-weighted: the camera looks at a lit print in a dark chamber.
+	 * The tuning's own weights expose for the chamber and blew a white
+	 * label in the middle of the view out (37% clipped; 0.9% centred). */
 	UVCD_CTRL_ROW("metering", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_METERING,
-		      UVCD_METERING_TUNING, UVCD_METERING_SPOT, UVCD_METERING_TUNING, metering),
+		      UVCD_METERING_TUNING, UVCD_METERING_SPOT, UVCD_METERING_CENTER, metering),
 	UVCD_CTRL_ROW("rotation", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_ROTATION,
 		      0, 180, 0, rotation, .res = 180),
 
