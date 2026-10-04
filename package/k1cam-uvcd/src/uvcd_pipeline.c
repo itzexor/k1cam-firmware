@@ -877,11 +877,6 @@ static uint32_t effective_h264_bitrate(const uvcd_pipeline_t *p, uint8_t frame)
 	return uvcd_frames[frame].h264_bitrate;
 }
 
-static uint32_t effective_h264_gop(const uvcd_pipeline_t *p, uint32_t fps)
-{
-	return p->controls.h264_gop_frames > 0 ? (uint32_t)p->controls.h264_gop_frames : fps;
-}
-
 static rss_rc_mode_t h264_rc_mode(const uvcd_pipeline_t *p)
 {
 	switch (p->controls.h264_rate_control) {
@@ -905,14 +900,6 @@ int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p)
 		return 0;
 	return RSS_HAL_CALL(p->ops, enc_set_bitrate, p->hal_ctx, UVCD_ENC_CHN,
 			    effective_h264_bitrate(p, p->cur_frame));
-}
-
-int uvcd_enc_apply_gop(uvcd_pipeline_t *p)
-{
-	if (!running_h264(p))
-		return 0;
-	return RSS_HAL_CALL(p->ops, enc_set_gop, p->hal_ctx, UVCD_ENC_CHN,
-			    effective_h264_gop(p, uvcd_interval_fps(p->cur_interval)));
 }
 
 int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
@@ -1015,7 +1002,11 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 		.max_bitrate = jpeg ? 0 : bitrate * 4 / 3,
 		.fps_num = fps_num,
 		.fps_den = fps_den,
-		.gop_length = effective_h264_gop(p, fps_num),
+		/* An IDR every second. libimp only makes whole-second GOPs, every
+		 * I-frame an IDR: AL_Codec_Encode_ValidateGopParam rounds the IDR
+		 * interval (gop_length * max_same_scene_cnt) up to a multiple of the
+		 * frame rate and sets the I-frame interval to match. */
+		.gop_length = fps_num,
 		.max_same_scene_cnt = 1, /* SDK default 2 doubles the IDR interval */
 		/* On T31 a JPEG channel's quality *is* its initial QP, and it can
 		 * only be set here -- enc_set_jpeg_qp is unsupported on this SDK. */

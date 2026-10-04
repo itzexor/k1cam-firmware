@@ -141,8 +141,8 @@ static const struct ctrl_def ctrl_defs[] = {
 	 "0: automatic, 1-16000: target kbps"},
 	{41, "h264-rate-control", CTRL_CUSTOM, 0, 14,
 	 "0: CBR, 1: VBR, 2: capped VBR"},
-	{42, "h264-gop-frames", CTRL_CUSTOM, 0, 15,
-	 "0: one second, 1-300: frames between keyframes, rounded up to whole seconds"},
+	/* 42 was h264-gop-frames: the camera now sends a keyframe every second,
+	 * the only GOP its encoder makes reliably. Retired, not reused. */
 	{43, "h264-min-qp", CTRL_CUSTOM, 0, 16,
 	 "-1: automatic (20), 0-51: lowest QP (best quality)"},
 	{44, "h264-max-qp", CTRL_CUSTOM, 0, 17,

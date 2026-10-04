@@ -72,7 +72,6 @@ int uvcd_apply_wb(uvcd_pipeline_t *p, int v, int a) { (void)p; (void)v; (void)a;
 int uvcd_awb_current_ct(uvcd_pipeline_t *p) { (void)p; return -1; }
 int uvcd_live_exposure(uvcd_pipeline_t *p) { (void)p; return -1; }
 int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p) { (void)p; return 0; }
-int uvcd_enc_apply_gop(uvcd_pipeline_t *p) { (void)p; return 0; }
 STUB_APPLY(uvcd_apply_metering)
 STUB_APPLY(uvcd_apply_rotation)
 STUB_APPLY(uvcd_apply_exposure)
@@ -222,9 +221,12 @@ int main(void)
 	uvcd_ctrl_reset(&g);
 	assert(saves == was_saves + 2 && good_saves == was_good + 2);
 
-	/* The retired explicit-save selectors answer like any unknown one. */
+	/* The retired explicit-save and GOP selectors answer like any unknown
+	 * one, and a saved GOP no longer names a control. */
 	for (unsigned sel = 23; sel <= 25; sel++)
 		assert(custom_ctrl_def(sel) == NULL && custom_control_value(&g, sel) == NULL);
+	assert(custom_ctrl_def(15) == NULL && custom_control_value(&g, 15) == NULL);
+	assert(uvcd_ctrl_find("h264-gop-frames") == NULL);
 	puts("gadget regression tests passed");
 	pthread_mutex_destroy(&p.frame.lock);
 	return 0;

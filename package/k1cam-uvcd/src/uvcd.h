@@ -134,7 +134,6 @@ struct uvcd_control_state {
 	 * the ones T31 can change at runtime are also applied live. */
 	int h264_bitrate_kbps; /* 0 = per-resolution default (uvcd_frames) */
 	int h264_rate_control; /* UVCD_H264_RC_* */
-	int h264_gop_frames;   /* 0 = one second at the negotiated frame rate */
 	int h264_min_qp;       /* -1 = UVCD_H264_AUTO_MIN_QP */
 	int h264_max_qp;       /* -1 = SDK default */
 	int h264_profile;      /* 0 = baseline, 1 = main, 2 = high */
@@ -308,7 +307,6 @@ int uvcd_awb_current_ct(uvcd_pipeline_t *p);
 /* Encoder settings. Each returns 0 when the setting is stored for the next
  * channel creation and, where T31 allows it, already applied live. */
 int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p);
-int uvcd_enc_apply_gop(uvcd_pipeline_t *p);
 int uvcd_enc_request_keyframe(uvcd_pipeline_t *p);
 
 /* Recreate the encoder channel with the current settings, keeping the

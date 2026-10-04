@@ -62,7 +62,7 @@ sudo make install
 
 ```sh
 uvcdctl list                  # values, ranges and defaults
-uvcdctl describe h264-gop-frames
+uvcdctl describe h264-rate-control
 uvcdctl get spatial-denoise
 uvcdctl set 23 200            # same control, by ID
 uvcdctl set h264-bitrate-kbps 6000

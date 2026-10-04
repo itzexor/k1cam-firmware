@@ -165,9 +165,12 @@ int main(void)
 	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_1080P, 333333) == -EIO);
 	assert(enc.gop_length == 30 && enc.max_same_scene_cnt == 1);
 	assert(stream_size == uvcd_frames[UVCD_FRAME_1080P].max_size && stream_count == 2);
-	p.controls.h264_gop_frames = 17;
+	/* An IDR every second at whatever rate was negotiated. */
+	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 666666) == -EIO);
+	assert(enc.gop_length == 15 && enc.max_same_scene_cnt == 1);
+	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 2000000) == -EIO);
+	assert(enc.gop_length == 5 && enc.max_same_scene_cnt == 1);
 	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
-	assert(enc.gop_length == 17 && enc.max_same_scene_cnt == 1);
 	/* Automatic min QP: 20, unless an explicit max QP is below it. */
 	assert(enc.min_qp == UVCD_H264_AUTO_MIN_QP && enc.max_qp == -1);
 	p.controls.h264_max_qp = 12;

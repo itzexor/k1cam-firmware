@@ -73,12 +73,14 @@ struct uvc_event {
 #define UVCD_CUSTOM_RESET 10
 /* 11 and 12 were horizontal/vertical flip, replaced by rotation (22). Not
  * reused, so an old host tool can't set the wrong thing by number. */
-/* Encoder settings. Bitrate and GOP apply live; the rest can only be set when
- * the encoder channel is created, so changing them mid-stream re-creates it
- * in place (a short gap in frames, no renegotiation with the host). */
+/* Encoder settings. Bitrate applies live; the rest can only be set when the
+ * encoder channel is created, so changing them mid-stream re-creates it in
+ * place (a short gap in frames, no renegotiation with the host). */
 #define UVCD_CUSTOM_H264_BITRATE 13
 #define UVCD_CUSTOM_H264_RATE_CONTROL 14
-#define UVCD_CUSTOM_H264_GOP 15
+/* 15 was the GOP length. The T31 encoder only makes whole-second GOPs, and
+ * libimp rounded a live change a second further than the same value at
+ * stream start, so the GOP is fixed at one second. Retired, not reused. */
 #define UVCD_CUSTOM_H264_MIN_QP 16
 #define UVCD_CUSTOM_H264_MAX_QP 17
 #define UVCD_CUSTOM_H264_PROFILE 18
@@ -339,8 +341,6 @@ static int *custom_control_value(gadget_t *g, uint8_t selector)
 		return &g->pipe->controls.h264_bitrate_kbps;
 	case UVCD_CUSTOM_H264_RATE_CONTROL:
 		return &g->pipe->controls.h264_rate_control;
-	case UVCD_CUSTOM_H264_GOP:
-		return &g->pipe->controls.h264_gop_frames;
 	case UVCD_CUSTOM_H264_MIN_QP:
 		return &g->pipe->controls.h264_min_qp;
 	case UVCD_CUSTOM_H264_MAX_QP:
@@ -420,7 +420,6 @@ static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
 	}
 	case UVCD_CUSTOM_H264_BITRATE:
 	case UVCD_CUSTOM_H264_RATE_CONTROL:
-	case UVCD_CUSTOM_H264_GOP:
 	case UVCD_CUSTOM_H264_MIN_QP:
 	case UVCD_CUSTOM_H264_MAX_QP:
 	case UVCD_CUSTOM_H264_PROFILE:
@@ -520,10 +519,6 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 		      0, 16000, 0, h264_bitrate_kbps),
 	UVCD_CTRL_ROW("h264-rate-control", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_RATE_CONTROL,
 		      UVCD_H264_RC_CBR, UVCD_H264_RC_CAPPED_VBR, UVCD_H264_RC_CBR, h264_rate_control),
-	/* The T31 encoder rounds this up to whole seconds: at 30 fps, 10 and 15
-	 * give an IDR every 30 frames, 31 and 45 every 60. */
-	UVCD_CTRL_ROW("h264-gop-frames", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_GOP,
-		      0, 300, 0, h264_gop_frames),
 	UVCD_CTRL_ROW("h264-min-qp", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_MIN_QP,
 		      -1, 51, -1, h264_min_qp),
 	UVCD_CTRL_ROW("h264-max-qp", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_H264_MAX_QP,
@@ -697,9 +692,6 @@ static void encoder_after_store(gadget_t *g, uint8_t selector)
 	switch (selector) {
 	case UVCD_CUSTOM_H264_BITRATE:
 		ret = uvcd_enc_apply_bitrate(g->pipe);
-		break;
-	case UVCD_CUSTOM_H264_GOP:
-		ret = uvcd_enc_apply_gop(g->pipe);
 		break;
 	case UVCD_CUSTOM_H264_RATE_CONTROL:
 	case UVCD_CUSTOM_H264_MIN_QP:
