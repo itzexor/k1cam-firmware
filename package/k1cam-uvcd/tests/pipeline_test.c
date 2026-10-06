@@ -86,6 +86,131 @@ static int create_enc(void *ctx, int chn, const rss_video_config_t *cfg)
 	return -EIO; /* Stop after capturing the complete configuration. */
 }
 
+/* Subject metering: fake ISP statistics in, weights and compensation out. */
+static uint32_t fake_zone[15][15], fake_hist[256];
+static uint8_t written_weight[15][15];
+static int weight_writes, written_comp = -1;
+
+static int get_zone(void *ctx, uint32_t zone[15][15])
+{
+	(void)ctx;
+	memcpy(zone, fake_zone, sizeof(fake_zone));
+	return 0;
+}
+
+static int get_hist(void *ctx, uint32_t bins[256])
+{
+	(void)ctx;
+	memcpy(bins, fake_hist, sizeof(fake_hist));
+	return 0;
+}
+
+static int set_weight(void *ctx, const uint8_t weight[15][15])
+{
+	(void)ctx;
+	memcpy(written_weight, weight, sizeof(written_weight));
+	weight_writes++;
+	return 0;
+}
+
+static int set_comp(void *ctx, int comp)
+{
+	(void)ctx;
+	written_comp = comp;
+	return 0;
+}
+
+/* A dark bed (zones at 40) with a bright print over a 3x3 block left of
+ * centre, and a histogram whose brightest 1% sits at `top_bin`. */
+static void fake_scene(uint32_t print, int top_bin)
+{
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++)
+			fake_zone[r][col] = r >= 8 && r <= 10 && col >= 3 && col <= 5 ? print : 40;
+	memset(fake_hist, 0, sizeof(fake_hist));
+	fake_hist[60] = 990;
+	fake_hist[top_bin] = 10;
+}
+
+static void test_subject_metering(void)
+{
+	rss_hal_ops_t ops = {
+		.isp_get_ae_zone = get_zone,
+		.isp_get_ae_hist_origin = get_hist,
+		.isp_set_ae_weight = set_weight,
+		.isp_set_ae_comp = set_comp,
+	};
+	uvcd_pipeline_t p = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080, .running = true};
+	p.view.w = 1920;
+	p.view.h = 1080;
+	p.controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	p.controls.ae_comp = 128;
+	p.controls.metering = UVCD_METERING_SUBJECT;
+
+	/* Starts out center-weighted. */
+	uint8_t center[15][15];
+	metering_weights(&p, UVCD_METERING_CENTER, center);
+	assert(uvcd_apply_metering(&p, &p.controls) == 0);
+	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+	assert(center[9][4] < 8 && center[7][7] == 8 && center[0][0] == 2);
+
+	/* The print eases up to full weight; the bed keeps center weights. */
+	fake_scene(400, 175);
+	for (int i = 0; i < 8; i++)
+		subject_weights(&p);
+	assert(written_weight[9][4] == 8 && written_weight[8][3] == 8);
+	assert(written_weight[0][0] == center[0][0] && written_weight[12][12] == center[12][12]);
+	/* Unchanged statistics write nothing new. */
+	int writes = weight_writes;
+	subject_weights(&p);
+	assert(weight_writes == writes);
+	/* A zone just a little brighter than the bed is not a subject. */
+	fake_scene(56, 200);
+	for (int i = 0; i < 8; i++)
+		subject_weights(&p);
+	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+
+	/* Clipping highlights hold compensation back, down to the floor. */
+	fake_scene(400, 255);
+	highlight_guard(&p);
+	assert(written_comp == 109); /* 128 * 0.85 */
+	for (int i = 0; i < 20; i++)
+		highlight_guard(&p);
+	assert(written_comp == 32);
+	/* Between the thresholds it holds still. */
+	fake_scene(400, 175);
+	written_comp = -1;
+	highlight_guard(&p);
+	assert(written_comp == -1);
+	/* Well below clipping, it gives the compensation back, never more. */
+	fake_scene(400, 120);
+	for (int i = 0; i < 30; i++)
+		highlight_guard(&p);
+	assert(written_comp == 128 && p.ae_comp_cut == 0.0f);
+
+	/* The control itself still applies under the guard ... */
+	fake_scene(400, 255);
+	highlight_guard(&p);
+	struct uvcd_control_state c = p.controls;
+	c.ae_comp = 200;
+	assert(uvcd_apply_ae_comp(&p, &c) == 0 && written_comp == 170);
+	/* ... and leaving subject metering gives back what it held. */
+	c.metering = UVCD_METERING_CENTER;
+	assert(uvcd_apply_metering(&p, &c) == 0);
+	assert(written_comp == 200 && p.ae_comp_cut == 0.0f);
+	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+
+	/* Nothing to do in manual exposure or other modes. */
+	writes = weight_writes;
+	p.subject_checked_ms = 0;
+	p.controls.metering = UVCD_METERING_CENTER;
+	subject_metering_tick(&p);
+	p.controls.metering = UVCD_METERING_SUBJECT;
+	p.controls.ae_mode = UVCD_AE_MANUAL;
+	subject_metering_tick(&p);
+	assert(weight_writes == writes);
+}
+
 int main(void)
 {
 	rss_hal_ops_t ops = {
@@ -192,6 +317,7 @@ int main(void)
 			fps = fps_step(fps, -1, ceiling);
 		assert(fps == (ceiling < 15 ? ceiling : 15));
 	}
+	test_subject_metering();
 	puts("pipeline regression tests passed");
 	return 0;
 }

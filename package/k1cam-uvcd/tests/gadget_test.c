@@ -73,6 +73,7 @@ int uvcd_awb_current_ct(uvcd_pipeline_t *p) { (void)p; return -1; }
 int uvcd_live_exposure(uvcd_pipeline_t *p) { (void)p; return -1; }
 int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p) { (void)p; return 0; }
 STUB_APPLY(uvcd_apply_metering)
+STUB_APPLY(uvcd_apply_ae_comp)
 STUB_APPLY(uvcd_apply_rotation)
 STUB_APPLY(uvcd_apply_exposure)
 STUB_APPLY(uvcd_apply_view)

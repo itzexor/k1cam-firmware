@@ -259,7 +259,7 @@ static void apply_isp_controls(uvcd_pipeline_t *p)
 	RSS_HAL_CALL(p->ops, isp_set_sinter_strength, p->hal_ctx, p->controls.sinter);
 	RSS_HAL_CALL(p->ops, isp_set_temper_strength, p->hal_ctx, p->controls.temper);
 	RSS_HAL_CALL(p->ops, isp_set_hue, p->hal_ctx, p->controls.hue + 128);
-	RSS_HAL_CALL(p->ops, isp_set_ae_comp, p->hal_ctx, p->controls.ae_comp);
+	uvcd_apply_ae_comp(p, &p->controls);
 	RSS_HAL_CALL(p->ops, isp_set_max_again, p->hal_ctx, p->controls.max_again);
 	RSS_HAL_CALL(p->ops, isp_set_max_dgain, p->hal_ctx, p->controls.max_dgain);
 	RSS_HAL_CALL(p->ops, isp_set_dpc_strength, p->hal_ctx, p->controls.dpc);
@@ -806,41 +806,41 @@ static void exposure_priority_tick(uvcd_pipeline_t *p)
 	}
 }
 
-int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
+/* The ISP meters on a 15x15 grid over the whole sensor. A zone counts as
+ * in the view when its centre is. */
+static bool zone_in_view(const uvcd_pipeline_t *p, int r, int col)
 {
-	uint8_t weight[15][15];
+	int zx = (2 * col + 1) * p->sensor_w / 30;
+	int zy = (2 * r + 1) * p->sensor_h / 30;
+	return zx >= p->view.x && zx < p->view.x + p->view.w && zy >= p->view.y &&
+	       zy < p->view.y + p->view.h;
+}
 
-	if (c->metering == UVCD_METERING_TUNING) {
-		if (!p->ae_weight_ref_valid)
-			return RSS_OK; /* never changed, so nothing to restore */
-		return RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
-				    (const uint8_t(*)[15])p->ae_weight_ref);
-	}
-
-	/* The ISP meters on a 15x15 grid over the whole sensor. Zones outside
-	 * the view get no weight, so what the host can't see doesn't set the
-	 * exposure. Weights run 0-8. */
+/* Fixed weights for `metering` (any mode but TUNING; SUBJECT starts from
+ * CENTER). Zones outside the view get no weight, so what the host can't see
+ * doesn't set the exposure. Weights run 0-8. */
+static void metering_weights(const uvcd_pipeline_t *p, int metering, uint8_t weight[15][15])
+{
 	int cx = p->view.x + p->view.w / 2, cy = p->view.y + p->view.h / 2;
 	bool any = false;
 	for (int r = 0; r < 15; r++) {
 		for (int col = 0; col < 15; col++) {
-			int zx = (2 * col + 1) * p->sensor_w / 30;
-			int zy = (2 * r + 1) * p->sensor_h / 30;
 			uint8_t w = 0;
 
-			if (zx >= p->view.x && zx < p->view.x + p->view.w && zy >= p->view.y &&
-			    zy < p->view.y + p->view.h) {
+			if (zone_in_view(p, r, col)) {
+				int zx = (2 * col + 1) * p->sensor_w / 30;
+				int zy = (2 * r + 1) * p->sensor_h / 30;
 				/* 0 at the centre of the view, 1 at its edge */
 				float dx = fabsf((float)(zx - cx)) / (float)(p->view.w / 2);
 				float dy = fabsf((float)(zy - cy)) / (float)(p->view.h / 2);
 				float d = dx > dy ? dx : dy;
 
-				if (c->metering == UVCD_METERING_AVERAGE)
+				if (metering == UVCD_METERING_AVERAGE)
 					w = 8;
-				else if (c->metering == UVCD_METERING_CENTER)
-					w = (uint8_t)(8.0f - 6.0f * d + 0.5f);
-				else
+				else if (metering == UVCD_METERING_SPOT)
 					w = d <= 0.2f ? 8 : 0;
+				else
+					w = (uint8_t)(8.0f - 6.0f * d + 0.5f);
 			}
 			weight[r][col] = w;
 			any |= (w != 0);
@@ -849,9 +849,186 @@ int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
 	/* A spot smaller than one zone: weight the zone under the centre. */
 	if (!any)
 		weight[cy * 15 / p->sensor_h][cx * 15 / p->sensor_w] = 8;
+}
+
+int uvcd_apply_ae_comp(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
+{
+	int v = c->ae_comp;
+
+	if (c->metering == UVCD_METERING_SUBJECT)
+		v = (int)((float)v * (1.0f - p->ae_comp_cut) + 0.5f);
+	return RSS_HAL_CALL(p->ops, isp_set_ae_comp, p->hal_ctx, v);
+}
+
+int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
+{
+	uint8_t weight[15][15];
+
+	/* Only subject metering holds exposure compensation back. */
+	if (c->metering != UVCD_METERING_SUBJECT && p->ae_comp_cut != 0.0f) {
+		p->ae_comp_cut = 0.0f;
+		uvcd_apply_ae_comp(p, c);
+	}
+
+	if (c->metering == UVCD_METERING_TUNING) {
+		if (!p->ae_weight_ref_valid)
+			return RSS_OK; /* never changed, so nothing to restore */
+		return RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
+				    (const uint8_t(*)[15])p->ae_weight_ref);
+	}
+
+	metering_weights(p, c->metering, weight);
+	/* Subject metering starts from center-weighted and finds the subject
+	 * from the next statistics on. */
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++)
+			p->subject_weight[r][col] = weight[r][col];
+	memcpy(p->subject_written, weight, sizeof(weight));
+	p->subject_checked_ms = p->guard_checked_ms = monotonic_ms();
 
 	return RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
 			    (const uint8_t(*)[15])weight);
+}
+
+/* Subject metering. The chamber camera looks at small, often white prints on
+ * a dark bed in a dark chamber, and any fixed weighting averages the two:
+ * the dark bed pulls the exposure up and the print clips. Two loops fix
+ * that, both from the ISP's own statistics, so they cost nothing per frame:
+ *
+ * - Find the subject: zones well above the median brightness of the view
+ *   are what stands out, and are eased up to full weight over the
+ *   center-weighted base. On the K1 the median zone is the unlit chamber,
+ *   so the lit bed and the prints on it both count. The ratio to the median
+ *   doesn't change with exposure, so this doesn't fight auto-exposure. With
+ *   nothing standing out it is plain center-weighted.
+ *
+ * - Guard the highlights: metering a white print to auto-exposure's target
+ *   alone would make it grey, so the weights only steer. What decides is
+ *   the brightest UVCD_GUARD_TOP of the picture: while it clips,
+ *   exposure compensation is held back a step at a time (to at most
+ *   UVCD_GUARD_MAX_CUT); once it sits well below clipping, it is given
+ *   back. Anything smaller than UVCD_GUARD_TOP, such as a glint, may clip. */
+#define UVCD_SUBJECT_PERIOD_MS 500
+#define UVCD_SUBJECT_RATIO_LO 1.5f /* zone / median: no extra weight below */
+#define UVCD_SUBJECT_RATIO_HI 3.0f /* full weight from here */
+#define UVCD_SUBJECT_EASE 0.5f     /* of the way to the target, per period */
+#define UVCD_GUARD_PERIOD_MS 1000  /* lets auto-exposure settle in between */
+#define UVCD_GUARD_TOP 0.005f      /* the brightest 0.5% of the picture */
+/* The histogram is linear, taken before the gamma curve: on the K1, bin 219
+ * came out at 251 of 255, bin 200 at about 238 and bin 150 at about 211.
+ * The band between the two is wider than one step either way, so the guard
+ * comes to rest instead of hunting. */
+#define UVCD_GUARD_CLIP_BIN 200
+#define UVCD_GUARD_LOW_BIN 150
+#define UVCD_GUARD_DOWN 0.85f
+#define UVCD_GUARD_UP 1.1f
+#define UVCD_GUARD_MAX_CUT 0.75f
+
+static int cmp_u32(const void *a, const void *b)
+{
+	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+	return (x > y) - (x < y);
+}
+
+static void subject_weights(uvcd_pipeline_t *p)
+{
+	uint32_t zone[15][15], sorted[225];
+	uint8_t base[15][15], weight[15][15];
+	int n = 0;
+
+	if (RSS_HAL_CALL(p->ops, isp_get_ae_zone, p->hal_ctx, zone) != RSS_OK)
+		return;
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++)
+			if (zone_in_view(p, r, col))
+				sorted[n++] = zone[r][col];
+	if (n == 0)
+		return;
+	qsort(sorted, (size_t)n, sizeof(sorted[0]), cmp_u32);
+	float median = (float)sorted[n / 2];
+	if (median < 1.0f)
+		median = 1.0f;
+
+	metering_weights(p, UVCD_METERING_CENTER, base);
+	int subject = 0;
+	for (int r = 0; r < 15; r++) {
+		for (int col = 0; col < 15; col++) {
+			float target = base[r][col];
+
+			if (zone_in_view(p, r, col)) {
+				float s = ((float)zone[r][col] / median - UVCD_SUBJECT_RATIO_LO) /
+					  (UVCD_SUBJECT_RATIO_HI - UVCD_SUBJECT_RATIO_LO);
+				s = s < 0.0f ? 0.0f : s > 1.0f ? 1.0f : s;
+				target += (8.0f - target) * s;
+				subject += s >= 0.5f;
+			}
+			float *w = &p->subject_weight[r][col];
+			*w += (target - *w) * UVCD_SUBJECT_EASE;
+			weight[r][col] = (uint8_t)(*w + 0.5f);
+		}
+	}
+	LOGD("subject metering: median %.0f, max %u, %d subject zones", (double)median,
+	     sorted[n - 1], subject);
+	if (memcmp(weight, p->subject_written, sizeof(weight)) == 0)
+		return;
+	if (RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
+			 (const uint8_t(*)[15])weight) == RSS_OK)
+		memcpy(p->subject_written, weight, sizeof(weight));
+}
+
+static void highlight_guard(uvcd_pipeline_t *p)
+{
+	uint32_t bins[256];
+	uint64_t total = 0, above = 0;
+	int top = 255;
+
+	if (RSS_HAL_CALL(p->ops, isp_get_ae_hist_origin, p->hal_ctx, bins) != RSS_OK)
+		return;
+	for (int i = 0; i < 256; i++)
+		total += bins[i];
+	if (total == 0)
+		return;
+	/* The darkest bin the brightest UVCD_GUARD_TOP reaches down into. */
+	for (; top > 0; top--) {
+		above += bins[top];
+		if ((float)above >= (float)total * UVCD_GUARD_TOP)
+			break;
+	}
+
+	float scale = 1.0f - p->ae_comp_cut;
+	if (top >= UVCD_GUARD_CLIP_BIN)
+		scale *= UVCD_GUARD_DOWN;
+	else if (top < UVCD_GUARD_LOW_BIN)
+		scale *= UVCD_GUARD_UP;
+	if (scale > 1.0f)
+		scale = 1.0f;
+	if (scale < 1.0f - UVCD_GUARD_MAX_CUT)
+		scale = 1.0f - UVCD_GUARD_MAX_CUT;
+
+	float cut = 1.0f - scale;
+	LOGD("highlight guard: top %.1f%% at bin %d, compensation cut %.0f%%",
+	     (double)(UVCD_GUARD_TOP * 100.0f), top, (double)(cut * 100.0f));
+	if (cut == p->ae_comp_cut)
+		return;
+	p->ae_comp_cut = cut;
+	uvcd_apply_ae_comp(p, &p->controls);
+}
+
+static void subject_metering_tick(uvcd_pipeline_t *p)
+{
+	const struct uvcd_control_state *c = &p->controls;
+
+	if (!p->running || c->metering != UVCD_METERING_SUBJECT || c->ae_mode == UVCD_AE_MANUAL)
+		return;
+	int64_t now = monotonic_ms();
+	if (now - p->subject_checked_ms < UVCD_SUBJECT_PERIOD_MS)
+		return;
+	p->subject_checked_ms = now;
+	subject_weights(p);
+	if (now - p->guard_checked_ms >= UVCD_GUARD_PERIOD_MS) {
+		p->guard_checked_ms = now;
+		highlight_guard(p);
+	}
 }
 
 int uvcd_apply_rotation(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
@@ -1200,6 +1377,7 @@ void uvcd_pipeline_stop(uvcd_pipeline_t *p)
 void uvcd_pipeline_tick(uvcd_pipeline_t *p)
 {
 	exposure_priority_tick(p);
+	subject_metering_tick(p);
 
 	if (!p->hal_up || p->configured) {
 		p->idle_since_ms = 0;

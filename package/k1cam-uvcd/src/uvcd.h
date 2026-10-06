@@ -167,6 +167,10 @@ struct uvcd_control_state {
 #define UVCD_METERING_AVERAGE 1
 #define UVCD_METERING_CENTER 2
 #define UVCD_METERING_SPOT 3
+/* Center-weighted, plus whatever stands out bright against the rest of the
+ * view (a print on the bed), with the highlights kept from clipping -- see
+ * subject_metering_tick(). */
+#define UVCD_METERING_SUBJECT 4
 
 #define UVCD_H264_RC_CBR 0
 #define UVCD_H264_RC_VBR 1
@@ -241,6 +245,15 @@ typedef struct {
 	uint8_t ae_weight_ref[15][15];
 	bool ae_weight_ref_valid;
 
+	/* UVCD_METERING_SUBJECT: the weights it is easing toward the subject,
+	 * the ones last written, and how much of the exposure-compensation
+	 * control the highlight guard holds back (0 = none, so the control
+	 * applies as set). */
+	float subject_weight[15][15];
+	uint8_t subject_written[15][15];
+	float ae_comp_cut;
+	int64_t subject_checked_ms, guard_checked_ms;
+
 	/* The one runtime copy of every control -- loaded from UVCD_CONFIG_PATH
 	 * (or compiled-in defaults) at init, changed in place by the gadget's
 	 * control paths, and read here when the encoder channel is created. */
@@ -295,6 +308,9 @@ int uvcd_apply_wb(uvcd_pipeline_t *p, int temp_kelvin, int auto_on);
 int uvcd_apply_exposure(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
 int uvcd_apply_view(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
 int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
+/* Exposure compensation, less what subject metering's highlight guard
+ * holds back. */
+int uvcd_apply_ae_comp(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
 int uvcd_apply_rotation(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
 
 /* The exposure time auto-exposure is using now, 100 us units, or -1. */
@@ -325,9 +341,9 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
  * up until uvcd_pipeline_idle() lets them go. */
 void uvcd_pipeline_stop(uvcd_pipeline_t *p);
 
-/* Call periodically from the main loop: runs exposure priority while
- * streaming, and takes the sensor, ISP and IMP system down once no channel
- * has been configured for UVCD_HAL_LINGER_MS. */
+/* Call periodically from the main loop: runs exposure priority and subject
+ * metering while streaming, and takes the sensor, ISP and IMP system down
+ * once no channel has been configured for UVCD_HAL_LINGER_MS. */
 void uvcd_pipeline_tick(uvcd_pipeline_t *p);
 
 /* True while the HAL is initialized. ISP calls are only valid then; while it

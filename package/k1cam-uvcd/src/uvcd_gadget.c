@@ -396,8 +396,11 @@ static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_max_again, g->pipe->hal_ctx, value);
 	case UVCD_CUSTOM_MAX_DGAIN:
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_max_dgain, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_AE_COMP:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_ae_comp, g->pipe->hal_ctx, value);
+	case UVCD_CUSTOM_AE_COMP: {
+		struct uvcd_control_state c = g->pipe->controls;
+		c.ae_comp = value;
+		return uvcd_apply_ae_comp(g->pipe, &c);
+	}
 	case UVCD_CUSTOM_SINTER:
 		return RSS_HAL_CALL(g->pipe->ops, isp_set_sinter_strength, g->pipe->hal_ctx, value);
 	case UVCD_CUSTOM_TEMPER:
@@ -510,7 +513,7 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 	 * The tuning's own weights expose for the chamber and blew a white
 	 * label in the middle of the view out (37% clipped; 0.9% centred). */
 	UVCD_CTRL_ROW("metering", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_METERING,
-		      UVCD_METERING_TUNING, UVCD_METERING_SPOT, UVCD_METERING_CENTER, metering),
+		      UVCD_METERING_TUNING, UVCD_METERING_SUBJECT, UVCD_METERING_CENTER, metering),
 	UVCD_CTRL_ROW("rotation", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_ROTATION,
 		      0, 180, 0, rotation, .res = 180),
 

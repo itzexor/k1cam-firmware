@@ -135,7 +135,8 @@ static const struct ctrl_def ctrl_defs[] = {
 	{31, "rotation", CTRL_CUSTOM, 0, 22,
 	 "0 or 180: degrees"},
 	{32, "metering", CTRL_CUSTOM, 0, 21,
-	 "0: tuning default, 1: average, 2: center-weighted, 3: spot (of the view)"},
+	 "0: tuning default, 1: average, 2: center-weighted, 3: spot (of the view), "
+	 "4: subject (what stands out bright, kept from clipping)"},
 
 	{40, "h264-bitrate-kbps", CTRL_CUSTOM, 0, 13,
 	 "0: automatic, 1-16000: target kbps"},
