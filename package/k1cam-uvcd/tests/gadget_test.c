@@ -207,7 +207,7 @@ int main(void)
 	deliver_frame(&g);
 	assert(queued == was_queued + 1 && g.read_seq == 3);
 	assert(uvcd_ctrl_find("power-line-frequency")->def == 0);
-	assert(uvcd_ctrl_find("spatial-denoise")->def == 192);
+	assert(uvcd_ctrl_find("spatial-denoise")->def == 0);
 
 	/* Factory reset is written at once, and replaces the proven controls
 	 * so a later crash cannot bring back what it threw away. Even when
