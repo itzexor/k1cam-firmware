@@ -496,7 +496,7 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 	UVCD_CTRL_ROW("spatial-denoise", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_SINTER,
 		      0, 255, 0, sinter),
 	UVCD_CTRL_ROW("temporal-denoise", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_TEMPER,
-		      0, 255, 128, temper),
+		      0, 255, 64, temper),
 	UVCD_CTRL_ROW("defective-pixel-correction", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DPC,
 		      0, 255, 128, dpc),
 	UVCD_CTRL_ROW("dynamic-range-compression", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DRC,
