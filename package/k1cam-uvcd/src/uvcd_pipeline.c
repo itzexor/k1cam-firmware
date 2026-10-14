@@ -878,16 +878,19 @@ int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
 	}
 
 	metering_weights(p, c->metering, weight);
+	int ret = RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
+			      (const uint8_t(*)[15])weight);
+	if (ret != RSS_OK)
+		return ret;
 	/* Subject metering starts from center-weighted and finds the subject
-	 * from the next statistics on. */
+	 * from the next statistics on. Only weights the ISP took count as
+	 * written, or a rejected write would never be retried. */
 	for (int r = 0; r < 15; r++)
 		for (int col = 0; col < 15; col++)
 			p->subject_weight[r][col] = weight[r][col];
 	memcpy(p->subject_written, weight, sizeof(weight));
 	p->subject_checked_ms = p->guard_checked_ms = monotonic_ms();
-
-	return RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
-			    (const uint8_t(*)[15])weight);
+	return RSS_OK;
 }
 
 /* Subject metering. The chamber camera looks at small, often white prints on
@@ -898,8 +901,9 @@ int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
  * - Find the subject: zones well above the median brightness of the view
  *   are what stands out, and are eased up to full weight over the
  *   center-weighted base. On the K1 the median zone is the unlit chamber,
- *   so the lit bed and the prints on it both count. The ratio to the median
- *   doesn't change with exposure, so this doesn't fight auto-exposure. With
+ *   so the lit bed and the prints on it both count. While neither zone
+ *   clips or sits in the noise floor, the ratio to the median doesn't
+ *   change with exposure, so this doesn't fight auto-exposure. With
  *   nothing standing out it is plain center-weighted.
  *
  * - Guard the highlights: metering a white print to auto-exposure's target
@@ -911,9 +915,10 @@ int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
 #define UVCD_SUBJECT_PERIOD_MS 500
 #define UVCD_SUBJECT_RATIO_LO 1.5f /* zone / median: no extra weight below */
 #define UVCD_SUBJECT_RATIO_HI 3.0f /* full weight from here */
+#define UVCD_SUBJECT_MEDIAN_FLOOR 4.0f /* below it, ratios are dark-zone noise */
 #define UVCD_SUBJECT_EASE 0.5f     /* of the way to the target, per period */
 #define UVCD_GUARD_PERIOD_MS 1000  /* lets auto-exposure settle in between */
-#define UVCD_GUARD_TOP 0.005f      /* the brightest 0.5% of the picture */
+#define UVCD_GUARD_TOP 0.01f       /* the brightest 1% of the picture */
 /* The histogram is linear, taken before the gamma curve: on the K1, bin 219
  * came out at 251 of 255, bin 200 at about 238 and bin 150 at about 211.
  * The band between the two is wider than one step either way, so the guard
@@ -922,7 +927,7 @@ int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
 #define UVCD_GUARD_LOW_BIN 150
 #define UVCD_GUARD_DOWN 0.85f
 #define UVCD_GUARD_UP 1.1f
-#define UVCD_GUARD_MAX_CUT 0.75f
+#define UVCD_GUARD_MAX_CUT 0.5f /* keep at least half the requested compensation */
 
 static int cmp_u32(const void *a, const void *b)
 {
@@ -946,8 +951,8 @@ static void subject_weights(uvcd_pipeline_t *p)
 		return;
 	qsort(sorted, (size_t)n, sizeof(sorted[0]), cmp_u32);
 	float median = (float)sorted[n / 2];
-	if (median < 1.0f)
-		median = 1.0f;
+	if (median < UVCD_SUBJECT_MEDIAN_FLOOR)
+		median = UVCD_SUBJECT_MEDIAN_FLOOR;
 
 	metering_weights(p, UVCD_METERING_CENTER, base);
 	int subject = 0;
@@ -1010,8 +1015,10 @@ static void highlight_guard(uvcd_pipeline_t *p)
 	     (double)(UVCD_GUARD_TOP * 100.0f), top, (double)(cut * 100.0f));
 	if (cut == p->ae_comp_cut)
 		return;
+	float old_cut = p->ae_comp_cut;
 	p->ae_comp_cut = cut;
-	uvcd_apply_ae_comp(p, &p->controls);
+	if (uvcd_apply_ae_comp(p, &p->controls) != RSS_OK)
+		p->ae_comp_cut = old_cut; /* not applied: try again next time */
 }
 
 static void subject_metering_tick(uvcd_pipeline_t *p)

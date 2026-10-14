@@ -89,7 +89,7 @@ static int create_enc(void *ctx, int chn, const rss_video_config_t *cfg)
 /* Subject metering: fake ISP statistics in, weights and compensation out. */
 static uint32_t fake_zone[15][15], fake_hist[256];
 static uint8_t written_weight[15][15];
-static int weight_writes, written_comp = -1;
+static int weight_writes, written_comp = -1, weight_error, comp_error;
 
 static int get_zone(void *ctx, uint32_t zone[15][15])
 {
@@ -108,14 +108,18 @@ static int get_hist(void *ctx, uint32_t bins[256])
 static int set_weight(void *ctx, const uint8_t weight[15][15])
 {
 	(void)ctx;
-	memcpy(written_weight, weight, sizeof(written_weight));
 	weight_writes++;
+	if (weight_error)
+		return weight_error; /* a rejected write leaves the ISP as it was */
+	memcpy(written_weight, weight, sizeof(written_weight));
 	return 0;
 }
 
 static int set_comp(void *ctx, int comp)
 {
 	(void)ctx;
+	if (comp_error)
+		return comp_error;
 	written_comp = comp;
 	return 0;
 }
@@ -169,6 +173,44 @@ static void test_subject_metering(void)
 	for (int i = 0; i < 8; i++)
 		subject_weights(&p);
 	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+	/* Nor is near-black noise: 3 against a median of 1 used to be a
+	 * full-weight subject. */
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++)
+			fake_zone[r][col] = 1;
+	fake_zone[9][4] = 3;
+	for (int i = 0; i < 8; i++)
+		subject_weights(&p);
+	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+
+	/* Weights the ISP rejected are not taken as written: with the print's
+	 * weights still in the ISP, a rejected reset to center-weighted must
+	 * be retried, not skipped as already in place. */
+	fake_scene(400, 175);
+	for (int i = 0; i < 8; i++)
+		subject_weights(&p);
+	assert(written_weight[9][4] == 8);
+	weight_error = -EIO;
+	assert(uvcd_apply_metering(&p, &p.controls) == -EIO);
+	weight_error = 0;
+	fake_scene(56, 175);
+	for (int i = 0; i < 8; i++)
+		subject_weights(&p);
+	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+
+	/* A rejected compensation write leaves the guard where it was. */
+	fake_scene(400, 255);
+	comp_error = -EIO;
+	highlight_guard(&p);
+	assert(p.ae_comp_cut == 0.0f);
+	comp_error = 0;
+	/* A small light source may clip without holding the scene back. */
+	memset(fake_hist, 0, sizeof(fake_hist));
+	fake_hist[60] = 992;
+	fake_hist[255] = 8; /* 0.8% */
+	written_comp = -1;
+	highlight_guard(&p);
+	assert(written_comp == -1 && p.ae_comp_cut == 0.0f);
 
 	/* Clipping highlights hold compensation back, down to the floor. */
 	fake_scene(400, 255);
@@ -176,7 +218,7 @@ static void test_subject_metering(void)
 	assert(written_comp == 109); /* 128 * 0.85 */
 	for (int i = 0; i < 20; i++)
 		highlight_guard(&p);
-	assert(written_comp == 32);
+	assert(written_comp == 64); /* never below half */
 	/* Between the thresholds it holds still. */
 	fake_scene(400, 175);
 	written_comp = -1;
