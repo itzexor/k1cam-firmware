@@ -1,5 +1,5 @@
 #!/bin/sh
-# S31uvcd -- minimal on-demand ISP -> UVC webcam daemon (T31 + GC2083 only)
+# S31uvcd -- minimal ISP -> UVC webcam daemon (T31 + GC2083 only)
 #
 # init runs the supervisor from inittab ("S31uvcd supervise", added by the
 # board's post-build script) and respawns it, and the supervisor respawns

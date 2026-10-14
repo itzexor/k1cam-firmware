@@ -1,5 +1,6 @@
 /* Host regression tests. Link with --gc-sections to discard hardware paths. */
 #include <assert.h>
+#include "../src/uvcd_camera.c"
 #include "../src/uvcd_pipeline.c"
 
 /* Smallest sensor crop measured to stream at each output size. One step
@@ -144,34 +145,37 @@ static void test_subject_metering(void)
 		.isp_set_ae_weight = set_weight,
 		.isp_set_ae_comp = set_comp,
 	};
-	uvcd_pipeline_t p = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080, .running = true};
-	p.view.w = 1920;
-	p.view.h = 1080;
-	p.controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
-	p.controls.ae_comp = 128;
-	p.controls.metering = UVCD_METERING_SUBJECT;
+	struct uvcd_control_state controls = {0};
+	uvcd_camera_t cam = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080, .up = true,
+			     .controls = &controls};
+	cam.view.w = 1920;
+	cam.view.h = 1080;
+	controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	controls.ae_comp = 128;
+	controls.metering = UVCD_METERING_SUBJECT;
 
 	/* Starts out center-weighted. */
 	uint8_t center[15][15];
-	metering_weights(&p, UVCD_METERING_CENTER, center);
-	assert(uvcd_apply_metering(&p, &p.controls) == 0);
+	metering_weights(&cam, UVCD_METERING_CENTER, center);
+	assert(apply_metering(&cam, &controls) == 0);
 	assert(memcmp(written_weight, center, sizeof(center)) == 0);
 	assert(center[9][4] < 8 && center[7][7] == 8 && center[0][0] == 2);
+	assert(cam.metering_valid && cam.metering_mode == UVCD_METERING_SUBJECT);
 
 	/* The print eases up to full weight; the bed keeps center weights. */
 	fake_scene(400, 175);
 	for (int i = 0; i < 8; i++)
-		subject_weights(&p);
+		subject_weights(&cam);
 	assert(written_weight[9][4] == 8 && written_weight[8][3] == 8);
 	assert(written_weight[0][0] == center[0][0] && written_weight[12][12] == center[12][12]);
 	/* Unchanged statistics write nothing new. */
 	int writes = weight_writes;
-	subject_weights(&p);
+	subject_weights(&cam);
 	assert(weight_writes == writes);
 	/* A zone just a little brighter than the bed is not a subject. */
 	fake_scene(56, 200);
 	for (int i = 0; i < 8; i++)
-		subject_weights(&p);
+		subject_weights(&cam);
 	assert(memcmp(written_weight, center, sizeof(center)) == 0);
 	/* Nor is near-black noise: 3 against a median of 1 used to be a
 	 * full-weight subject. */
@@ -180,7 +184,7 @@ static void test_subject_metering(void)
 			fake_zone[r][col] = 1;
 	fake_zone[9][4] = 3;
 	for (int i = 0; i < 8; i++)
-		subject_weights(&p);
+		subject_weights(&cam);
 	assert(memcmp(written_weight, center, sizeof(center)) == 0);
 
 	/* Weights the ISP rejected are not taken as written: with the print's
@@ -188,69 +192,314 @@ static void test_subject_metering(void)
 	 * be retried, not skipped as already in place. */
 	fake_scene(400, 175);
 	for (int i = 0; i < 8; i++)
-		subject_weights(&p);
+		subject_weights(&cam);
 	assert(written_weight[9][4] == 8);
+	cam.metering_valid = false; /* as after a view change */
 	weight_error = -EIO;
-	assert(uvcd_apply_metering(&p, &p.controls) == -EIO);
+	assert(apply_metering(&cam, &controls) == -EIO && !cam.metering_valid);
 	weight_error = 0;
 	fake_scene(56, 175);
 	for (int i = 0; i < 8; i++)
-		subject_weights(&p);
+		subject_weights(&cam);
 	assert(memcmp(written_weight, center, sizeof(center)) == 0);
+	/* ...and the tick retries the rejected reset itself. */
+	assert(!cam.metering_valid);
+	cam.metering_tried_ms = 0;
+	writes = weight_writes;
+	uvcd_camera_tick(&cam);
+	assert(cam.metering_valid && weight_writes == writes + 1);
 
 	/* A rejected compensation write leaves the guard where it was. */
 	fake_scene(400, 255);
 	comp_error = -EIO;
-	highlight_guard(&p);
-	assert(p.ae_comp_cut == 0.0f);
+	highlight_guard(&cam);
+	assert(cam.ae_comp_cut == 0.0f);
 	comp_error = 0;
 	/* A small light source may clip without holding the scene back. */
 	memset(fake_hist, 0, sizeof(fake_hist));
 	fake_hist[60] = 992;
 	fake_hist[255] = 8; /* 0.8% */
 	written_comp = -1;
-	highlight_guard(&p);
-	assert(written_comp == -1 && p.ae_comp_cut == 0.0f);
+	highlight_guard(&cam);
+	assert(written_comp == -1 && cam.ae_comp_cut == 0.0f);
 
 	/* Clipping highlights hold compensation back, down to the floor. */
 	fake_scene(400, 255);
-	highlight_guard(&p);
+	highlight_guard(&cam);
 	assert(written_comp == 109); /* 128 * 0.85 */
 	for (int i = 0; i < 20; i++)
-		highlight_guard(&p);
+		highlight_guard(&cam);
 	assert(written_comp == 64); /* never below half */
 	/* Between the thresholds it holds still. */
 	fake_scene(400, 175);
 	written_comp = -1;
-	highlight_guard(&p);
+	highlight_guard(&cam);
 	assert(written_comp == -1);
 	/* Well below clipping, it gives the compensation back, never more. */
 	fake_scene(400, 120);
 	for (int i = 0; i < 30; i++)
-		highlight_guard(&p);
-	assert(written_comp == 128 && p.ae_comp_cut == 0.0f);
+		highlight_guard(&cam);
+	assert(written_comp == 128 && cam.ae_comp_cut == 0.0f);
 
 	/* The control itself still applies under the guard ... */
 	fake_scene(400, 255);
-	highlight_guard(&p);
-	struct uvcd_control_state c = p.controls;
+	highlight_guard(&cam);
+	struct uvcd_control_state c = controls;
 	c.ae_comp = 200;
-	assert(uvcd_apply_ae_comp(&p, &c) == 0 && written_comp == 170);
+	assert(apply_ae_comp(&cam, &c) == 0 && written_comp == 170);
 	/* ... and leaving subject metering gives back what it held. */
 	c.metering = UVCD_METERING_CENTER;
-	assert(uvcd_apply_metering(&p, &c) == 0);
-	assert(written_comp == 200 && p.ae_comp_cut == 0.0f);
+	assert(apply_metering(&cam, &c) == 0);
+	assert(written_comp == 200 && cam.ae_comp_cut == 0.0f);
 	assert(memcmp(written_weight, center, sizeof(center)) == 0);
 
 	/* Nothing to do in manual exposure or other modes. */
 	writes = weight_writes;
-	p.subject_checked_ms = 0;
-	p.controls.metering = UVCD_METERING_CENTER;
-	subject_metering_tick(&p);
-	p.controls.metering = UVCD_METERING_SUBJECT;
-	p.controls.ae_mode = UVCD_AE_MANUAL;
-	subject_metering_tick(&p);
+	cam.subject_checked_ms = 0;
+	controls.metering = UVCD_METERING_CENTER;
+	subject_metering_tick(&cam);
+	controls.metering = UVCD_METERING_SUBJECT;
+	controls.ae_mode = UVCD_AE_MANUAL;
+	subject_metering_tick(&cam);
 	assert(weight_writes == writes);
+}
+
+
+/* The camera's lease: rate, view, exposure and metering follow whoever
+ * holds the camera, and the camera stays up throughout. */
+int rss_hal_get_imp_version(char *buf, int size)
+{
+	(void)buf;
+	(void)size;
+	return -1;
+}
+
+static uint32_t sensor_rate, encoder_rate;
+static int csc_mode, expr_writes, inits;
+static struct uvcd_imp_expr last_expr;
+static rss_wb_config_t last_wb;
+
+static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
+{
+	(void)ctx;
+	(void)cfg;
+	inits++;
+	return 0;
+}
+
+static int set_sensor_rate(void *ctx, uint32_t num, uint32_t den)
+{
+	(void)ctx;
+	assert(den == 1);
+	sensor_rate = num;
+	return 0;
+}
+
+static int set_encoder_rate(void *ctx, int chn, uint32_t num, uint32_t den)
+{
+	(void)ctx;
+	(void)chn;
+	assert(den == 1);
+	encoder_rate = num;
+	return 0;
+}
+
+static int get_csc(void *ctx, void *attr)
+{
+	(void)ctx;
+	((struct uvcd_imp_csc *)attr)->mode = csc_mode;
+	return 0;
+}
+
+static int set_csc(void *ctx, const void *attr)
+{
+	(void)ctx;
+	csc_mode = ((const struct uvcd_imp_csc *)attr)->mode;
+	return 0;
+}
+
+static int set_expr(void *ctx, const void *attr)
+{
+	(void)ctx;
+	last_expr = *(const struct uvcd_imp_expr *)attr;
+	expr_writes++;
+	return 0;
+}
+
+static int get_exposure(void *ctx, rss_exposure_t *e)
+{
+	(void)ctx;
+	memset(e, 0, sizeof(*e));
+	e->exposure_time = 12345; /* us */
+	e->total_gain = 256;
+	return 0;
+}
+
+static int get_ct(void *ctx, void *ct)
+{
+	(void)ctx;
+	*(unsigned int *)ct = 9000; /* above the control's range */
+	return 0;
+}
+
+static int set_wb(void *ctx, const rss_wb_config_t *cfg)
+{
+	(void)ctx;
+	last_wb = *cfg;
+	return 0;
+}
+
+static void test_camera_lease(void)
+{
+	rss_hal_ops_t ops = {
+		.init = hal_init,
+		.isp_set_sensor_fps = set_sensor_rate,
+		.isp_set_ae_weight = set_weight,
+		.isp_get_ae_zone = get_zone,
+		.isp_get_ae_hist_origin = get_hist,
+		.isp_set_ae_comp = set_comp,
+		.isp_get_csc_attr = get_csc,
+		.isp_set_csc_attr = set_csc,
+		.isp_set_expr = set_expr,
+		.isp_get_exposure = get_exposure,
+		.isp_get_awb_ct_attr = get_ct,
+		.isp_set_wb = set_wb,
+		.enc_set_fps = set_encoder_rate,
+	};
+	uvcd_pipeline_t p = {.cam = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080}};
+	p.cam.controls = &p.controls;
+	p.controls.zoom = 100;
+	p.controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	p.controls.ae_comp = 128;
+	p.controls.wb_auto = 1;
+	p.controls.metering = UVCD_METERING_SUBJECT;
+	weight_error = comp_error = 0;
+
+	/* A control changed while the camera is down is only stored, for the
+	 * bring-up to apply. */
+	struct uvcd_control_state next = p.controls;
+	next.metering = UVCD_METERING_CENTER;
+	int writes = weight_writes;
+	assert(uvcd_pipeline_apply(&p, &next, offsetof(struct uvcd_control_state, metering)) == 0);
+	assert(weight_writes == writes);
+
+	/* Up: idle rate and the default output's view, metered at once. */
+	assert(uvcd_camera_up(&p.cam) == 0 && p.cam.up && inits == 1);
+	assert(uvcd_camera_up(&p.cam) == 0 && inits == 1);
+	assert(sensor_rate == UVCD_IDLE_FPS && p.cam.view_frame == UVCD_IDLE_FRAME);
+	assert(p.cam.view.w == 1920 && p.cam.view.h == 1080);
+	assert(p.cam.metering_valid && weight_writes == writes + 1);
+
+	/* Subject metering runs with no stream: the idle camera meters the
+	 * scene the next stream will start on. */
+	fake_scene(400, 175);
+	for (int i = 0; i < 8; i++) {
+		p.cam.subject_checked_ms = 0;
+		uvcd_pipeline_tick(&p);
+	}
+	assert(written_weight[9][4] == 8);
+	uint8_t learned[15][15];
+	memcpy(learned, written_weight, sizeof(learned));
+
+	/* A 720p stream at 15 fps sees the same 16:9 view: the rate follows
+	 * the lease, and the learned weights stay. */
+	writes = weight_writes;
+	assert(uvcd_camera_acquire(&p.cam, UVCD_FRAME_720P, 15) == 0);
+	assert(sensor_rate == 15 && p.cam.metering_valid);
+	uvcd_camera_stream_on(&p.cam, UVCD_FMT_H264);
+	assert(csc_mode == UVCD_CSC_BT709_CLIP);
+	assert(weight_writes == writes && memcmp(written_weight, learned, sizeof(learned)) == 0);
+	/* The view of a running stream is its channel's crop: only the stream
+	 * may move it. */
+	next = p.controls;
+	next.zoom = 200;
+	assert(uvcd_camera_apply(&p.cam, &next, offsetof(struct uvcd_control_state, zoom)) ==
+	       -EBUSY);
+
+	/* Exposure priority slows a stream that runs out of frame time, and
+	 * the encoder follows the sensor. */
+	p.configured = true;
+	p.enc_fps = 15;
+	p.controls.ae_mode = UVCD_AE_MANUAL;
+	p.controls.ae_priority = 1;
+	p.controls.exposure_time = 900; /* 90 ms: no listed rate fits, floor 15 */
+	uvcd_camera_stream_on(&p.cam, UVCD_FMT_H264);
+	assert(sensor_rate == 15 && last_expr.mode == 1 && last_expr.time == 65535);
+	p.cam.lease_fps = 30;
+	uvcd_camera_stream_on(&p.cam, UVCD_FMT_H264);
+	assert(sensor_rate == 15); /* 30 -> 25 -> 20 -> 15, the floor */
+	p.enc_fps = 30;
+	uvcd_pipeline_tick(&p);
+	assert(encoder_rate == 15 && p.enc_fps == 15);
+	p.configured = false;
+	p.controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	p.controls.ae_priority = 0;
+
+	/* Released, the camera goes back to the idle rate. */
+	uvcd_camera_release(&p.cam);
+	assert(!p.cam.leased && sensor_rate == UVCD_IDLE_FPS);
+
+	/* A 4:3 stream crops the sides: a new view, metered afresh. */
+	writes = weight_writes;
+	assert(uvcd_camera_acquire(&p.cam, UVCD_FRAME_640X480, 30) == 0);
+	assert(p.cam.view.w == 1440 && p.cam.view.x == 240 && !p.cam.metering_valid);
+	uvcd_camera_stream_on(&p.cam, UVCD_FMT_MJPEG);
+	assert(csc_mode == UVCD_CSC_BT601_FULL && p.cam.metering_valid);
+	assert(weight_writes == writes + 1);
+
+	/* Released: back to the idle rate and view. */
+	writes = weight_writes;
+	uvcd_camera_release(&p.cam);
+	assert(!p.cam.leased && sensor_rate == UVCD_IDLE_FPS);
+	assert(p.cam.view.w == 1920 && p.cam.metering_valid && weight_writes == writes + 1);
+	uvcd_camera_release(&p.cam); /* nothing held: nothing happens */
+	assert(weight_writes == writes + 1);
+
+	/* Idle zoom moves the camera's own view, and metering with it (at the
+	 * K1's ISP clock, where 1080p takes 2x). */
+	p.cam.isp_clk_hz = UVCD_ISP_FAST_HZ;
+	next = p.controls;
+	next.zoom = 200;
+	writes = weight_writes;
+	assert(uvcd_pipeline_apply(&p, &next, offsetof(struct uvcd_control_state, zoom)) == 0);
+	assert(p.cam.view.w == 960 && p.cam.view.x == 480 && weight_writes == writes + 1);
+	p.controls = next;
+	/* A zoom that leaves the view where it is changes nothing. */
+	next.pan = 0;
+	writes = weight_writes;
+	assert(uvcd_pipeline_apply(&p, &next, offsetof(struct uvcd_control_state, pan)) == 0);
+	assert(weight_writes == writes);
+
+	/* Leaving an automatic mode keeps what it measured, clamped to the
+	 * control's range. */
+	next = p.controls;
+	next.wb_auto = 0;
+	assert(uvcd_camera_apply(&p.cam, &next, offsetof(struct uvcd_control_state, wb_auto)) == 0);
+	assert(next.wb_temp == UVCD_WB_TEMP_MAX && last_wb.mode == RSS_WB_MANUAL);
+	next = p.controls;
+	next.ae_mode = UVCD_AE_MANUAL;
+	assert(uvcd_camera_apply(&p.cam, &next, offsetof(struct uvcd_control_state, ae_mode)) == 0);
+	assert(next.exposure_time == 123 && last_expr.mode == 1 && last_expr.time == 12300);
+	/* Idle runs the idle rate even for a long manual exposure. */
+	next.exposure_time = 500;
+	next.ae_priority = 1;
+	assert(uvcd_camera_apply(&p.cam, &next,
+				 offsetof(struct uvcd_control_state, exposure_time)) == 0);
+	assert(sensor_rate == UVCD_IDLE_FPS && last_expr.time == 1000000 / UVCD_IDLE_FPS);
+	/* Encoder settings are not the camera's. */
+	int exprs = expr_writes;
+	next.mjpeg_quality = 50;
+	assert(uvcd_camera_apply(&p.cam, &next,
+				 offsetof(struct uvcd_control_state, mjpeg_quality)) == 0);
+	assert(expr_writes == exprs);
+}
+
+/* The stream's channel takes its crop from the camera's view, which a
+ * lease sets for the output size. */
+static int configure(uvcd_pipeline_t *p, uint8_t format, uint8_t frame, uint32_t interval)
+{
+	assert(uvcd_camera_acquire(&p->cam, frame, uvcd_interval_fps(interval)) == 0);
+	return configure_channel(p, format, frame, interval);
 }
 
 int main(void)
@@ -266,7 +515,8 @@ int main(void)
 		.enc_set_max_stream_cnt = set_count,
 		.enc_create_channel = create_enc,
 	};
-	uvcd_pipeline_t p = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080};
+	uvcd_pipeline_t p = {.cam = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080, .up = true}};
+	p.cam.controls = &p.controls;
 	p.controls.mjpeg_quality = 80;
 	p.controls.h264_min_qp = p.controls.h264_max_qp = -1;
 	for (int frame = 1; frame <= UVCD_NUM_FRAMES; frame++) {
@@ -281,8 +531,8 @@ int main(void)
 	/* 0: the clock couldn't be read, which must get the slow caps. */
 	static const int clocks[] = {0, 100000000, UVCD_ISP_FAST_HZ, 250000000};
 	for (size_t ci = 0; ci < sizeof(clocks) / sizeof(clocks[0]); ci++) {
-		p.isp_clk_hz = clocks[ci];
-		const struct crop *proven = p.isp_clk_hz >= UVCD_ISP_FAST_HZ ? proven_fast : proven_slow;
+		p.cam.isp_clk_hz = clocks[ci];
+		const struct crop *proven = p.cam.isp_clk_hz >= UVCD_ISP_FAST_HZ ? proven_fast : proven_slow;
 		int smallest_w = 1920;
 		for (int frame = 1; frame <= UVCD_NUM_FRAMES; frame++) {
 			for (int zoom = 100; zoom <= 400; zoom += 25) {
@@ -291,7 +541,7 @@ int main(void)
 					p.controls.zoom = zoom;
 					p.controls.pan = pan;
 					p.controls.tilt = -pan;
-					assert(configure_channel(&p, UVCD_FMT_MJPEG, frame, 333333) == -EIO);
+					assert(configure(&p, UVCD_FMT_MJPEG, frame, 333333) == -EIO);
 					assert(!fs.crop.enable);
 					assert(fs.width == uvcd_frames[frame].width);
 					assert(fs.height == uvcd_frames[frame].height);
@@ -314,44 +564,44 @@ int main(void)
 			}
 		}
 		/* The fast clock really does zoom further at 1080p. */
-		assert(p.isp_clk_hz >= UVCD_ISP_FAST_HZ ? smallest_w < 700 : smallest_w > 1400);
+		assert(p.cam.isp_clk_hz >= UVCD_ISP_FAST_HZ ? smallest_w < 700 : smallest_w > 1400);
 	}
-	p.isp_clk_hz = 0;
+	p.cam.isp_clk_hz = 0;
 	p.controls.zoom = 100;
 	p.controls.pan = p.controls.tilt = 0;
-	assert(configure_channel(&p, UVCD_FMT_MJPEG, UVCD_FRAME_1080P, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_1080P, 333333) == -EIO);
 	assert(!fs.fcrop.enable && !fs.scaler.enable); /* Preserve all 1080 rows. */
-	assert(configure_channel(&p, UVCD_FMT_MJPEG, UVCD_FRAME_1280X960, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_1280X960, 333333) == -EIO);
 	assert(fs.fcrop.x == 240 && fs.fcrop.y == 0);
 	assert(fs.fcrop.w == 1440 && fs.fcrop.h == 1080);
 	/* The requested JPEG quality goes to the encoder as is. */
 	p.controls.mjpeg_quality = 100;
-	assert(configure_channel(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -EIO);
 	assert(enc.init_qp == 100);
 	p.controls.mjpeg_quality = 80;
-	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_1080P, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_1080P, 333333) == -EIO);
 	assert(enc.gop_length == 30 && enc.max_same_scene_cnt == 1);
 	assert(stream_size == uvcd_frames[UVCD_FRAME_1080P].max_size && stream_count == 2);
 	/* An IDR every second at whatever rate was negotiated. */
-	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 666666) == -EIO);
+	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 666666) == -EIO);
 	assert(enc.gop_length == 15 && enc.max_same_scene_cnt == 1);
-	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 2000000) == -EIO);
+	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 2000000) == -EIO);
 	assert(enc.gop_length == 5 && enc.max_same_scene_cnt == 1);
-	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
 	/* Automatic min QP: 20, unless an explicit max QP is below it. */
 	assert(enc.min_qp == UVCD_H264_AUTO_MIN_QP && enc.max_qp == -1);
 	p.controls.h264_max_qp = 12;
-	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
 	assert(enc.min_qp == 12 && enc.max_qp == 12);
 	p.controls.h264_min_qp = 30;
 	p.controls.h264_max_qp = 40;
-	assert(configure_channel(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_720P, 333333) == -EIO);
 	assert(enc.min_qp == 30 && enc.max_qp == 40);
 	p.controls.h264_min_qp = p.controls.h264_max_qp = -1;
 	int calls = encoder_calls;
 	destroyed = 0;
 	buffer_error = -ENOMEM;
-	assert(configure_channel(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -ENOMEM);
+	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -ENOMEM);
 	assert(encoder_calls == calls && destroyed == 2);
 	for (uint32_t ceiling = 5; ceiling <= 30; ceiling += 5) {
 		uint32_t fps = ceiling;
@@ -360,6 +610,7 @@ int main(void)
 		assert(fps == (ceiling < 15 ? ceiling : 15));
 	}
 	test_subject_metering();
+	test_camera_lease();
 	puts("pipeline regression tests passed");
 	return 0;
 }

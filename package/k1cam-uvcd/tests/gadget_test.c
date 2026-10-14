@@ -65,18 +65,31 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
 	return 0;
 }
 
-#define STUB_APPLY(name) int name(uvcd_pipeline_t *p, const struct uvcd_control_state *c) \
-	{ (void)p; (void)c; return 0; }
-int uvcd_apply_gamma(uvcd_pipeline_t *p, int v) { (void)p; (void)v; return 0; }
-int uvcd_apply_wb(uvcd_pipeline_t *p, int v, int a) { (void)p; (void)v; (void)a; return 0; }
-int uvcd_awb_current_ct(uvcd_pipeline_t *p) { (void)p; return -1; }
-int uvcd_live_exposure(uvcd_pipeline_t *p) { (void)p; return -1; }
+int uvcd_camera_live_exposure(uvcd_camera_t *cam) { (void)cam; return -1; }
 int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p) { (void)p; return 0; }
-STUB_APPLY(uvcd_apply_metering)
-STUB_APPLY(uvcd_apply_ae_comp)
-STUB_APPLY(uvcd_apply_rotation)
-STUB_APPLY(uvcd_apply_exposure)
-STUB_APPLY(uvcd_apply_view)
+
+/* The camera, as the gadget sees it: it takes or rejects a change, and may
+ * fill in a dependent value (leaving auto white balance keeps the measured
+ * temperature). */
+static int applies, apply_error, camera_guard_arms;
+static size_t last_field;
+int uvcd_pipeline_apply(uvcd_pipeline_t *p, struct uvcd_control_state *next, size_t field)
+{
+	(void)p;
+	applies++;
+	last_field = field;
+	if (apply_error)
+		return apply_error;
+	if (field == offsetof(struct uvcd_control_state, wb_auto) && !next->wb_auto)
+		next->wb_temp = 3300;
+	return 0;
+}
+
+void uvcd_pipeline_camera_guard_arm(uvcd_pipeline_t *p)
+{
+	(void)p;
+	camera_guard_arms++;
+}
 
 int test_ioctl(int fd, unsigned long request, ...)
 {
@@ -128,7 +141,29 @@ int main(void)
 	/* Rewriting a value it already has changes nothing. */
 	assert(uvcd_ctrl_set(&g, brightness, 150, &applied) == 0 && applied == 150);
 	assert(!g.config_dirty);
-	assert(streak_writes == 0 && unlinks == 0); /* ...and idle is never a crash. */
+	/* Idle changes go to the camera-side guard in RAM, never the stream's
+	 * on flash: an idle camera unplugged is not a crash. */
+	assert(streak_writes == 0 && unlinks == 0);
+	assert(camera_guard_arms == 2);
+
+	/* A change the camera rejects is neither stored nor persisted. */
+	int was_applies = applies;
+	apply_error = -EIO;
+	assert(uvcd_ctrl_set(&g, brightness, 99, &applied) == -1);
+	apply_error = 0;
+	assert(applies == was_applies + 1 && last_field == brightness->state_offset);
+	assert(p.controls.brightness == 150 && !g.config_dirty);
+	/* It was counted before it was applied: a crash while applying it is
+	 * caught too. */
+	assert(camera_guard_arms == 3);
+	/* What the camera filled in is stored with the change. */
+	const struct uvcd_ctrl_def *wb_auto = uvcd_ctrl_find("white-balance-auto");
+	assert(uvcd_ctrl_set(&g, wb_auto, 0, &applied) == 0 && applied == 0);
+	assert(p.controls.wb_auto == 0 && p.controls.wb_temp == 3300 && g.config_dirty);
+	g.config_dirty_at -= UVCD_CONFIG_SETTLE_MS;
+	config_flush(&g, false);
+	assert(last_saved.wb_temp == 3300 && last_saved.wb_auto == 0);
+	int arms = camera_guard_arms;
 
 	/* A stream is counted in the crash guard from its start, once, on top
 	 * of the streams before it that died unproven. */
@@ -138,8 +173,8 @@ int main(void)
 	assert(streak_writes == 1 && last_streak == 2 && g.guard_armed);
 
 	g.streaming = true;
-	g.healthy_since_ms = monotonic_ms() - 9000;
-	g.last_frame_ms = monotonic_ms();
+	g.healthy_since_ms = uvcd_monotonic_ms() - 9000;
+	g.last_frame_ms = uvcd_monotonic_ms();
 	stream_guard_tick(&g);
 	assert(good_saves == 0 && g.guard_armed && unlinks == 0);
 	g.healthy_since_ms -= 2000;
@@ -159,8 +194,9 @@ int main(void)
 	assert(!g.guard_armed && streak_writes == 1);
 	assert(uvcd_ctrl_set(&g, brightness, 160, &applied) == 0);
 	assert(g.guard_armed && streak_writes == 2 && last_streak == 1);
+	assert(camera_guard_arms == arms);
 	assert(g.healthy_since_ms == 0 && p.good.brightness == 150);
-	g.healthy_since_ms = monotonic_ms() - UVCD_CONFIG_HEALTHY_MS;
+	g.healthy_since_ms = uvcd_monotonic_ms() - UVCD_CONFIG_HEALTHY_MS;
 	stream_guard_tick(&g);
 	assert(good_saves == 2 && p.good.brightness == 160 && !g.guard_armed);
 	/* ...and a clean stop before then does not prove it. */
@@ -180,7 +216,7 @@ int main(void)
 	g.buf_queued[0] = true;
 	g.buffers[0].start = output;
 	g.buffers[0].length = sizeof(output);
-	g.stalled_since_ms = monotonic_ms() - 10000;
+	g.stalled_since_ms = uvcd_monotonic_ms() - 10000;
 	deliver_frame(&g);
 	assert(g.streaming && queued == 0 && g.read_seq == 0);
 	host_reading = true;

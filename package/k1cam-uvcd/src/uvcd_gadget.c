@@ -2,8 +2,9 @@
  * uvcd_gadget.c -- UVC gadget event handling and frame delivery
  *
  * Adapted from raptor's rwc daemon, stripped of audio/ring-IPC: frames
- * come straight from uvcd_pipeline's shared buffer, which only exists
- * while a host has actually committed to a format (on-demand).
+ * come straight from the stream's shared buffer (uvcd_pipeline.c), which
+ * only fills while a host has actually committed to a format. Controls go
+ * to the camera live, streaming or not (uvcd_ctrl_set).
  */
 
 #include <stddef.h>
@@ -238,82 +239,6 @@ static uint16_t control_length(uint8_t selector)
 		       : 2;
 }
 
-static int apply_control(gadget_t *g, uint8_t selector, int value)
-{
-	switch (selector) {
-	case UVC_PU_HUE_CONTROL:
-		if (value < UVCD_HUE_MIN)
-			value = UVCD_HUE_MIN;
-		if (value > UVCD_HUE_MAX)
-			value = UVCD_HUE_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_hue, g->pipe->hal_ctx, value + UVCD_CONTROL_DEF);
-	case UVC_PU_BRIGHTNESS_CONTROL:
-		if (value < UVCD_CONTROL_MIN)
-			value = UVCD_CONTROL_MIN;
-		if (value > UVCD_CONTROL_MAX)
-			value = UVCD_CONTROL_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_brightness, g->pipe->hal_ctx, value);
-	case UVC_PU_CONTRAST_CONTROL:
-		if (value < UVCD_CONTROL_MIN)
-			value = UVCD_CONTROL_MIN;
-		if (value > UVCD_CONTROL_MAX)
-			value = UVCD_CONTROL_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_contrast, g->pipe->hal_ctx, value);
-	case UVC_PU_SATURATION_CONTROL:
-		if (value < UVCD_CONTROL_MIN)
-			value = UVCD_CONTROL_MIN;
-		if (value > UVCD_CONTROL_MAX)
-			value = UVCD_CONTROL_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_saturation, g->pipe->hal_ctx, value);
-	case UVC_PU_SHARPNESS_CONTROL:
-		if (value < UVCD_CONTROL_MIN)
-			value = UVCD_CONTROL_MIN;
-		if (value > UVCD_SHARPNESS_MAX)
-			value = UVCD_SHARPNESS_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_sharpness, g->pipe->hal_ctx, value);
-	case UVC_PU_POWER_LINE_FREQUENCY_CONTROL:
-		if (value < UVCD_POWER_LINE_MIN)
-			value = UVCD_POWER_LINE_MIN;
-		if (value > UVCD_POWER_LINE_MAX)
-			value = UVCD_POWER_LINE_MAX;
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_antiflicker, g->pipe->hal_ctx,
-					(rss_antiflicker_t)value);
-	case UVC_PU_GAMMA_CONTROL:
-		if (value < UVCD_GAMMA_MIN)
-			value = UVCD_GAMMA_MIN;
-		if (value > UVCD_GAMMA_MAX)
-			value = UVCD_GAMMA_MAX;
-		return uvcd_apply_gamma(g->pipe, value);
-	/* The two white-balance controls are one HAL call between them, so
-	 * each re-applies using the other's current shadow value. */
-	case UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL:
-		if (value < UVCD_WB_TEMP_MIN)
-			value = UVCD_WB_TEMP_MIN;
-		if (value > UVCD_WB_TEMP_MAX)
-			value = UVCD_WB_TEMP_MAX;
-		return uvcd_apply_wb(g->pipe, value, g->pipe->controls.wb_auto);
-	case UVC_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL:
-		value = value ? 1 : 0;
-		/* Leaving auto: start manual from the temperature auto had
-		 * measured, so the picture doesn't jump and the temperature
-		 * control reads where the light actually is. */
-		if (!value && g->pipe->controls.wb_auto) {
-			int ct = uvcd_awb_current_ct(g->pipe);
-			if (ct > 0) {
-				if (ct < UVCD_WB_TEMP_MIN)
-					ct = UVCD_WB_TEMP_MIN;
-				if (ct > UVCD_WB_TEMP_MAX)
-					ct = UVCD_WB_TEMP_MAX;
-				g->pipe->controls.wb_temp = ct;
-				LOGI("white-balance-temperature=%d (from auto)", ct);
-			}
-		}
-		return uvcd_apply_wb(g->pipe, g->pipe->controls.wb_temp, value);
-	default:
-		return -EINVAL;
-	}
-}
-
 static int *custom_control_value(gadget_t *g, uint8_t selector)
 {
 	switch (selector) {
@@ -384,63 +309,11 @@ static int custom_control_res(uint8_t selector)
 	return def && def->res ? def->res : 1;
 }
 
-static int apply_custom_control(gadget_t *g, uint8_t selector, int value)
-{
-	if (value < custom_control_min(selector))
-		value = custom_control_min(selector);
-	if (value > custom_control_max(selector))
-		value = custom_control_max(selector);
-
-	switch (selector) {
-	case UVCD_CUSTOM_MAX_AGAIN:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_max_again, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_MAX_DGAIN:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_max_dgain, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_AE_COMP: {
-		struct uvcd_control_state c = g->pipe->controls;
-		c.ae_comp = value;
-		return uvcd_apply_ae_comp(g->pipe, &c);
-	}
-	case UVCD_CUSTOM_SINTER:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_sinter_strength, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_TEMPER:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_temper_strength, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_DPC:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_dpc_strength, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_DRC:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_drc_strength, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_HIGHLIGHT:
-		return RSS_HAL_CALL(g->pipe->ops, isp_set_highlight_depress, g->pipe->hal_ctx, value);
-	case UVCD_CUSTOM_METERING: {
-		struct uvcd_control_state c = g->pipe->controls;
-		c.metering = value;
-		return uvcd_apply_metering(g->pipe, &c);
-	}
-	case UVCD_CUSTOM_ROTATION: {
-		struct uvcd_control_state c = g->pipe->controls;
-		c.rotation = value;
-		return uvcd_apply_rotation(g->pipe, &c);
-	}
-	case UVCD_CUSTOM_H264_BITRATE:
-	case UVCD_CUSTOM_H264_RATE_CONTROL:
-	case UVCD_CUSTOM_H264_MIN_QP:
-	case UVCD_CUSTOM_H264_MAX_QP:
-	case UVCD_CUSTOM_H264_PROFILE:
-	case UVCD_CUSTOM_MJPEG_QUALITY:
-		/* The pipeline reads these from the stored state, so they take
-		 * effect in encoder_after_store(), once the value is in place. */
-		return 0;
-	default:
-		return -EINVAL;
-	}
-}
-
 /* --------------------------------------------------------------------------
  * Control table -- name<->selector mapping shared with config persistence
- * (uvcd_config.c), and the source of the XU GET_MIN/GET_MAX/GET_DEF
- * replies. Ranges here must match the per-selector clamps in apply_control()/
- * apply_custom_control() above; they're re-clamped there too, so a mismatch
- * would only ever narrow the effective range, never widen it.
+ * (uvcd_config.c), the source of the XU GET_MIN/GET_MAX/GET_DEF replies,
+ * and the one place a value is clamped (uvcd_ctrl_set) before the camera
+ * applies it.
  */
 /* One control-table row. Only a few rows need .res or .part, so they are
  * named where used and zero everywhere else. */
@@ -577,18 +450,17 @@ static const struct uvcd_ctrl_def *standard_ctrl_def(uint8_t selector)
  * burst of them); only a factory reset is written at once.
  */
 #define UVCD_CONFIG_SETTLE_MS 2000
-#define UVCD_CONFIG_HEALTHY_MS 10000
 #define UVCD_FRAME_TIMEOUT_MS 5000
 
-static int64_t monotonic_ms(void);
-
-/* Crash guard. The encoder is where a bad setting takes the daemon (or the
- * kernel) down, so a stream is counted in UVCD_CONFIG_DIRTY_PATH from its
- * start, and again from any change made while it runs, until it proves
- * healthy or stops cleanly. A crash leaves the count behind for
- * uvcd_pipeline_init(), which then goes back to the controls the last
- * healthy stream proved (UVCD_CONFIG_GOOD_PATH). An idle camera writes
- * nothing, so unplugging it is never taken for a crash. */
+/* Stream crash guard (uvcd_config.h). The encoder is where a bad setting
+ * takes the daemon (or the kernel) down, so a stream is counted in
+ * UVCD_CONFIG_DIRTY_PATH from its start, and again from any change made
+ * while it runs, until it proves healthy or stops cleanly. A crash leaves
+ * the count behind for uvcd_pipeline_init(), which then goes back to the
+ * controls the last healthy stream proved (UVCD_CONFIG_GOOD_PATH). Changes
+ * outside a stream are the camera-side guard's, which lives in RAM, so an
+ * idle camera writes nothing to flash and unplugging it is never taken for
+ * a crash. */
 static void stream_guard_arm(gadget_t *g)
 {
 	if (g->guard_armed)
@@ -613,8 +485,8 @@ static void stream_guard_clear(gadget_t *g)
 static void stream_guard_tick(gadget_t *g)
 {
 	if (!g->guard_armed || !g->streaming || !g->healthy_since_ms ||
-	    monotonic_ms() - g->healthy_since_ms < UVCD_CONFIG_HEALTHY_MS ||
-	    monotonic_ms() - g->last_frame_ms >= 1000)
+	    uvcd_monotonic_ms() - g->healthy_since_ms < UVCD_CONFIG_HEALTHY_MS ||
+	    uvcd_monotonic_ms() - g->last_frame_ms >= 1000)
 		return;
 	if (memcmp(&g->pipe->good, &g->pipe->controls, sizeof(g->pipe->good)) != 0) {
 		if (uvcd_config_save(UVCD_CONFIG_GOOD_PATH, &g->pipe->controls) != 0)
@@ -625,22 +497,30 @@ static void stream_guard_tick(gadget_t *g)
 	stream_guard_clear(g);
 }
 
-static void config_mark_dirty(gadget_t *g)
+/* A change is about to reach the camera: counted before it is applied, so
+ * a crash in applying it counts too. Mid-stream it has to prove itself in
+ * the stream again; outside one, the camera-side guard watches. */
+static void guard_change(gadget_t *g)
 {
-	g->config_dirty = true;
-	g->config_dirty_at = monotonic_ms();
-	/* Mid-stream, the change still has to prove itself. */
 	if (g->streaming) {
 		g->healthy_since_ms = 0;
 		stream_guard_arm(g);
+	} else {
+		uvcd_pipeline_camera_guard_arm(g->pipe);
 	}
+}
+
+static void config_mark_dirty(gadget_t *g)
+{
+	g->config_dirty = true;
+	g->config_dirty_at = uvcd_monotonic_ms();
 }
 
 /* Write pending changes once they have settled, or now if force. */
 static void config_flush(gadget_t *g, bool force)
 {
 	if (!g->config_dirty ||
-	    (!force && monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_MS))
+	    (!force && uvcd_monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_MS))
 		return;
 	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls) != 0)
 		/* Don't spin retrying a write that keeps failing (read-only
@@ -683,7 +563,7 @@ static void encoder_restart(gadget_t *g, uint8_t format)
 	if (uvcd_pipeline_restart_encoder(g->pipe, format)) {
 		g->read_seq = 0;
 		g->watched_seq = 0;
-		g->last_frame_ms = monotonic_ms();
+		g->last_frame_ms = uvcd_monotonic_ms();
 		g->healthy_since_ms = 0;
 	}
 }
@@ -715,50 +595,6 @@ static void encoder_after_store(gadget_t *g, uint8_t selector)
 		     ret);
 }
 
-/* Camera Terminal controls. The pipeline applies them from a whole control
- * state, so hand it a copy with the new value in place. */
-static int apply_camera_control(gadget_t *g, const struct uvcd_ctrl_def *def, int value)
-{
-	struct uvcd_control_state *live = &g->pipe->controls;
-
-	/* Leaving auto-exposure: start manual from the exposure auto was
-	 * using, so the picture doesn't jump -- as for white balance. */
-	if (def->selector == UVC_CT_AE_MODE_CONTROL && value == UVCD_AE_MANUAL &&
-	    live->ae_mode != UVCD_AE_MANUAL) {
-		int t = uvcd_live_exposure(g->pipe);
-		if (t > 0) {
-			live->exposure_time = t > UVCD_EXPOSURE_MAX ? UVCD_EXPOSURE_MAX : t;
-			LOGI("exposure-time=%d (from auto)", live->exposure_time);
-		}
-	}
-
-	struct uvcd_control_state c = *live;
-	*uvcd_ctrl_field(&c, def) = value;
-
-	switch (def->selector) {
-	case UVC_CT_AE_MODE_CONTROL:
-	case UVC_CT_AE_PRIORITY_CONTROL:
-	case UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
-		return uvcd_apply_exposure(g->pipe, &c);
-	case UVC_CT_ZOOM_ABSOLUTE_CONTROL:
-	case UVC_CT_PANTILT_ABSOLUTE_CONTROL: {
-		bool changed = c.zoom != live->zoom || c.pan != live->pan || c.tilt != live->tilt;
-		int ret = uvcd_apply_view(g->pipe, &c);
-		/* Front-crop changes recreate the channel and reset its sequence,
-		 * including when a rejected change restores the previous view. */
-		if (changed) {
-			g->read_seq = 0;
-			g->watched_seq = 0;
-			g->last_frame_ms = monotonic_ms();
-			g->healthy_since_ms = 0;
-		}
-		return ret;
-	}
-	default:
-		return -EINVAL;
-	}
-}
-
 /* Controls whose values mean one of a few things: store the meaning, not
  * whatever in-between number arrived. */
 static int normalize_value(const struct uvcd_ctrl_def *def, int value)
@@ -778,26 +614,34 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 		value = def->max;
 	value = normalize_value(def, value);
 
-	/* With the sensor/ISP down (no stream) there is nothing to apply to:
-	 * store the value and let the next bring-up push it with the rest. */
-	int ret = 0;
-	if (uvcd_pipeline_hal_up(g->pipe)) {
-		if (def->kind == UVCD_CTRL_STANDARD)
-			ret = apply_control(g, def->selector, value);
-		else if (def->kind == UVCD_CTRL_CAMERA)
-			ret = apply_camera_control(g, def, value);
-		else
-			ret = apply_custom_control(g, def->selector, value);
-	}
-	if (ret != 0)
-		return -1;
-
-	int *field = uvcd_ctrl_field(&g->pipe->controls, def);
 	/* Hosts rewrite values they already have (uvcvideo probes
 	 * power-line-frequency on every connect): nothing to persist or
 	 * re-prove then. */
-	if (*field != value) {
-		*field = value;
+	struct uvcd_control_state next = g->pipe->controls;
+	int *field = uvcd_ctrl_field(&next, def);
+	bool changed = *field != value;
+	*field = value;
+	if (changed)
+		guard_change(g);
+
+	/* Applied before it is stored, so the stored state is only ever what
+	 * the camera took. The camera may fill in a dependent value (leaving
+	 * an automatic mode keeps what it measured). */
+	if (uvcd_pipeline_apply(g->pipe, &next, def->state_offset) != 0)
+		return -1;
+	/* A zoom/pan/tilt change re-creates a stream's channels, whose frame
+	 * sequence starts again at 0, also when a rejected change restores the
+	 * previous view. */
+	if (changed && def->kind == UVCD_CTRL_CAMERA &&
+	    (def->selector == UVC_CT_ZOOM_ABSOLUTE_CONTROL ||
+	     def->selector == UVC_CT_PANTILT_ABSOLUTE_CONTROL)) {
+		g->read_seq = 0;
+		g->watched_seq = 0;
+		g->last_frame_ms = uvcd_monotonic_ms();
+		g->healthy_since_ms = 0;
+	}
+	if (memcmp(&next, &g->pipe->controls, sizeof(next)) != 0) {
+		g->pipe->controls = next;
 		config_mark_dirty(g);
 	}
 	if (def->kind == UVCD_CTRL_CUSTOM)
@@ -1061,7 +905,7 @@ static void handle_camera_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 				 * actually using. */
 				if (selector == UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL &&
 				    g->pipe->controls.ae_mode != UVCD_AE_MANUAL) {
-					int t = uvcd_live_exposure(g->pipe);
+					int t = uvcd_camera_live_exposure(&g->pipe->cam);
 					if (t > 0)
 						v = t;
 				}
@@ -1292,7 +1136,7 @@ static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 	if (g->last_cs == UVC_VS_COMMIT_CONTROL) {
 		if (g->streaming)
 			stop_streaming(g);
-		LOGI("COMMIT received, bringing up pipeline + streaming");
+		LOGI("COMMIT received, starting the stream");
 		if (start_streaming(g) < 0)
 			LOGE("failed to start streaming");
 	}
@@ -1308,7 +1152,8 @@ static int start_streaming(gadget_t *g)
 	g->cur_frame = g->commit.bFrameIndex;
 	g->cur_interval = g->commit.dwFrameInterval;
 
-	/* Bring up the ISP/encoder pipeline for exactly what was negotiated */
+	/* Lease the camera and create the stream for exactly what was
+	 * negotiated. */
 	stream_guard_arm(g);
 	if (uvcd_pipeline_start(g->pipe, g->cur_format, g->cur_frame, g->cur_interval) != 0) {
 		LOGE("pipeline start failed for fmt=%u frame=%u", g->cur_format, g->cur_frame);
@@ -1380,7 +1225,7 @@ static int start_streaming(gadget_t *g)
 
 	g->stalled_since_ms = 0;
 	g->streaming = true;
-	g->last_frame_ms = monotonic_ms();
+	g->last_frame_ms = uvcd_monotonic_ms();
 	g->watched_seq = 0;
 	g->healthy_since_ms = 0;
 
@@ -1426,12 +1271,11 @@ static void stop_streaming(gadget_t *g)
 
 	g->streaming = false;
 
-	/* True on-demand: the channels go now, the sensor/ISP once
-	 * uvcd_pipeline_tick() sees no stream for UVCD_HAL_LINGER_MS. */
+	/* The stream's channels go now; the camera stays up, back at idle. */
 	uvcd_pipeline_stop(g->pipe);
 	/* Only once teardown is over: it can hang after an ISP failure. */
 	stream_guard_clear(g);
-	LOGI("streaming stopped, pipeline released");
+	LOGI("streaming stopped");
 }
 
 static void process_events(gadget_t *g)
@@ -1473,13 +1317,6 @@ static void process_events(gadget_t *g)
 	/* An empty queue is ENOENT on this kernel (EAGAIN on newer ones). */
 	if (errno != EAGAIN && errno != ENOENT)
 		LOGW("VIDIOC_DQEVENT: %s", strerror(errno));
-}
-
-static int64_t monotonic_ms(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* A buffer userspace owns and may fill, or -1 with errno set. Unqueued
@@ -1530,7 +1367,7 @@ static void deliver_frame(gadget_t *g)
 		/* Keep encoding into the single latest-frame slot. A host that
 		 * resumes reading can immediately receive a fresh frame. */
 		if (!g->stalled_since_ms)
-			g->stalled_since_ms = monotonic_ms();
+			g->stalled_since_ms = uvcd_monotonic_ms();
 		g->healthy_since_ms = 0;
 		return;
 	}
@@ -1586,7 +1423,7 @@ static void deliver_frame(gadget_t *g)
 	}
 	g->buf_queued[idx] = true;
 	if (!g->healthy_since_ms)
-		g->healthy_since_ms = monotonic_ms();
+		g->healthy_since_ms = uvcd_monotonic_ms();
 }
 
 static int gadget_open(gadget_t *g)
@@ -1679,9 +1516,9 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 			pthread_mutex_unlock(&p->frame.lock);
 			if (seq != g.watched_seq) {
 				g.watched_seq = seq;
-				g.last_frame_ms = monotonic_ms();
+				g.last_frame_ms = uvcd_monotonic_ms();
 			}
-			if (monotonic_ms() - g.last_frame_ms >= UVCD_FRAME_TIMEOUT_MS) {
+			if (uvcd_monotonic_ms() - g.last_frame_ms >= UVCD_FRAME_TIMEOUT_MS) {
 				LOGE("no encoded frames for %d ms; restarting daemon",
 				     UVCD_FRAME_TIMEOUT_MS);
 				/* The SDK can hang during teardown after an ISP failure.

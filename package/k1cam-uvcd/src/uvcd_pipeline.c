@@ -1,12 +1,15 @@
 /*
- * uvcd_pipeline.c -- sensor/ISP/encoder bring-up and teardown
+ * uvcd_pipeline.c -- the stream: framesource + encoder channels on the camera
  *
- * Single sensor (T31 + GC2083), single framesource channel, single
- * encoder group/channel. No OSD, no IVS, no multi-sensor, no config
- * file: sensor identity/GPIOs come from the kernel sensor driver via
- * procfs (/proc/jz/sensor/sensor0/...) -- same auto-discovery rvd
- * falls back to when raptor.conf doesn't override the [sensor]
- * section, which is exactly this board's current working setup.
+ * A stream exists only while a host streams. It leases the camera
+ * (uvcd_camera.c), which sets the sensor rate and the view for the
+ * negotiated output size, then creates one framesource channel cropped to
+ * that view and one encoder group/channel, and runs the pump thread that
+ * hands encoded frames to the gadget. Stopping tears all of that down and
+ * releases the camera back to idle; the camera itself stays up.
+ *
+ * Also here: which controls the daemon starts with (load_controls), and the
+ * camera-side crash guard.
  */
 
 #include <stdio.h>
@@ -14,148 +17,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <math.h>
 #include <pthread.h>
-#include <time.h>
 
 #include "uvcd.h"
 #include "uvcd_config.h"
-
-/* --------------------------------------------------------------------------
- * Controls whose HAL representation isn't a plain scalar.
- *
- * UVC (and V4L2) express gamma as a single number and white balance as a
- * colour temperature. The ISP wants a 129-point curve and a mode+gains
- * struct respectively. Keeping both translations here means uvcd_gadget.c
- * stays a pure UVC-protocol file with no ISP-shaped special cases.
- */
-
-int uvcd_apply_gamma(uvcd_pipeline_t *p, int gamma_x100)
-{
-	uint16_t curve[UVCD_GAMMA_POINTS];
-
-	/* Without the factory curve there is no reference to re-shape, and
-	 * inventing one would mean guessing the table's value range. */
-	if (!p->gamma_ref_valid)
-		return -ENOTSUP;
-
-	if (gamma_x100 < UVCD_GAMMA_MIN)
-		gamma_x100 = UVCD_GAMMA_MIN;
-	if (gamma_x100 > UVCD_GAMMA_MAX)
-		gamma_x100 = UVCD_GAMMA_MAX;
-
-	if (gamma_x100 == UVCD_GAMMA_DEF) {
-		/* Exactly the vendor tuning, no floating point rounding. */
-		memcpy(curve, p->gamma_ref, sizeof(curve));
-	} else {
-		/* Normalize against the curve's own peak so this works whatever
-		 * the table's full-scale value happens to be, apply the extra
-		 * power law, then scale back. Output = in^(1/gamma), so a
-		 * larger gamma brightens -- the UVC/V4L2 convention. */
-		uint16_t peak = 0;
-		for (int i = 0; i < UVCD_GAMMA_POINTS; i++) {
-			if (p->gamma_ref[i] > peak)
-				peak = p->gamma_ref[i];
-		}
-		if (peak == 0)
-			return -ENOTSUP;
-
-		float exponent = (float)UVCD_GAMMA_DEF / (float)gamma_x100;
-		for (int i = 0; i < UVCD_GAMMA_POINTS; i++) {
-			float norm = (float)p->gamma_ref[i] / (float)peak;
-			float out = powf(norm, exponent) * (float)peak;
-
-			if (out < 0.0f)
-				out = 0.0f;
-			if (out > (float)peak)
-				out = (float)peak;
-			curve[i] = (uint16_t)(out + 0.5f);
-		}
-	}
-
-	return RSS_HAL_CALL(p->ops, isp_set_gamma, p->hal_ctx, curve);
-}
-
-/* Manual white balance follows a model of this sensor's white locus: the
- * red and blue gains that make a grey surface neutral under light of a given
- * colour temperature. The ISP's own presets are no use for this -- they are
- * fixed gain pairs compiled into the tx-isp blob (tisp_s_wb_mode), identical
- * for every sensor, and on the GC2083 they land well off-white (FLUORESCENT
- * leaves a strong green cast) with nothing in between them.
- *
- * Both gains are close to exponential in mired (1e6 / K) over 2800-7500 K.
- * The slopes are a least-squares fit to the blob's own preset gains taken at
- * their nominal temperatures (INCANDESCENT 2856 K, DAYLIGHT 5000 K, CLOUDY
- * 6500 K, SHADE 7500 K); the reference point pins that curve to this sensor:
- * the gains the ISP's auto white balance settled on for a scene it measured
- * at 3640 K. Gains are in the ISP's manual-mode units, the same ones
- * IMP_ISP_Tuning_GetWB reports for auto. */
-#define UVCD_WB_REF_KELVIN 3640.0f
-#define UVCD_WB_REF_RGAIN 343.0f
-#define UVCD_WB_REF_BGAIN 612.0f
-#define UVCD_WB_R_PER_MIRED -0.0035f /* d ln(rgain) / d mired */
-#define UVCD_WB_B_PER_MIRED 0.0042f  /* d ln(bgain) / d mired */
-#define UVCD_WB_GAIN_MIN 32
-#define UVCD_WB_GAIN_MAX 4095
-
-static uint16_t wb_gain(float ref, float per_mired, float d_mired)
-{
-	float g = ref * expf(per_mired * d_mired);
-
-	if (g < UVCD_WB_GAIN_MIN)
-		g = UVCD_WB_GAIN_MIN;
-	if (g > UVCD_WB_GAIN_MAX)
-		g = UVCD_WB_GAIN_MAX;
-	return (uint16_t)(g + 0.5f);
-}
-
-int uvcd_apply_wb(uvcd_pipeline_t *p, int temp_kelvin, int auto_on)
-{
-	rss_wb_config_t cfg;
-
-	memset(&cfg, 0, sizeof(cfg));
-
-	if (auto_on) {
-		cfg.mode = RSS_WB_AUTO;
-		return RSS_HAL_CALL(p->ops, isp_set_wb, p->hal_ctx, &cfg);
-	}
-
-	if (temp_kelvin < UVCD_WB_TEMP_MIN)
-		temp_kelvin = UVCD_WB_TEMP_MIN;
-	if (temp_kelvin > UVCD_WB_TEMP_MAX)
-		temp_kelvin = UVCD_WB_TEMP_MAX;
-
-	float d_mired = 1e6f / (float)temp_kelvin - 1e6f / UVCD_WB_REF_KELVIN;
-	cfg.mode = RSS_WB_MANUAL;
-	cfg.r_gain = wb_gain(UVCD_WB_REF_RGAIN, UVCD_WB_R_PER_MIRED, d_mired);
-	cfg.b_gain = wb_gain(UVCD_WB_REF_BGAIN, UVCD_WB_B_PER_MIRED, d_mired);
-
-	int ret = RSS_HAL_CALL(p->ops, isp_set_wb, p->hal_ctx, &cfg);
-	if (ret != RSS_OK)
-		return ret;
-
-	/* In manual mode the ISP takes the colour temperature for its
-	 * CT-dependent tuning (colour matrix, saturation, shading) from here
-	 * rather than from its own estimate, so keep it on the same light the
-	 * gains assume. The gains are what matter; this only refines them. */
-	unsigned int ct = (unsigned int)temp_kelvin;
-	if (RSS_HAL_CALL(p->ops, isp_set_awb_ct_attr, p->hal_ctx, &ct) != RSS_OK)
-		LOGD("isp_set_awb_ct_attr(%u) failed", ct);
-
-	LOGD("white balance %d K: rgain=%u bgain=%u", temp_kelvin, cfg.r_gain, cfg.b_gain);
-	return RSS_OK;
-}
-
-int uvcd_awb_current_ct(uvcd_pipeline_t *p)
-{
-	unsigned int ct = 0;
-
-	if (!p->hal_up)
-		return -1;
-	if (RSS_HAL_CALL(p->ops, isp_get_awb_ct_attr, p->hal_ctx, &ct) != RSS_OK || ct == 0)
-		return -1;
-	return (int)ct;
-}
 
 /* max_size is about 1 byte per pixel (at least 384 KB): MJPEG at quality
  * 100 runs about 0.45 B/px on the K1, and 0.9 B/px with sharpness at its
@@ -211,188 +76,24 @@ uint32_t uvcd_snap_interval(uint32_t interval)
 /* The pump's copy of the newest frame; at least the largest max_size. */
 #define UVCD_FRAME_BUF_CAP (2048 * 1024)
 
-static int read_procfs_int(const char *path, int base, int def)
-{
-	FILE *f = fopen(path, "r");
-	if (!f)
-		return def;
-	char buf[64] = {0};
-	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-	fclose(f);
-	if (n == 0)
-		return def;
-	return (int)strtol(buf, NULL, base);
-}
-
-static void read_procfs_str(const char *path, char *out, size_t out_len)
-{
-	FILE *f = fopen(path, "r");
-	if (!f) {
-		out[0] = '\0';
-		return;
-	}
-	size_t n = fread(out, 1, out_len - 1, f);
-	fclose(f);
-	out[n] = '\0';
-	char *nl = strchr(out, '\n');
-	if (nl)
-		*nl = '\0';
-}
-
-static int64_t monotonic_ms(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* Push every stored control to the ISP. Runs at each bring-up: the ISP
- * starts from its factory tuning every time it is opened. Hue is stored
- * and exchanged as a signed -128..127 value; the HAL wants it offset to
- * 0..255. */
-static void apply_isp_controls(uvcd_pipeline_t *p)
-{
-	RSS_HAL_CALL(p->ops, isp_set_brightness, p->hal_ctx, p->controls.brightness);
-	RSS_HAL_CALL(p->ops, isp_set_contrast, p->hal_ctx, p->controls.contrast);
-	RSS_HAL_CALL(p->ops, isp_set_saturation, p->hal_ctx, p->controls.saturation);
-	RSS_HAL_CALL(p->ops, isp_set_sharpness, p->hal_ctx, p->controls.sharpness);
-	RSS_HAL_CALL(p->ops, isp_set_sinter_strength, p->hal_ctx, p->controls.sinter);
-	RSS_HAL_CALL(p->ops, isp_set_temper_strength, p->hal_ctx, p->controls.temper);
-	RSS_HAL_CALL(p->ops, isp_set_hue, p->hal_ctx, p->controls.hue + 128);
-	uvcd_apply_ae_comp(p, &p->controls);
-	RSS_HAL_CALL(p->ops, isp_set_max_again, p->hal_ctx, p->controls.max_again);
-	RSS_HAL_CALL(p->ops, isp_set_max_dgain, p->hal_ctx, p->controls.max_dgain);
-	RSS_HAL_CALL(p->ops, isp_set_dpc_strength, p->hal_ctx, p->controls.dpc);
-	RSS_HAL_CALL(p->ops, isp_set_drc_strength, p->hal_ctx, p->controls.drc);
-	/* Off, and not a control: at any strength auto-exposure hunted (frame
-	 * brightness swinging 20x more than at 0) and clipped more. */
-	RSS_HAL_CALL(p->ops, isp_set_backlight_comp, p->hal_ctx, 0);
-	RSS_HAL_CALL(p->ops, isp_set_highlight_depress, p->hal_ctx, p->controls.highlight);
-	RSS_HAL_CALL(p->ops, isp_set_running_mode, p->hal_ctx, RSS_ISP_DAY);
-	RSS_HAL_CALL(p->ops, isp_set_bypass, p->hal_ctx, 1);
-	RSS_HAL_CALL(p->ops, isp_set_antiflicker, p->hal_ctx,
-		     (rss_antiflicker_t)p->controls.power_line_frequency);
-	uvcd_apply_rotation(p, &p->controls);
-	uvcd_apply_gamma(p, p->controls.gamma);
-	uvcd_apply_wb(p, p->controls.wb_temp, p->controls.wb_auto);
-	uvcd_apply_exposure(p, &p->controls);
-	uvcd_apply_metering(p, &p->controls);
-}
-
-/* Sensor + ISP + IMP system up, with every stored control applied. */
-static int hal_bring_up(uvcd_pipeline_t *p)
-{
-	static bool first = true;
-
-	if (p->hal_up)
-		return RSS_OK;
-
-	int64_t t0 = monotonic_ms();
-
-	/* OSD pool must be set before HAL init even when unused (SDK requirement) */
-	RSS_HAL_CALL(p->ops, osd_set_pool_size, p->hal_ctx, 0);
-
-	rss_multi_sensor_config_t multi = {0};
-	multi.sensor_count = 1;
-	multi.sensors[0] = p->sensor;
-
-	int ret = RSS_HAL_CALL(p->ops, init, p->hal_ctx, &multi);
-	if (ret != RSS_OK) {
-		LOGE("HAL init failed: %d", ret);
-		return ret;
-	}
-	p->hal_up = true;
-	p->idle_since_ms = 0;
-	p->sensor_fps = 0; /* the driver boots at its own default rate */
-
-	p->caps = p->ops->get_caps ? p->ops->get_caps(p->hal_ctx) : NULL;
-
-	if (first) {
-		char ver[64];
-		if (rss_hal_get_imp_version(ver, sizeof(ver)) == 0)
-			LOGI("LIBIMP version %s", ver);
-		if (p->caps && !p->caps->has_h265)
-			LOGD("H.265 not supported (unused -- uvcd is H.264/MJPEG only)");
-
-		/* Capture the vendor's gamma curve before anything touches it --
-		 * it is the reference every later gamma change is derived from.
-		 * Only on the first bring-up: the ISP driver outlives uvcd's
-		 * sessions, so a later read could return our own reshaped curve. */
-		p->gamma_ref_valid =
-			(RSS_HAL_CALL(p->ops, isp_get_gamma, p->hal_ctx, p->gamma_ref) == 0);
-		if (!p->gamma_ref_valid)
-			LOGW("could not read factory gamma curve; gamma control disabled");
-
-		/* Same for the tuning file's metering weights. */
-		p->ae_weight_ref_valid = (RSS_HAL_CALL(p->ops, isp_get_ae_weight, p->hal_ctx,
-						       p->ae_weight_ref) == 0);
-		if (!p->ae_weight_ref_valid)
-			LOGW("could not read the tuning's metering weights");
-	}
-
-	p->sensor_w = read_procfs_int("/proc/jz/sensor/sensor0/width", 10, 0);
-	p->sensor_h = read_procfs_int("/proc/jz/sensor/sensor0/height", 10, 0);
-	if (p->sensor_w <= 0 || p->sensor_h <= 0) {
-		p->sensor_w = 1920;
-		p->sensor_h = 1080;
-		LOGW("could not read sensor resolution, assuming %dx%d", p->sensor_w,
-		     p->sensor_h);
-	} else if (first) {
-		LOGI("sensor resolution: %dx%d", p->sensor_w, p->sensor_h);
-	}
-	/* Fixed while the module is loaded; it sets how far zoom can go. */
-	p->isp_clk_hz = read_procfs_int("/sys/module/tx_isp_t31/parameters/isp_clk", 10, 0);
-	if (first)
-		LOGI("ISP clock: %d MHz", p->isp_clk_hz / 1000000);
-	/* Until a channel says otherwise, the whole sensor is in view. */
-	p->view.x = 0;
-	p->view.y = 0;
-	p->view.w = p->sensor_w;
-	p->view.h = p->sensor_h;
-
-	apply_isp_controls(p);
-
-	/* No sensor frame rate here: it follows the host's negotiated interval
-	 * (uvcd_pipeline_start), since the channel cannot run faster than the
-	 * sensor and the GC2083 driver boots at 25 of its 30 fps. */
-
-
-	first = false;
-	LOGI("sensor + ISP up in %lld ms", (long long)(monotonic_ms() - t0));
-	return RSS_OK;
-}
-
-/* Sensor stream off, ISP closed, IMP system exited. Channels must already
- * be torn down (uvcd_pipeline_stop). */
-static void hal_shut_down(uvcd_pipeline_t *p)
-{
-	if (!p->hal_up)
-		return;
-
-	int ret = RSS_HAL_CALL(p->ops, deinit, p->hal_ctx);
-	if (ret != RSS_OK)
-		LOGW("HAL deinit: %d", ret);
-	p->hal_up = false;
-	p->idle_since_ms = 0;
-	LOGI("sensor + ISP down (no stream for %d ms)", UVCD_HAL_LINGER_MS);
-}
-
 /* Controls persist by default -- the daemon writes the file back shortly
  * after any accepted change -- else the compiled-in neutral defaults. They
- * are held in p->controls and pushed to the ISP at every bring-up
- * (hal_bring_up), since the ISP itself only exists while a host is
- * streaming.
+ * are held in p->controls; the camera applies them at bring-up and every
+ * change live.
  *
- * A stream that died before proving healthy (see the crash guard in
- * uvcd_gadget.c) points at whatever changed since the last healthy one, so
- * go back to the controls that stream proved. Only a run of them points at
- * those too. */
+ * A run that crashed before proving its controls (the crash guard,
+ * uvcd_config.h) points at whatever changed since the last healthy stream,
+ * so go back to the controls that stream proved. Only a run of them points
+ * at those too. The two guard files each count the runs in a row; the
+ * larger count is the streak. */
 static int load_controls(uvcd_pipeline_t *p)
 {
 	uvcd_config_load(UVCD_CONFIG_GOOD_PATH, &p->good);
-	p->unproven_streak = uvcd_config_streak_read(UVCD_CONFIG_DIRTY_PATH);
+	int stream_streak = uvcd_config_streak_read(UVCD_CONFIG_DIRTY_PATH);
+	int camera_streak = uvcd_config_streak_read(UVCD_CAMERA_GUARD_PATH);
+	p->unproven_streak = stream_streak > camera_streak ? stream_streak : camera_streak;
 	if (p->unproven_streak >= UVCD_CONFIG_UNPROVEN_LIMIT) {
-		LOGW("%d streams in a row died before proving healthy; using factory controls",
+		LOGW("%d runs in a row crashed before proving their controls; using factory controls",
 		     p->unproven_streak);
 		uvcd_config_defaults(&p->controls);
 		p->good = p->controls;
@@ -405,9 +106,11 @@ static int load_controls(uvcd_pipeline_t *p)
 			LOGW("clear %s: %s", UVCD_CONFIG_GOOD_PATH, strerror(errno));
 		if (unlink(UVCD_CONFIG_DIRTY_PATH) != 0 && errno != ENOENT)
 			LOGW("clear %s: %s", UVCD_CONFIG_DIRTY_PATH, strerror(errno));
+		if (unlink(UVCD_CAMERA_GUARD_PATH) != 0 && errno != ENOENT)
+			LOGW("clear %s: %s", UVCD_CAMERA_GUARD_PATH, strerror(errno));
 		p->unproven_streak = 0;
 	} else if (p->unproven_streak) {
-		LOGW("previous stream died before proving healthy (%d of %d); "
+		LOGW("previous run crashed before proving its controls (%d of %d); "
 		     "using the last proven controls",
 		     p->unproven_streak, UVCD_CONFIG_UNPROVEN_LIMIT);
 		p->controls = p->good;
@@ -418,6 +121,49 @@ static int load_controls(uvcd_pipeline_t *p)
 		uvcd_config_load(UVCD_CONFIG_PATH, &p->controls);
 	}
 	return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Camera-side crash guard (uvcd_config.h). The camera applies stored
+ * controls at bring-up and every change made outside a stream, where no
+ * stream guard is watching; a bad one can crash or hang the daemon right
+ * there. The file is in RAM, so only a restart within the same boot finds
+ * it: unplugging the camera, which is also its power, never counts.
+ */
+static void camera_guard_arm(uvcd_pipeline_t *p)
+{
+	p->camera_guard_since_ms = uvcd_monotonic_ms();
+	if (p->camera_guard_armed)
+		return;
+	p->camera_guard_armed = true;
+	if (uvcd_config_streak_write(UVCD_CAMERA_GUARD_PATH, p->unproven_streak + 1) != 0)
+		LOGW("crash guard %s: %s", UVCD_CAMERA_GUARD_PATH, strerror(errno));
+}
+
+void uvcd_pipeline_camera_guard_arm(uvcd_pipeline_t *p)
+{
+	if (p->cam.up) /* a camera that is down takes nothing in */
+		camera_guard_arm(p);
+}
+
+/* Proven, or released by a clean exit (which is not a crash). */
+static void camera_guard_clear(uvcd_pipeline_t *p, bool proven)
+{
+	if (!p->camera_guard_armed)
+		return;
+	p->camera_guard_armed = false;
+	if (proven)
+		p->unproven_streak = 0;
+	if (unlink(UVCD_CAMERA_GUARD_PATH) != 0 && errno != ENOENT)
+		LOGW("clear %s: %s", UVCD_CAMERA_GUARD_PATH, strerror(errno));
+}
+
+/* The camera ran UVCD_CONFIG_HEALTHY_MS on what it was given. */
+static void camera_guard_tick(uvcd_pipeline_t *p)
+{
+	if (p->camera_guard_armed && p->cam.up &&
+	    uvcd_monotonic_ms() - p->camera_guard_since_ms >= UVCD_CONFIG_HEALTHY_MS)
+		camera_guard_clear(p, true);
 }
 
 int uvcd_pipeline_init(uvcd_pipeline_t *p)
@@ -432,62 +178,27 @@ int uvcd_pipeline_init(uvcd_pipeline_t *p)
 	}
 	p->frame.size = UVCD_FRAME_BUF_CAP;
 
-	p->hal_ctx = rss_hal_create();
-	if (!p->hal_ctx) {
-		LOGE("rss_hal_create failed");
+	if (load_controls(p) != 0 || uvcd_camera_init(&p->cam, &p->controls) != 0) {
 		free(p->frame.data);
 		return -1;
 	}
-	p->ops = rss_hal_get_ops(p->hal_ctx);
 
-	rss_sensor_config_t *sensor = &p->sensor;
-	read_procfs_str("/proc/jz/sensor/sensor0/name", sensor->name, sizeof(sensor->name));
-	if (!sensor->name[0]) {
-		LOGE("no sensor registered at /proc/jz/sensor/sensor0 (gc2083 driver not loaded?)");
-		goto fail;
+	/* Start measuring before the first host streams. A camera that won't
+	 * come up is not fatal: the gadget still enumerates and answers, and
+	 * the first stream tries again. */
+	camera_guard_arm(p);
+	if (uvcd_camera_up(&p->cam) != RSS_OK) {
+		LOGW("camera did not come up; trying again at the first stream");
+		camera_guard_clear(p, false);
 	}
-	sensor->i2c_addr = (uint16_t)read_procfs_int("/proc/jz/sensor/sensor0/i2c_addr", 0, 0);
-	sensor->i2c_adapter = read_procfs_int("/proc/jz/sensor/sensor0/i2c_adapter", 10, 0);
-	sensor->sensor_id = 0;
-	sensor->pwdn_gpio = read_procfs_int("/proc/jz/sensor/sensor0/pwdn_gpio", 10, -1);
-	sensor->rst_gpio = read_procfs_int("/proc/jz/sensor/sensor0/rst_gpio", 10, -1);
-	sensor->power_gpio = -1;
-	sensor->default_boot = read_procfs_int("/proc/jz/sensor/sensor0/boot", 10, 0);
-	sensor->mclk = (rss_sensor_mclk_t)read_procfs_int("/proc/jz/sensor/sensor0/mclk", 10, 1);
-	sensor->vin_type = (rss_sensor_vin_t)read_procfs_int(
-		"/proc/jz/sensor/sensor0/video_interface", 10, 0);
-
-	if (sensor->i2c_addr == 0) {
-		LOGE("could not read sensor i2c_addr from procfs");
-		goto fail;
-	}
-
-	LOGI("sensor: %s i2c=0x%02x bus=%d boot=%d", sensor->name, sensor->i2c_addr,
-	     sensor->i2c_adapter, sensor->default_boot);
-
-	if (load_controls(p) != 0)
-		goto fail;
-
-	/* Nothing else: the sensor, ISP and IMP system come up on the first
-	 * stream (uvcd_pipeline_start), so an unused camera never starts them
-	 * and the gadget can enumerate without waiting on the sensor. */
 	return 0;
-
-fail:
-	rss_hal_destroy(p->hal_ctx);
-	p->hal_ctx = NULL;
-	free(p->frame.data);
-	return -1;
 }
 
 void uvcd_pipeline_deinit(uvcd_pipeline_t *p)
 {
 	uvcd_pipeline_stop(p);
-	hal_shut_down(p);
-	if (p->hal_ctx) {
-		rss_hal_destroy(p->hal_ctx);
-		p->hal_ctx = NULL;
-	}
+	uvcd_camera_deinit(&p->cam);
+	camera_guard_clear(p, false);
 	pthread_mutex_destroy(&p->frame.lock);
 	free(p->frame.data);
 }
@@ -504,25 +215,18 @@ static uint16_t primary_nal_type(const rss_frame_t *f)
 	return f->nal_count ? (uint16_t)f->nals[0].type : (uint16_t)RSS_NAL_UNKNOWN;
 }
 
-static int64_t monotonic_us(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
 static void *pump_thread(void *arg)
 {
 	uvcd_pipeline_t *p = arg;
 
 	LOGD("pump thread started");
 	while (p->pump_run) {
-		int ret = RSS_HAL_CALL(p->ops, enc_poll, p->hal_ctx, UVCD_ENC_CHN, 1000);
+		int ret = RSS_HAL_CALL(p->cam.ops, enc_poll, p->cam.hal_ctx, UVCD_ENC_CHN, 1000);
 		if (ret != RSS_OK)
 			continue; /* normal: sensor idle / timeout */
 
 		rss_frame_t frame;
-		ret = RSS_HAL_CALL(p->ops, enc_get_frame, p->hal_ctx, UVCD_ENC_CHN, &frame);
+		ret = RSS_HAL_CALL(p->cam.ops, enc_get_frame, p->cam.hal_ctx, UVCD_ENC_CHN, &frame);
 		if (ret != RSS_OK)
 			continue;
 
@@ -541,7 +245,7 @@ static void *pump_thread(void *arg)
 			p->frame.len = off;
 			p->frame.ts_us = p->ts_rebased && frame.timestamp > 0
 						 ? frame.timestamp
-						 : monotonic_us();
+						 : uvcd_monotonic_us();
 			p->frame.is_key = frame.is_key;
 			p->frame.seq++;
 		} else {
@@ -553,498 +257,10 @@ static void *pump_thread(void *arg)
 			uvcd_enc_request_keyframe(p); /* see deliver_frame() */
 
 		(void)primary_nal_type(&frame);
-		RSS_HAL_CALL(p->ops, enc_release_frame, p->hal_ctx, UVCD_ENC_CHN, &frame);
+		RSS_HAL_CALL(p->cam.ops, enc_release_frame, p->cam.hal_ctx, UVCD_ENC_CHN, &frame);
 	}
 	LOGD("pump thread exiting");
 	return NULL;
-}
-
-/* --------------------------------------------------------------------------
- * Camera Terminal controls: exposure, exposure priority, zoom/pan/tilt --
- * and the two nonstandard ones that shape the same picture, rotation and
- * metering.
- */
-
-/* SDK structs these HAL calls pass through as void *. uvcd builds against
- * raptor_hal.h only, so they are mirrored from the T31 1.1.6 imp_isp.h. */
-struct uvcd_imp_expr { /* IMPISPExpr, s_attr side of the union */
-	int mode;      /* 0 = auto, 1 = manual */
-	int unit;      /* 0 = sensor lines, 1 = microseconds */
-	uint16_t time; /* integration time in `unit` */
-	uint16_t pad;  /* the union is 12 bytes (its g_attr side) */
-};
-
-struct uvcd_imp_csc { /* IMPISPCscAttr */
-	int mode;      /* IMPISPCscCgMode, below */
-	int coef[9];   /* custom 3x3 matrix, used in USER mode only */
-	int offset[2]; /* UV, Y */
-	int y_clip[2]; /* max, min */
-	int c_clip[2]; /* max, min */
-};
-
-enum { /* IMPISPCscCgMode */
-	UVCD_CSC_BT601_FULL,
-	UVCD_CSC_BT601_CLIP,
-	UVCD_CSC_BT709_FULL,
-	UVCD_CSC_BT709_CLIP,
-};
-
-/* Make the ISP's YUV what the stream says it is. The T31 encoder tags
- * H.264 as BT.709 limited range and gives no way to change that, while the
- * ISP comes up producing BT.601 full range: every decoder then stretched
- * 16..235 to 0..255, crushing ~40% of a dim scene to black and clipping
- * whites. JPEG decoders assume BT.601 full range (JFIF), the ISP default.
- * The clip limits are left as read (255/0), so blown highlights land a
- * little above 235; decoders clip those to white anyway. */
-static void apply_csc(uvcd_pipeline_t *p, uint8_t format)
-{
-	struct uvcd_imp_csc c = {0};
-	int was = -1;
-
-	if (RSS_HAL_CALL(p->ops, isp_get_csc_attr, p->hal_ctx, &c) == RSS_OK)
-		was = c.mode;
-	c.mode = format == UVCD_FMT_H264 ? UVCD_CSC_BT709_CLIP : UVCD_CSC_BT601_FULL;
-	if (c.mode == was)
-		return;
-	int ret = RSS_HAL_CALL(p->ops, isp_set_csc_attr, p->hal_ctx, &c);
-	if (ret != RSS_OK)
-		LOGW("ISP CSC mode %d rejected (%d)", c.mode, ret);
-	else
-		LOGI("ISP CSC mode %d -> %d", was, c.mode);
-}
-
-/* Exposure priority: with auto-exposure out of frame time and leaning on
- * gain, slow the sensor down a step so it can expose longer instead; once
- * the gain is low and the exposure would fit a faster frame, speed back up.
- * Gains are total gain as a plain multiple (the ISP reports [24.8]); the
- * gap between the two thresholds keeps it from hunting. */
-#define UVCD_PRIORITY_PERIOD_MS 2000
-#define UVCD_PRIORITY_SLOWER_GAIN 16.0f
-#define UVCD_PRIORITY_FASTER_GAIN 8.0f
-
-/* Run the sensor at `fps`, and tell the encoder so its rate control keeps
- * bits per second rather than bits per frame. */
-static void set_sensor_fps(uvcd_pipeline_t *p, uint32_t fps)
-{
-	if (fps == p->sensor_fps)
-		return;
-	if (RSS_HAL_CALL(p->ops, isp_set_sensor_fps, p->hal_ctx, fps, 1) != RSS_OK) {
-		LOGW("sensor fps %u rejected", fps);
-		return;
-	}
-	if (p->configured)
-		RSS_HAL_CALL(p->ops, enc_set_fps, p->hal_ctx, UVCD_ENC_CHN, fps, 1);
-	if (p->sensor_fps)
-		LOGI("sensor at %u fps", fps);
-	p->sensor_fps = fps;
-}
-
-/* One listed step, at most `ceiling`, with a 15 fps priority floor.
- * A host explicitly negotiating 5/10 fps keeps that rate. */
-static uint32_t fps_step(uint32_t fps, int dir, uint32_t ceiling)
-{
-	uint32_t best = fps;
-
-	for (int i = 0; i < UVCD_NUM_INTERVALS; i++) {
-		uint32_t f = uvcd_interval_fps(uvcd_intervals[i]);
-		if (dir < 0 && f < fps && f >= (ceiling < 15 ? ceiling : 15) &&
-		    (best == fps || f > best))
-			best = f;
-		if (dir > 0 && f > fps && f <= ceiling && (best == fps || f < best))
-			best = f;
-	}
-	return best;
-}
-
-/* The zoom actually used at this output size. The control keeps what the
- * host asked for, so switching to a size that can take it gets it back. */
-static int effective_zoom(const uvcd_pipeline_t *p, const struct uvcd_control_state *c,
-			  uint8_t frame)
-{
-	int zoom = c->zoom < UVCD_ZOOM_MIN ? UVCD_ZOOM_MIN : c->zoom;
-	int max = p->isp_clk_hz >= UVCD_ISP_FAST_HZ ? uvcd_frames[frame].max_zoom
-						    : uvcd_frames[frame].max_zoom_slow;
-	return zoom > max ? max : zoom;
-}
-
-/* The part of the sensor image the host sees for output `frame`: the
- * largest centred rectangle of the output's aspect ratio (so 4:3 sizes are
- * cropped, not squashed), narrowed by zoom and moved by pan/tilt. */
-static void compute_view(const uvcd_pipeline_t *p, const struct uvcd_control_state *c,
-			 uint8_t frame, int *x, int *y, int *w, int *h)
-{
-	int sw = p->sensor_w, sh = p->sensor_h;
-	int ow = uvcd_frames[frame].width, oh = uvcd_frames[frame].height;
-	int zoom = effective_zoom(p, c, frame);
-
-	int bw = sw, bh = (int)((int64_t)sw * oh / ow);
-	if (bh > sh) {
-		bh = sh;
-		bw = (int)((int64_t)sh * ow / oh);
-	}
-	/* The ISP wants the crop aligned; round down, so it stays inside. */
-	*w = bw * UVCD_ZOOM_MIN / zoom;
-	*h = bh * UVCD_ZOOM_MIN / zoom;
-	*w &= ~1;
-	*h &= ~1;
-
-	int spare_x = sw - *w, spare_y = sh - *h;
-	*x = spare_x / 2 + (int)((int64_t)(spare_x / 2) * c->pan / UVCD_PANTILT_MAX);
-	*y = spare_y / 2 - (int)((int64_t)(spare_y / 2) * c->tilt / UVCD_PANTILT_MAX);
-	*x = (*x < 0 ? 0 : *x > spare_x ? spare_x : *x) & ~1;
-	*y = (*y < 0 ? 0 : *y > spare_y ? spare_y : *y) & ~1;
-}
-
-int uvcd_apply_view(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
-{
-	/* The view is relative to an output size; with no channel there is
-	 * none yet, and configure_channel() works it out at the next start. */
-	if (!p->configured)
-		return RSS_OK;
-
-	int x, y, w, h;
-	compute_view(p, c, p->cur_frame, &x, &y, &w, &h);
-	if (x == p->view.x && y == p->view.y && w == p->view.w && h == p->view.h)
-		return RSS_OK;
-
-	/* AutoZoom crops AFTER scaling on T31. Recreate with a front crop
-	 * instead, so zoom never needs a sensor-wide 7680-pixel scaler output.
-	 * Preserve the old controls if the SDK rejects the requested view. */
-	struct uvcd_control_state old = p->controls;
-	uint8_t format = p->cur_format, frame = p->cur_frame;
-	uint32_t interval = p->cur_interval;
-	uvcd_pipeline_stop(p);
-	p->controls = *c;
-	int ret = uvcd_pipeline_start(p, format, frame, interval);
-	p->controls = old;
-	if (ret != RSS_OK) {
-		LOGW("view change failed; restoring previous view");
-		uvcd_pipeline_start(p, format, frame, interval);
-	}
-	return ret;
-}
-
-int uvcd_apply_exposure(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
-{
-	struct uvcd_imp_expr e = {0};
-	uint32_t fps = p->configured ? uvcd_interval_fps(p->cur_interval) : 0;
-
-	if (c->ae_mode == UVCD_AE_MANUAL) {
-		uint32_t us = (uint32_t)c->exposure_time * 100;
-
-		if (fps) {
-			/* Exposure priority lets the frame rate drop to make
-			 * room; otherwise the exposure is cut to fit a frame. */
-			if (c->ae_priority) {
-				uint32_t fits = 1000000 / us;
-				while (fps > fits) {
-					uint32_t slower = fps_step(fps, -1, uvcd_interval_fps(p->cur_interval));
-					if (slower == fps)
-						break;
-					fps = slower;
-				}
-			}
-			set_sensor_fps(p, fps);
-			uint32_t running_fps = p->sensor_fps ? p->sensor_fps : fps;
-			if (us > 1000000 / running_fps)
-				us = 1000000 / running_fps;
-		}
-		if (us > UINT16_MAX)
-			us = UINT16_MAX;
-		e.mode = 1;
-		e.unit = 1;
-		e.time = (uint16_t)us;
-	} else if (fps) {
-		/* Auto: start from the negotiated rate; with exposure priority
-		 * on, the tick slows it down if the light calls for it. */
-		set_sensor_fps(p, fps);
-	}
-	p->priority_checked_ms = monotonic_ms();
-
-	return RSS_HAL_CALL(p->ops, isp_set_expr, p->hal_ctx, &e);
-}
-
-int uvcd_live_exposure(uvcd_pipeline_t *p)
-{
-	rss_exposure_t e;
-
-	if (!p->hal_up || RSS_HAL_CALL(p->ops, isp_get_exposure, p->hal_ctx, &e) != RSS_OK)
-		return -1;
-	int t = (int)((e.exposure_time + 50) / 100);
-	return t < UVCD_EXPOSURE_MIN ? UVCD_EXPOSURE_MIN : t;
-}
-
-static void exposure_priority_tick(uvcd_pipeline_t *p)
-{
-	const struct uvcd_control_state *c = &p->controls;
-
-	if (!p->running || c->ae_mode == UVCD_AE_MANUAL || !c->ae_priority)
-		return;
-	int64_t now = monotonic_ms();
-	if (now - p->priority_checked_ms < UVCD_PRIORITY_PERIOD_MS)
-		return;
-	p->priority_checked_ms = now;
-
-	rss_exposure_t e;
-	if (RSS_HAL_CALL(p->ops, isp_get_exposure, p->hal_ctx, &e) != RSS_OK)
-		return;
-
-	uint32_t negotiated = uvcd_interval_fps(p->cur_interval);
-	uint32_t fps = p->sensor_fps ? p->sensor_fps : negotiated;
-	float gain = (float)e.total_gain / 256.0f;
-	uint32_t frame_us = 1000000 / fps;
-
-	LOGD("exposure priority: %u of %u us, gain %.2fx, %u fps", e.exposure_time, frame_us,
-	     (double)gain, fps);
-
-	if (e.exposure_time >= frame_us * 9 / 10 && gain >= UVCD_PRIORITY_SLOWER_GAIN) {
-		set_sensor_fps(p, fps_step(fps, -1, negotiated));
-	} else if (fps < negotiated && gain <= UVCD_PRIORITY_FASTER_GAIN) {
-		uint32_t faster = fps_step(fps, +1, negotiated);
-		if (e.exposure_time <= (1000000 / faster) * 8 / 10)
-			set_sensor_fps(p, faster);
-	}
-}
-
-/* The ISP meters on a 15x15 grid over the whole sensor. A zone counts as
- * in the view when its centre is. */
-static bool zone_in_view(const uvcd_pipeline_t *p, int r, int col)
-{
-	int zx = (2 * col + 1) * p->sensor_w / 30;
-	int zy = (2 * r + 1) * p->sensor_h / 30;
-	return zx >= p->view.x && zx < p->view.x + p->view.w && zy >= p->view.y &&
-	       zy < p->view.y + p->view.h;
-}
-
-/* Fixed weights for `metering` (any mode but TUNING; SUBJECT starts from
- * CENTER). Zones outside the view get no weight, so what the host can't see
- * doesn't set the exposure. Weights run 0-8. */
-static void metering_weights(const uvcd_pipeline_t *p, int metering, uint8_t weight[15][15])
-{
-	int cx = p->view.x + p->view.w / 2, cy = p->view.y + p->view.h / 2;
-	bool any = false;
-	for (int r = 0; r < 15; r++) {
-		for (int col = 0; col < 15; col++) {
-			uint8_t w = 0;
-
-			if (zone_in_view(p, r, col)) {
-				int zx = (2 * col + 1) * p->sensor_w / 30;
-				int zy = (2 * r + 1) * p->sensor_h / 30;
-				/* 0 at the centre of the view, 1 at its edge */
-				float dx = fabsf((float)(zx - cx)) / (float)(p->view.w / 2);
-				float dy = fabsf((float)(zy - cy)) / (float)(p->view.h / 2);
-				float d = dx > dy ? dx : dy;
-
-				if (metering == UVCD_METERING_AVERAGE)
-					w = 8;
-				else if (metering == UVCD_METERING_SPOT)
-					w = d <= 0.2f ? 8 : 0;
-				else
-					w = (uint8_t)(8.0f - 6.0f * d + 0.5f);
-			}
-			weight[r][col] = w;
-			any |= (w != 0);
-		}
-	}
-	/* A spot smaller than one zone: weight the zone under the centre. */
-	if (!any)
-		weight[cy * 15 / p->sensor_h][cx * 15 / p->sensor_w] = 8;
-}
-
-int uvcd_apply_ae_comp(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
-{
-	int v = c->ae_comp;
-
-	if (c->metering == UVCD_METERING_SUBJECT)
-		v = (int)((float)v * (1.0f - p->ae_comp_cut) + 0.5f);
-	return RSS_HAL_CALL(p->ops, isp_set_ae_comp, p->hal_ctx, v);
-}
-
-int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
-{
-	uint8_t weight[15][15];
-
-	/* Only subject metering holds exposure compensation back. */
-	if (c->metering != UVCD_METERING_SUBJECT && p->ae_comp_cut != 0.0f) {
-		p->ae_comp_cut = 0.0f;
-		uvcd_apply_ae_comp(p, c);
-	}
-
-	if (c->metering == UVCD_METERING_TUNING) {
-		if (!p->ae_weight_ref_valid)
-			return RSS_OK; /* never changed, so nothing to restore */
-		return RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
-				    (const uint8_t(*)[15])p->ae_weight_ref);
-	}
-
-	metering_weights(p, c->metering, weight);
-	int ret = RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
-			      (const uint8_t(*)[15])weight);
-	if (ret != RSS_OK)
-		return ret;
-	/* Subject metering starts from center-weighted and finds the subject
-	 * from the next statistics on. Only weights the ISP took count as
-	 * written, or a rejected write would never be retried. */
-	for (int r = 0; r < 15; r++)
-		for (int col = 0; col < 15; col++)
-			p->subject_weight[r][col] = weight[r][col];
-	memcpy(p->subject_written, weight, sizeof(weight));
-	p->subject_checked_ms = p->guard_checked_ms = monotonic_ms();
-	return RSS_OK;
-}
-
-/* Subject metering. The chamber camera looks at small, often white prints on
- * a dark bed in a dark chamber, and any fixed weighting averages the two:
- * the dark bed pulls the exposure up and the print clips. Two loops fix
- * that, both from the ISP's own statistics, so they cost nothing per frame:
- *
- * - Find the subject: zones well above the median brightness of the view
- *   are what stands out, and are eased up to full weight over the
- *   center-weighted base. On the K1 the median zone is the unlit chamber,
- *   so the lit bed and the prints on it both count. While neither zone
- *   clips or sits in the noise floor, the ratio to the median doesn't
- *   change with exposure, so this doesn't fight auto-exposure. With
- *   nothing standing out it is plain center-weighted.
- *
- * - Guard the highlights: metering a white print to auto-exposure's target
- *   alone would make it grey, so the weights only steer. What decides is
- *   the brightest UVCD_GUARD_TOP of the picture: while it clips,
- *   exposure compensation is held back a step at a time (to at most
- *   UVCD_GUARD_MAX_CUT); once it sits well below clipping, it is given
- *   back. Anything smaller than UVCD_GUARD_TOP, such as a glint, may clip. */
-#define UVCD_SUBJECT_PERIOD_MS 500
-#define UVCD_SUBJECT_RATIO_LO 1.5f /* zone / median: no extra weight below */
-#define UVCD_SUBJECT_RATIO_HI 3.0f /* full weight from here */
-#define UVCD_SUBJECT_MEDIAN_FLOOR 4.0f /* below it, ratios are dark-zone noise */
-#define UVCD_SUBJECT_EASE 0.5f     /* of the way to the target, per period */
-#define UVCD_GUARD_PERIOD_MS 1000  /* lets auto-exposure settle in between */
-#define UVCD_GUARD_TOP 0.01f       /* the brightest 1% of the picture */
-/* The histogram is linear, taken before the gamma curve: on the K1, bin 219
- * came out at 251 of 255, bin 200 at about 238 and bin 150 at about 211.
- * The band between the two is wider than one step either way, so the guard
- * comes to rest instead of hunting. */
-#define UVCD_GUARD_CLIP_BIN 200
-#define UVCD_GUARD_LOW_BIN 150
-#define UVCD_GUARD_DOWN 0.85f
-#define UVCD_GUARD_UP 1.1f
-#define UVCD_GUARD_MAX_CUT 0.5f /* keep at least half the requested compensation */
-
-static int cmp_u32(const void *a, const void *b)
-{
-	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-	return (x > y) - (x < y);
-}
-
-static void subject_weights(uvcd_pipeline_t *p)
-{
-	uint32_t zone[15][15], sorted[225];
-	uint8_t base[15][15], weight[15][15];
-	int n = 0;
-
-	if (RSS_HAL_CALL(p->ops, isp_get_ae_zone, p->hal_ctx, zone) != RSS_OK)
-		return;
-	for (int r = 0; r < 15; r++)
-		for (int col = 0; col < 15; col++)
-			if (zone_in_view(p, r, col))
-				sorted[n++] = zone[r][col];
-	if (n == 0)
-		return;
-	qsort(sorted, (size_t)n, sizeof(sorted[0]), cmp_u32);
-	float median = (float)sorted[n / 2];
-	if (median < UVCD_SUBJECT_MEDIAN_FLOOR)
-		median = UVCD_SUBJECT_MEDIAN_FLOOR;
-
-	metering_weights(p, UVCD_METERING_CENTER, base);
-	int subject = 0;
-	for (int r = 0; r < 15; r++) {
-		for (int col = 0; col < 15; col++) {
-			float target = base[r][col];
-
-			if (zone_in_view(p, r, col)) {
-				float s = ((float)zone[r][col] / median - UVCD_SUBJECT_RATIO_LO) /
-					  (UVCD_SUBJECT_RATIO_HI - UVCD_SUBJECT_RATIO_LO);
-				s = s < 0.0f ? 0.0f : s > 1.0f ? 1.0f : s;
-				target += (8.0f - target) * s;
-				subject += s >= 0.5f;
-			}
-			float *w = &p->subject_weight[r][col];
-			*w += (target - *w) * UVCD_SUBJECT_EASE;
-			weight[r][col] = (uint8_t)(*w + 0.5f);
-		}
-	}
-	LOGD("subject metering: median %.0f, max %u, %d subject zones", (double)median,
-	     sorted[n - 1], subject);
-	if (memcmp(weight, p->subject_written, sizeof(weight)) == 0)
-		return;
-	if (RSS_HAL_CALL(p->ops, isp_set_ae_weight, p->hal_ctx,
-			 (const uint8_t(*)[15])weight) == RSS_OK)
-		memcpy(p->subject_written, weight, sizeof(weight));
-}
-
-static void highlight_guard(uvcd_pipeline_t *p)
-{
-	uint32_t bins[256];
-	uint64_t total = 0, above = 0;
-	int top = 255;
-
-	if (RSS_HAL_CALL(p->ops, isp_get_ae_hist_origin, p->hal_ctx, bins) != RSS_OK)
-		return;
-	for (int i = 0; i < 256; i++)
-		total += bins[i];
-	if (total == 0)
-		return;
-	/* The darkest bin the brightest UVCD_GUARD_TOP reaches down into. */
-	for (; top > 0; top--) {
-		above += bins[top];
-		if ((float)above >= (float)total * UVCD_GUARD_TOP)
-			break;
-	}
-
-	float scale = 1.0f - p->ae_comp_cut;
-	if (top >= UVCD_GUARD_CLIP_BIN)
-		scale *= UVCD_GUARD_DOWN;
-	else if (top < UVCD_GUARD_LOW_BIN)
-		scale *= UVCD_GUARD_UP;
-	if (scale > 1.0f)
-		scale = 1.0f;
-	if (scale < 1.0f - UVCD_GUARD_MAX_CUT)
-		scale = 1.0f - UVCD_GUARD_MAX_CUT;
-
-	float cut = 1.0f - scale;
-	LOGD("highlight guard: top %.1f%% at bin %d, compensation cut %.0f%%",
-	     (double)(UVCD_GUARD_TOP * 100.0f), top, (double)(cut * 100.0f));
-	if (cut == p->ae_comp_cut)
-		return;
-	float old_cut = p->ae_comp_cut;
-	p->ae_comp_cut = cut;
-	if (uvcd_apply_ae_comp(p, &p->controls) != RSS_OK)
-		p->ae_comp_cut = old_cut; /* not applied: try again next time */
-}
-
-static void subject_metering_tick(uvcd_pipeline_t *p)
-{
-	const struct uvcd_control_state *c = &p->controls;
-
-	if (!p->running || c->metering != UVCD_METERING_SUBJECT || c->ae_mode == UVCD_AE_MANUAL)
-		return;
-	int64_t now = monotonic_ms();
-	if (now - p->subject_checked_ms < UVCD_SUBJECT_PERIOD_MS)
-		return;
-	p->subject_checked_ms = now;
-	subject_weights(p);
-	if (now - p->guard_checked_ms >= UVCD_GUARD_PERIOD_MS) {
-		p->guard_checked_ms = now;
-		highlight_guard(p);
-	}
-}
-
-int uvcd_apply_rotation(uvcd_pipeline_t *p, const struct uvcd_control_state *c)
-{
-	int flip = c->rotation >= 90 ? 1 : 0;
-	int ret = RSS_HAL_CALL(p->ops, isp_set_hflip, p->hal_ctx, flip);
-	if (ret != RSS_OK)
-		return ret;
-	return RSS_HAL_CALL(p->ops, isp_set_vflip, p->hal_ctx, flip);
 }
 
 /* ── Configure FS + encoder channel for a given (format, frame size) ── */
@@ -1082,7 +298,7 @@ int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p)
 {
 	if (!running_h264(p))
 		return 0;
-	return RSS_HAL_CALL(p->ops, enc_set_bitrate, p->hal_ctx, UVCD_ENC_CHN,
+	return RSS_HAL_CALL(p->cam.ops, enc_set_bitrate, p->cam.hal_ctx, UVCD_ENC_CHN,
 			    effective_h264_bitrate(p, p->cur_frame));
 }
 
@@ -1090,7 +306,7 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
 {
 	if (!running_h264(p))
 		return 0; /* MJPEG is all keyframes; not streaming, nothing to do */
-	return RSS_HAL_CALL(p->ops, enc_request_idr, p->hal_ctx, UVCD_ENC_CHN);
+	return RSS_HAL_CALL(p->cam.ops, enc_request_idr, p->cam.hal_ctx, UVCD_ENC_CHN);
 }
 
 static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
@@ -1109,19 +325,17 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 		.fps_den = fps_den,
 		.nr_vbs = 2,
 	};
-	/* Start on the view zoom/pan/tilt ask for; uvcd_apply_view() moves
-	 * it live from then on. */
-	int vx, vy, vw, vh;
-	if (effective_zoom(p, &p->controls, frame) < p->controls.zoom)
-		LOGI("zoom %d limited to %d at %ux%u (ISP upscale limit at %d MHz)",
-		     p->controls.zoom, effective_zoom(p, &p->controls, frame), fi->width,
-		     fi->height, p->isp_clk_hz / 1000000);
-	compute_view(p, &p->controls, frame, &vx, &vy, &vw, &vh);
+	/* The camera's view for this output size (uvcd_camera_acquire), as a
+	 * front crop before the scaler; a view change re-creates the channel
+	 * (apply_view). */
+	int vx = p->cam.view.x, vy = p->cam.view.y, vw = p->cam.view.w, vh = p->cam.view.h;
+	if (p->cam.view_frame != frame)
+		return -EINVAL; /* the camera was not acquired for this size */
 	/* Never pass an invalid sensor-space rectangle to the ISP. */
 	if (vw <= 0 || vh <= 0 || vx < 0 || vy < 0 ||
-	    vx + vw > p->sensor_w || vy + vh > p->sensor_h)
+	    vx + vw > p->cam.sensor_w || vy + vh > p->cam.sensor_h)
 		return -EINVAL;
-	if (vw != p->sensor_w || vh != p->sensor_h) {
+	if (vw != p->cam.sensor_w || vh != p->cam.sensor_h) {
 		fs_cfg.fcrop.enable = true;
 		fs_cfg.fcrop.x = vx;
 		fs_cfg.fcrop.y = vy;
@@ -1134,19 +348,15 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 		fs_cfg.scaler.out_height = fi->height;
 	}
 
-	int ret = RSS_HAL_CALL(p->ops, fs_create_channel, p->hal_ctx, UVCD_FS_CHN, &fs_cfg);
+	int ret = RSS_HAL_CALL(p->cam.ops, fs_create_channel, p->cam.hal_ctx, UVCD_FS_CHN, &fs_cfg);
 	if (ret != RSS_OK) {
 		LOGE("fs_create_channel failed: %d", ret);
 		return ret;
 	}
-	p->view.x = vx;
-	p->view.y = vy;
-	p->view.w = vw;
-	p->view.h = vh;
-	RSS_HAL_CALL(p->ops, fs_set_fifo, p->hal_ctx, UVCD_FS_CHN, 0);
-	RSS_HAL_CALL(p->ops, fs_set_frame_depth, p->hal_ctx, UVCD_FS_CHN, 0);
+	RSS_HAL_CALL(p->cam.ops, fs_set_fifo, p->cam.hal_ctx, UVCD_FS_CHN, 0);
+	RSS_HAL_CALL(p->cam.ops, fs_set_frame_depth, p->cam.hal_ctx, UVCD_FS_CHN, 0);
 
-	ret = RSS_HAL_CALL(p->ops, enc_create_group, p->hal_ctx, UVCD_ENC_CHN);
+	ret = RSS_HAL_CALL(p->cam.ops, enc_create_group, p->cam.hal_ctx, UVCD_ENC_CHN);
 	if (ret != RSS_OK) {
 		LOGE("enc_create_group failed: %d", ret);
 		goto fail_fs;
@@ -1209,23 +419,23 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	 * about 1 byte per pixel takes far more than quality 100 needs. */
 	uint32_t stream_bytes = jpeg ? (fi->width * fi->height * 4u + 65535u) & ~4095u
 				    : fi->max_size;
-	ret = RSS_HAL_CALL(p->ops, enc_set_max_stream_cnt, p->hal_ctx, UVCD_ENC_CHN,
+	ret = RSS_HAL_CALL(p->cam.ops, enc_set_max_stream_cnt, p->cam.hal_ctx, UVCD_ENC_CHN,
 			   jpeg ? 1 : 2);
 	if (ret < 0)
 		goto fail_grp;
-	ret = RSS_HAL_CALL(p->ops, enc_set_stream_buf_size, p->hal_ctx,
+	ret = RSS_HAL_CALL(p->cam.ops, enc_set_stream_buf_size, p->cam.hal_ctx,
 			   UVCD_ENC_CHN, stream_bytes);
 	if (ret < 0) {
 		LOGE("encoder stream buffer (%u bytes) rejected: %d", stream_bytes, ret);
 		goto fail_grp;
 	}
 
-	ret = RSS_HAL_CALL(p->ops, enc_create_channel, p->hal_ctx, UVCD_ENC_CHN, &enc_cfg);
+	ret = RSS_HAL_CALL(p->cam.ops, enc_create_channel, p->cam.hal_ctx, UVCD_ENC_CHN, &enc_cfg);
 	if (ret != RSS_OK) {
 		LOGE("enc_create_channel failed: %d", ret);
 		goto fail_grp;
 	}
-	ret = RSS_HAL_CALL(p->ops, enc_register_channel, p->hal_ctx, UVCD_ENC_CHN, UVCD_ENC_CHN);
+	ret = RSS_HAL_CALL(p->cam.ops, enc_register_channel, p->cam.hal_ctx, UVCD_ENC_CHN, UVCD_ENC_CHN);
 	if (ret != RSS_OK) {
 		LOGE("enc_register_channel failed: %d", ret);
 		goto fail_chn;
@@ -1233,7 +443,7 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 
 	rss_cell_t fs_cell = {RSS_DEV_FS, UVCD_FS_CHN, 0};
 	rss_cell_t enc_cell = {RSS_DEV_ENC, UVCD_ENC_CHN, 0};
-	ret = RSS_HAL_CALL(p->ops, bind, p->hal_ctx, &fs_cell, &enc_cell);
+	ret = RSS_HAL_CALL(p->cam.ops, bind, p->cam.hal_ctx, &fs_cell, &enc_cell);
 	if (ret != RSS_OK) {
 		LOGE("bind failed: %d", ret);
 		goto fail_reg;
@@ -1244,13 +454,13 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	return RSS_OK;
 
 fail_reg:
-	RSS_HAL_CALL(p->ops, enc_unregister_channel, p->hal_ctx, UVCD_ENC_CHN);
+	RSS_HAL_CALL(p->cam.ops, enc_unregister_channel, p->cam.hal_ctx, UVCD_ENC_CHN);
 fail_chn:
-	RSS_HAL_CALL(p->ops, enc_destroy_channel, p->hal_ctx, UVCD_ENC_CHN);
+	RSS_HAL_CALL(p->cam.ops, enc_destroy_channel, p->cam.hal_ctx, UVCD_ENC_CHN);
 fail_grp:
-	RSS_HAL_CALL(p->ops, enc_destroy_group, p->hal_ctx, UVCD_ENC_CHN);
+	RSS_HAL_CALL(p->cam.ops, enc_destroy_group, p->cam.hal_ctx, UVCD_ENC_CHN);
 fail_fs:
-	RSS_HAL_CALL(p->ops, fs_destroy_channel, p->hal_ctx, UVCD_FS_CHN);
+	RSS_HAL_CALL(p->cam.ops, fs_destroy_channel, p->cam.hal_ctx, UVCD_FS_CHN);
 	return ret;
 }
 
@@ -1259,11 +469,24 @@ static void teardown_channel(uvcd_pipeline_t *p)
 	rss_cell_t fs_cell = {RSS_DEV_FS, UVCD_FS_CHN, 0};
 	rss_cell_t enc_cell = {RSS_DEV_ENC, UVCD_ENC_CHN, 0};
 
-	RSS_HAL_CALL(p->ops, unbind, p->hal_ctx, &fs_cell, &enc_cell);
-	RSS_HAL_CALL(p->ops, enc_unregister_channel, p->hal_ctx, UVCD_ENC_CHN);
-	RSS_HAL_CALL(p->ops, enc_destroy_channel, p->hal_ctx, UVCD_ENC_CHN);
-	RSS_HAL_CALL(p->ops, enc_destroy_group, p->hal_ctx, UVCD_ENC_CHN);
-	RSS_HAL_CALL(p->ops, fs_destroy_channel, p->hal_ctx, UVCD_FS_CHN);
+	RSS_HAL_CALL(p->cam.ops, unbind, p->cam.hal_ctx, &fs_cell, &enc_cell);
+	RSS_HAL_CALL(p->cam.ops, enc_unregister_channel, p->cam.hal_ctx, UVCD_ENC_CHN);
+	RSS_HAL_CALL(p->cam.ops, enc_destroy_channel, p->cam.hal_ctx, UVCD_ENC_CHN);
+	RSS_HAL_CALL(p->cam.ops, enc_destroy_group, p->cam.hal_ctx, UVCD_ENC_CHN);
+	RSS_HAL_CALL(p->cam.ops, fs_destroy_channel, p->cam.hal_ctx, UVCD_FS_CHN);
+}
+
+/* Keep the encoder at the sensor's rate, which exposure priority may move
+ * below the negotiated one, so rate control holds bits per second. */
+static void sync_encoder_rate(uvcd_pipeline_t *p)
+{
+	uint32_t fps = p->cam.sensor_fps;
+
+	if (!p->configured || !fps || fps == p->enc_fps)
+		return;
+	if (RSS_HAL_CALL(p->cam.ops, enc_set_fps, p->cam.hal_ctx, UVCD_ENC_CHN, fps, 1) != RSS_OK)
+		LOGW("encoder rate %u rejected", fps);
+	p->enc_fps = fps; /* either way: not retried every tick */
 }
 
 int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
@@ -1278,46 +501,46 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 
 	uvcd_pipeline_stop(p);
 
-	int ret = hal_bring_up(p);
+	/* Normally already up since daemon start; this retries one that
+	 * failed then. */
+	int ret = uvcd_camera_up(&p->cam);
 	if (ret != RSS_OK)
 		return ret;
-
-	/* The sensor sets the pace: a 30 fps channel on a 25 fps sensor still
-	 * delivers 25 while the host was promised 30. */
-	set_sensor_fps(p, uvcd_interval_fps(interval));
+	ret = uvcd_camera_acquire(&p->cam, frame, uvcd_interval_fps(interval));
+	if (ret != RSS_OK)
+		return ret;
 
 	ret = configure_channel(p, format, frame, interval);
-	if (ret != RSS_OK)
+	if (ret != RSS_OK) {
+		uvcd_camera_release(&p->cam);
 		return ret;
-	apply_csc(p, format);
+	}
 	p->configured = true;
 	p->cur_format = format;
 	p->cur_frame = frame;
 	p->cur_interval = interval;
+	p->enc_fps = uvcd_interval_fps(interval);
 
 	/* Put the SDK's capture timestamps on CLOCK_MONOTONIC, the clock the
 	 * gadget stamps USB payloads with, so a frame's PTS is when the
 	 * sensor captured it rather than when it finished encoding. Redone on
 	 * every start so the two clocks never drift far apart. */
-	p->ts_rebased = RSS_HAL_CALL(p->ops, sys_rebase_timestamp, p->hal_ctx,
-				     monotonic_us()) == RSS_OK;
+	p->ts_rebased = RSS_HAL_CALL(p->cam.ops, sys_rebase_timestamp, p->cam.hal_ctx,
+				     uvcd_monotonic_us()) == RSS_OK;
 	if (!p->ts_rebased)
 		LOGW("SDK timestamp rebase failed; stamping frames on receipt");
 
-	ret = RSS_HAL_CALL(p->ops, fs_enable_channel, p->hal_ctx, UVCD_FS_CHN);
+	ret = RSS_HAL_CALL(p->cam.ops, fs_enable_channel, p->cam.hal_ctx, UVCD_FS_CHN);
 	if (ret != RSS_OK)
 		goto fail_start;
-	ret = RSS_HAL_CALL(p->ops, enc_start, p->hal_ctx, UVCD_ENC_CHN);
+	ret = RSS_HAL_CALL(p->cam.ops, enc_start, p->cam.hal_ctx, UVCD_ENC_CHN);
 	if (ret != RSS_OK) {
-		RSS_HAL_CALL(p->ops, fs_disable_channel, p->hal_ctx, UVCD_FS_CHN);
+		RSS_HAL_CALL(p->cam.ops, fs_disable_channel, p->cam.hal_ctx, UVCD_FS_CHN);
 		goto fail_start;
 	}
 
-	/* Now that there is a frame rate to hold or give up: manual exposure
-	 * with exposure priority may need a slower sensor. And metering can
-	 * follow the channel's view. */
-	uvcd_apply_exposure(p, &p->controls);
-	uvcd_apply_metering(p, &p->controls);
+	uvcd_camera_stream_on(&p->cam, format);
+	sync_encoder_rate(p);
 
 	p->frame.seq = 0;
 	p->frame.len = 0;
@@ -1325,21 +548,23 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 	if (pthread_create(&p->pump_tid, NULL, pump_thread, p) != 0) {
 		LOGE("pump thread create failed");
 		p->pump_run = 0;
-		RSS_HAL_CALL(p->ops, enc_stop, p->hal_ctx, UVCD_ENC_CHN);
-		RSS_HAL_CALL(p->ops, fs_disable_channel, p->hal_ctx, UVCD_FS_CHN);
+		RSS_HAL_CALL(p->cam.ops, enc_stop, p->cam.hal_ctx, UVCD_ENC_CHN);
+		RSS_HAL_CALL(p->cam.ops, fs_disable_channel, p->cam.hal_ctx, UVCD_FS_CHN);
 		teardown_channel(p);
 		p->configured = false;
+		uvcd_camera_release(&p->cam);
 		return -1;
 	}
 
 	p->running = true;
-	LOGI("pipeline started (on demand)");
+	LOGI("stream started");
 	return RSS_OK;
 
 fail_start:
-	LOGE("pipeline enable failed: %d", ret);
+	LOGE("stream enable failed: %d", ret);
 	teardown_channel(p);
 	p->configured = false;
+	uvcd_camera_release(&p->cam);
 	return ret;
 }
 
@@ -1370,32 +595,57 @@ void uvcd_pipeline_stop(uvcd_pipeline_t *p)
 		pthread_join(p->pump_tid, NULL);
 	}
 	if (p->running) {
-		RSS_HAL_CALL(p->ops, enc_stop, p->hal_ctx, UVCD_ENC_CHN);
-		RSS_HAL_CALL(p->ops, fs_disable_channel, p->hal_ctx, UVCD_FS_CHN);
+		RSS_HAL_CALL(p->cam.ops, enc_stop, p->cam.hal_ctx, UVCD_ENC_CHN);
+		RSS_HAL_CALL(p->cam.ops, fs_disable_channel, p->cam.hal_ctx, UVCD_FS_CHN);
 		p->running = false;
 	}
 	if (p->configured) {
 		teardown_channel(p);
 		p->configured = false;
-		LOGI("pipeline torn down (no host attached)");
+		p->enc_fps = 0;
+		uvcd_camera_release(&p->cam);
+		LOGI("stream torn down; camera idle");
 	}
+}
+
+/* A new zoom/pan/tilt. Without a stream the camera just moves its view.
+ * A stream's view is its framesource crop: AutoZoom crops AFTER scaling on
+ * T31, so re-create the channels with a front crop instead, and zoom never
+ * needs a sensor-wide 7680-pixel scaler output. If the SDK rejects the new
+ * view, the old one comes back. */
+static int apply_view(uvcd_pipeline_t *p, struct uvcd_control_state *c, size_t field)
+{
+	if (!p->configured)
+		return uvcd_camera_apply(&p->cam, c, field);
+	if (!uvcd_camera_view_moves(&p->cam, c))
+		return RSS_OK;
+
+	struct uvcd_control_state old = p->controls;
+	uint8_t format = p->cur_format, frame = p->cur_frame;
+	uint32_t interval = p->cur_interval;
+	uvcd_pipeline_stop(p);
+	p->controls = *c;
+	int ret = uvcd_pipeline_start(p, format, frame, interval);
+	p->controls = old;
+	if (ret != RSS_OK) {
+		LOGW("view change failed; restoring previous view");
+		uvcd_pipeline_start(p, format, frame, interval);
+	}
+	return ret;
+}
+
+int uvcd_pipeline_apply(uvcd_pipeline_t *p, struct uvcd_control_state *next, size_t field)
+{
+	if (field == offsetof(struct uvcd_control_state, zoom) ||
+	    field == offsetof(struct uvcd_control_state, pan) ||
+	    field == offsetof(struct uvcd_control_state, tilt))
+		return apply_view(p, next, field);
+	return uvcd_camera_apply(&p->cam, next, field);
 }
 
 void uvcd_pipeline_tick(uvcd_pipeline_t *p)
 {
-	exposure_priority_tick(p);
-	subject_metering_tick(p);
-
-	if (!p->hal_up || p->configured) {
-		p->idle_since_ms = 0;
-		return;
-	}
-
-	int64_t now = monotonic_ms();
-	if (!p->idle_since_ms) {
-		p->idle_since_ms = now;
-		return;
-	}
-	if (now - p->idle_since_ms >= UVCD_HAL_LINGER_MS)
-		hal_shut_down(p);
+	uvcd_camera_tick(&p->cam);
+	sync_encoder_rate(p);
+	camera_guard_tick(p);
 }

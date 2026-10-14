@@ -3,6 +3,7 @@
  * --gc-sections to discard hardware paths. */
 #define UVCD_CONFIG_DIR "/tmp/uvcd-startup-test"
 #define UVCD_CONFIG_PATH UVCD_CONFIG_DIR "/uvcd.conf"
+#define UVCD_RUN_DIR UVCD_CONFIG_DIR
 #include <assert.h>
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -51,6 +52,7 @@ static void clean(void)
 	unlink(UVCD_CONFIG_GOOD_PATH);
 	unlink(UVCD_CONFIG_DIRTY_PATH);
 	unlink(UVCD_CONFIG_PATH ".rejected");
+	unlink(UVCD_CAMERA_GUARD_PATH);
 }
 
 int main(void)
@@ -94,6 +96,56 @@ int main(void)
 	assert(p.good.brightness == 128 && p.unproven_streak == 0);
 	assert(!exists(UVCD_CONFIG_PATH) && exists(UVCD_CONFIG_PATH ".rejected"));
 	assert(!exists(UVCD_CONFIG_GOOD_PATH) && !exists(UVCD_CONFIG_DIRTY_PATH));
+
+	/* The camera-side guard counts the same way, from RAM: a daemon that
+	 * crashed outside a stream falls back too ... */
+	clean();
+	write_raw(UVCD_CONFIG_PATH, "brightness=150\n");
+	write_raw(UVCD_CONFIG_GOOD_PATH, "brightness=140\n");
+	write_raw(UVCD_CAMERA_GUARD_PATH, "1\n");
+	memset(&p, 0, sizeof(p));
+	assert(load_controls(&p) == 0);
+	assert(p.controls.brightness == 140 && p.unproven_streak == 1);
+	/* ... a crash both guards saw is one run, not two ... */
+	write_raw(UVCD_CONFIG_PATH, "brightness=150\n");
+	write_raw(UVCD_CONFIG_DIRTY_PATH, "1\n");
+	memset(&p, 0, sizeof(p));
+	assert(load_controls(&p) == 0);
+	assert(p.controls.brightness == 140 && p.unproven_streak == 1);
+	/* ... and a run of them goes to factory, clearing both. */
+	write_raw(UVCD_CAMERA_GUARD_PATH, "2\n");
+	memset(&p, 0, sizeof(p));
+	assert(load_controls(&p) == 0);
+	assert(p.controls.brightness == 128 && p.unproven_streak == 0);
+	assert(!exists(UVCD_CAMERA_GUARD_PATH) && !exists(UVCD_CONFIG_DIRTY_PATH));
+
+	/* Armed on top of the runs before it, once; a camera that is down
+	 * takes nothing in, so there is nothing to guard. */
+	clean();
+	memset(&p, 0, sizeof(p));
+	p.unproven_streak = 1;
+	uvcd_pipeline_camera_guard_arm(&p);
+	assert(!p.camera_guard_armed && !exists(UVCD_CAMERA_GUARD_PATH));
+	p.cam.up = true;
+	uvcd_pipeline_camera_guard_arm(&p);
+	assert(p.camera_guard_armed && uvcd_config_streak_read(UVCD_CAMERA_GUARD_PATH) == 2);
+	/* A clean exit is no crash: the file goes, the streak stays. */
+	camera_guard_clear(&p, false);
+	assert(!exists(UVCD_CAMERA_GUARD_PATH) && p.unproven_streak == 1);
+	/* Proven by the camera running on what it got; each change restarts
+	 * the wait. */
+	uvcd_pipeline_camera_guard_arm(&p);
+	p.camera_guard_since_ms -= UVCD_CONFIG_HEALTHY_MS - 1000;
+	camera_guard_tick(&p);
+	assert(p.camera_guard_armed);
+	uvcd_pipeline_camera_guard_arm(&p);
+	p.camera_guard_since_ms -= UVCD_CONFIG_HEALTHY_MS - 1000;
+	camera_guard_tick(&p);
+	assert(p.camera_guard_armed);
+	p.camera_guard_since_ms -= 1000;
+	camera_guard_tick(&p);
+	assert(!p.camera_guard_armed && p.unproven_streak == 0);
+	assert(!exists(UVCD_CAMERA_GUARD_PATH));
 
 	clean();
 	rmdir(UVCD_CONFIG_DIR);

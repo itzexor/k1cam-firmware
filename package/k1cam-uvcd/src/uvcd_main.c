@@ -128,9 +128,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* The crash guard is armed per stream (uvcd_gadget.c), not here: an
-	 * idle daemon can't be crashed by its controls, and a camera unplugged
-	 * while idle must keep its settings. */
+	/* The crash guards are armed where controls reach the camera: per
+	 * stream on flash (uvcd_gadget.c), and outside a stream in RAM
+	 * (uvcd_pipeline.c), so a camera unplugged while idle keeps its
+	 * settings. */
 	LOGI("uvcd running, device=%s", device);
 	int ret = uvcd_gadget_run(&pipe_state, device);
 

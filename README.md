@@ -13,7 +13,9 @@ standard UVC webcam (so far tested with Linux hosts), with:
 - settings that persist across reboots, with a factory reset;
 - a shell on the USB serial (ACM) port.
 
-The camera only runs its image pipeline while a program is streaming.
+The sensor and ISP run from boot, at the default 1080p and 30 fps, so
+exposure and white balance are already settled when a program starts
+streaming. Capture and encoding only run while a program is streaming.
 
 ## Build
 

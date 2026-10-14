@@ -6,9 +6,14 @@
  * standard UVC PROBE/COMMIT/STREAMON/STREAMOFF requests from the USB host,
  * and settings arrive as UVC controls (or from the camera's own shell over
  * the local socket in uvcd_ctl.c). The daemon saves every accepted change
- * itself to UVCD_CONFIG_PATH and reloads it at startup (uvcd_config.c). When no host is streaming, the framesource and encoder
- * channels are torn down at once, and the sensor, ISP and IMP system follow
- * after UVCD_HAL_LINGER_MS: an idle camera does no imaging work at all.
+ * itself to UVCD_CONFIG_PATH and reloads it at startup (uvcd_config.c).
+ *
+ * Two layers. The camera (uvcd_camera.c) is the sensor, ISP and IMP system:
+ * it comes up with the daemon and stays up, so auto-exposure, white balance
+ * and metering are already settled when a host starts streaming, and every
+ * control applies to it live. A stream (uvcd_pipeline.c) is the framesource
+ * and encoder channels plus the thread that hands frames to the gadget; it
+ * exists only while a host streams, and leases the camera for that time.
  */
 #ifndef UVCD_H
 #define UVCD_H
@@ -17,7 +22,21 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
+#include <time.h>
 #include <raptor_hal.h>
+
+static inline int64_t uvcd_monotonic_us(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static inline int64_t uvcd_monotonic_ms(void)
+{
+	return uvcd_monotonic_us() / 1000;
+}
 
 /* --------------------------------------------------------------------------
  * Logging -- kernel ring buffer (/dev/kmsg) when daemonized, stderr in the
@@ -81,12 +100,11 @@ extern const uint32_t uvcd_intervals[UVCD_NUM_INTERVALS];
 uint32_t uvcd_snap_interval(uint32_t interval);
 uint32_t uvcd_interval_fps(uint32_t interval);
 
-/* How long the sensor/ISP stay up after the last stream stops. Bringing
- * them back costs about half a second before the first frame, and hosts
- * routinely close and reopen a stream within a second or two (players
- * seeking, browsers enumerating, Windows' frame server), so each of those
- * would otherwise pay it. */
-#define UVCD_HAL_LINGER_MS 5000
+/* With no stream, the camera runs the default output's rate and view (the
+ * UVC default is 1080p at 30 fps), so the most common stream starts on
+ * exactly what the camera is already doing. */
+#define UVCD_IDLE_FPS 30
+#define UVCD_IDLE_FRAME UVCD_FRAME_1080P
 
 #define UVCD_MAX_BUFFERS 4
 #define UVCD_ENC_CHN 0
@@ -210,7 +228,7 @@ struct uvcd_frame_buf {
 };
 
 /* --------------------------------------------------------------------------
- * Pipeline state (sensor + FS + encoder channel currently configured)
+ * Camera: sensor + ISP + IMP system -- uvcd_camera.c
  */
 typedef struct {
 	rss_hal_ctx_t *hal_ctx;
@@ -218,27 +236,43 @@ typedef struct {
 	const rss_hal_caps_t *caps;
 
 	/* Sensor identity, read from procfs once at init and handed to every
-	 * HAL bring-up. */
+	 * bring-up. */
 	rss_sensor_config_t sensor;
 	int sensor_w, sensor_h;
 	int isp_clk_hz; /* tx-isp's isp_clk parameter; 0 if unknown */
 
-	/* Sensor + ISP + IMP system initialized (hal init done). Brought up by
-	 * uvcd_pipeline_start(), taken down by uvcd_pipeline_idle() once no
-	 * channel has been configured for UVCD_HAL_LINGER_MS. */
-	bool hal_up;
-	int64_t idle_since_ms; /* 0 = not counting */
+	/* The daemon's live controls (uvcd_pipeline_t.controls): what a
+	 * bring-up applies and the periodic loops read. A change arrives
+	 * through uvcd_camera_apply() before it is stored there. */
+	const struct uvcd_control_state *controls;
+
+	/* Sensor + ISP + IMP system initialized. Up from daemon start to exit,
+	 * unless bring-up failed; then a stream start tries again. */
+	bool up;
+	bool brought_up_once;
+
+	/* A stream holds the camera: its output size and negotiated rate. With
+	 * none, the camera runs UVCD_IDLE_FRAME at UVCD_IDLE_FPS. */
+	bool leased;
+	uint8_t lease_frame;
+	uint32_t lease_fps;
 
 	/* The rate the sensor is actually running at, which exposure priority
 	 * may hold below the negotiated one. 0 = not set since bring-up. */
 	uint32_t sensor_fps;
 	int64_t priority_checked_ms;
 
-	/* The part of the sensor image the channel shows (zoom/pan/tilt),
-	 * sensor pixels. Metering weights follow it. */
+	/* The part of the sensor image the output shows (zoom/pan/tilt), in
+	 * sensor pixels, for output size view_frame. Metering follows it. */
+	uint8_t view_frame;
 	struct {
 		int x, y, w, h;
 	} view;
+
+	/* The metering mode whose weights are in the ISP for this view. Not
+	 * valid after a bring-up or a view change, until they are written. */
+	bool metering_valid;
+	int metering_mode;
 
 	/* The tuning file's own metering weights, read at the first bring-up,
 	 * for UVCD_METERING_TUNING. */
@@ -253,17 +287,7 @@ typedef struct {
 	uint8_t subject_written[15][15];
 	float ae_comp_cut;
 	int64_t subject_checked_ms, guard_checked_ms;
-
-	/* The one runtime copy of every control -- loaded from UVCD_CONFIG_PATH
-	 * (or compiled-in defaults) at init, changed in place by the gadget's
-	 * control paths, and read here when the encoder channel is created. */
-	struct uvcd_control_state controls;
-	/* The controls last proven by a healthy stream, as in
-	 * UVCD_CONFIG_GOOD_PATH: what a crash falls back to. */
-	struct uvcd_control_state good;
-	/* Streams in a row that started without proving healthy, from the
-	 * crash guard file (uvcd_config.h); 0 once one does. */
-	int unproven_streak;
+	int64_t metering_tried_ms;
 
 	/* The ISP's factory gamma curve, read once after HAL init. Scaling
 	 * this rather than synthesizing a curve from scratch keeps gamma=100
@@ -271,13 +295,83 @@ typedef struct {
 	 * having to guess the table's undocumented value range. */
 	uint16_t gamma_ref[UVCD_GAMMA_POINTS];
 	bool gamma_ref_valid;
+} uvcd_camera_t;
 
-	/* Currently configured/running pipeline (0 = torn down) */
+/* Create the HAL context and read the sensor's identity. Does not bring the
+ * camera up. `controls` stays the camera's view of the live controls. */
+int uvcd_camera_init(uvcd_camera_t *cam, const struct uvcd_control_state *controls);
+/* Take the camera down and release the HAL context. */
+void uvcd_camera_deinit(uvcd_camera_t *cam);
+
+/* Bring the sensor, ISP and IMP system up with every control applied, at
+ * the lease's rate and view or the idle ones. Idempotent. */
+int uvcd_camera_up(uvcd_camera_t *cam);
+void uvcd_camera_down(uvcd_camera_t *cam);
+
+/* A stream takes the camera for output size `frame` at `fps`: the sensor
+ * rate and the view follow. Call before creating the stream's channels,
+ * which take their crop from cam->view, then uvcd_camera_stream_on() once
+ * they exist. Fails only if the camera is down. */
+int uvcd_camera_acquire(uvcd_camera_t *cam, uint8_t frame, uint32_t fps);
+/* The stream's channels exist: colour space for `format`, then exposure
+ * for the rate and metering for the view. */
+void uvcd_camera_stream_on(uvcd_camera_t *cam, uint8_t format);
+/* The stream is gone: back to the idle rate and view. */
+void uvcd_camera_release(uvcd_camera_t *cam);
+
+/* Call periodically: subject metering whenever the camera is up, exposure
+ * priority while a stream holds it. */
+void uvcd_camera_tick(uvcd_camera_t *cam);
+
+/* Apply one control, the field at `field` (offsetof in struct
+ * uvcd_control_state), from the whole state `next`, before the caller
+ * stores it. Leaving an automatic mode fills in the value the automatic
+ * one was using (white-balance temperature, exposure time) in `next`.
+ * With the camera down this applies nothing and succeeds: the value takes
+ * effect at the next bring-up. Fields that are not the camera's (encoder
+ * settings) succeed without effect. Returns 0 or a negative RSS_ERR_* /
+ * errno value. */
+int uvcd_camera_apply(uvcd_camera_t *cam, struct uvcd_control_state *next, size_t field);
+
+/* Whether `c`'s zoom/pan/tilt would move the view of the current output. */
+bool uvcd_camera_view_moves(const uvcd_camera_t *cam, const struct uvcd_control_state *c);
+
+/* The exposure time auto-exposure is using now, 100 us units, or -1. */
+int uvcd_camera_live_exposure(uvcd_camera_t *cam);
+
+/* The colour temperature the ISP's auto white balance currently measures,
+ * in Kelvin, or -1 when the camera is down or the ISP won't say. */
+int uvcd_camera_awb_ct(uvcd_camera_t *cam);
+
+/* --------------------------------------------------------------------------
+ * Pipeline: the camera plus the stream that leases it -- uvcd_pipeline.c
+ */
+typedef struct {
+	uvcd_camera_t cam;
+
+	/* The one runtime copy of every control -- loaded from UVCD_CONFIG_PATH
+	 * (or compiled-in defaults) at init, changed in place by the gadget's
+	 * control paths, read by the camera and when the encoder channel is
+	 * created. */
+	struct uvcd_control_state controls;
+	/* The controls last proven by a healthy stream, as in
+	 * UVCD_CONFIG_GOOD_PATH: what a crash falls back to. */
+	struct uvcd_control_state good;
+	/* Runs in a row that ended in a crash before proving their controls,
+	 * from the crash guard files (uvcd_config.h); 0 once one proves them. */
+	int unproven_streak;
+	/* The camera-side crash guard (UVCD_CAMERA_GUARD_PATH): armed when
+	 * controls not yet proven reach the camera outside a stream. */
+	bool camera_guard_armed;
+	int64_t camera_guard_since_ms;
+
+	/* Currently configured/running stream (0 = torn down) */
 	bool configured;
 	bool running;
 	uint8_t cur_format; /* UVCD_FMT_* */
 	uint8_t cur_frame;  /* UVCD_FRAME_* */
 	uint32_t cur_interval;
+	uint32_t enc_fps; /* the rate the encoder was last told */
 
 	/* The SDK's frame timestamps were rebased onto CLOCK_MONOTONIC at
 	 * start; if not, frames are stamped when the pump receives them. */
@@ -289,36 +383,21 @@ typedef struct {
 	struct uvcd_frame_buf frame;
 } uvcd_pipeline_t;
 
+/* Load the controls (falling back after a crash), set up the camera and
+ * bring it up. Fails only if the sensor is not there at all; a camera that
+ * would not come up is tried again at the first stream. */
 int uvcd_pipeline_init(uvcd_pipeline_t *p);
 void uvcd_pipeline_deinit(uvcd_pipeline_t *p);
 
-/* Translate the two UVC controls whose HAL shape is not a plain scalar.
- * Both live here rather than in uvcd_gadget.c because both the gadget's
- * control path and pipeline bring-up need them, and both are HAL-specific.
- * Return 0 on success, or a negative RSS_ERR_* / errno value. */
-int uvcd_apply_gamma(uvcd_pipeline_t *p, int gamma_x100);
-int uvcd_apply_wb(uvcd_pipeline_t *p, int temp_kelvin, int auto_on);
+/* Apply one control (as uvcd_camera_apply) before the caller stores it. A
+ * view change while streaming re-creates the stream's channels on the new
+ * crop, keeping the old view if that fails. */
+int uvcd_pipeline_apply(uvcd_pipeline_t *p, struct uvcd_control_state *next, size_t field);
 
-/* Camera Terminal and orientation controls. Each takes the full control
- * state rather than one value, so a caller can apply a change before
- * storing it (uvcd_ctrl_set stores only what the ISP accepted). Exposure
- * and the view also need a configured channel for the frame rate and the
- * output size; without one they apply what they can and the rest follows
- * at the next stream start. */
-int uvcd_apply_exposure(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
-int uvcd_apply_view(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
-int uvcd_apply_metering(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
-/* Exposure compensation, less what subject metering's highlight guard
- * holds back. */
-int uvcd_apply_ae_comp(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
-int uvcd_apply_rotation(uvcd_pipeline_t *p, const struct uvcd_control_state *c);
-
-/* The exposure time auto-exposure is using now, 100 us units, or -1. */
-int uvcd_live_exposure(uvcd_pipeline_t *p);
-
-/* The colour temperature the ISP's auto white balance currently measures,
- * in Kelvin, or -1 when the HAL is down or the ISP won't say. */
-int uvcd_awb_current_ct(uvcd_pipeline_t *p);
+/* Arm the camera-side crash guard: a change is about to reach the camera
+ * outside a stream. Proven once the camera has run UVCD_CONFIG_HEALTHY_MS
+ * since, or released by a clean exit. */
+void uvcd_pipeline_camera_guard_arm(uvcd_pipeline_t *p);
 
 /* Encoder settings. Each returns 0 when the setting is stored for the next
  * channel creation and, where T31 allows it, already applied live. */
@@ -331,27 +410,19 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p);
  * restarts at 0; the caller must resync anything that tracks it. */
 bool uvcd_pipeline_restart_encoder(uvcd_pipeline_t *p, uint8_t format);
 
-/* Bring up the sensor/ISP if they are down, then FS+encoder for
- * (format,frame) if not already configured for it, then enable the channel
- * and start the pump thread. Idempotent. */
+/* Lease the camera (bringing it up if it is down) and create FS+encoder
+ * for (format,frame) if not already configured for it, then enable the
+ * channel and start the pump thread. Idempotent. */
 int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 			uint32_t interval);
 
-/* Stop the pump thread and fully tear down FS+encoder. The sensor/ISP stay
- * up until uvcd_pipeline_idle() lets them go. */
+/* Stop the pump thread, fully tear down FS+encoder and release the camera
+ * back to idle. */
 void uvcd_pipeline_stop(uvcd_pipeline_t *p);
 
-/* Call periodically from the main loop: runs exposure priority and subject
- * metering while streaming, and takes the sensor, ISP and IMP system down
- * once no channel has been configured for UVCD_HAL_LINGER_MS. */
+/* Call periodically from the main loop: the camera's loops, the encoder
+ * following the sensor's rate, and the camera-side crash guard. */
 void uvcd_pipeline_tick(uvcd_pipeline_t *p);
-
-/* True while the HAL is initialized. ISP calls are only valid then; while it
- * is down, controls are stored and applied at the next bring-up. */
-static inline bool uvcd_pipeline_hal_up(const uvcd_pipeline_t *p)
-{
-	return p->hal_up;
-}
 
 /* --------------------------------------------------------------------------
  * Gadget (UVC + kernel webcam device) -- uvcd_gadget.c
