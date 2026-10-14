@@ -100,10 +100,14 @@ extern const uint32_t uvcd_intervals[UVCD_NUM_INTERVALS];
 uint32_t uvcd_snap_interval(uint32_t interval);
 uint32_t uvcd_interval_fps(uint32_t interval);
 
-/* With no stream, the camera runs the default output's rate and view (the
- * UVC default is 1080p at 30 fps), so the most common stream starts on
- * exactly what the camera is already doing. */
+/* With no stream, the camera runs the default output's view (the UVC
+ * default is 1080p at 30 fps), so the most common stream starts on exactly
+ * what the camera is already doing. It runs at UVCD_IDLE_FPS until exposure
+ * has settled, then at UVCD_IDLE_SLOW_FPS until the scene changes, with
+ * exposure held to what fits a UVCD_IDLE_FPS frame so that a stream at
+ * that rate starts on the same exposure. */
 #define UVCD_IDLE_FPS 30
+#define UVCD_IDLE_SLOW_FPS 5
 #define UVCD_IDLE_FRAME UVCD_FRAME_1080P
 
 #define UVCD_MAX_BUFFERS 4
@@ -261,6 +265,21 @@ typedef struct {
 	 * may hold below the negotiated one. 0 = not set since bring-up. */
 	uint32_t sensor_fps;
 	int64_t priority_checked_ms;
+
+	/* Idle pacing (uvcd_camera_tick): settling at UVCD_IDLE_FPS until
+	 * brightness and exposure hold still, then settled at
+	 * UVCD_IDLE_SLOW_FPS until either moves away from what it settled on.
+	 * it_max_idle is auto-exposure's integration limit at UVCD_IDLE_FPS,
+	 * in sensor lines, applied while slow (it_capped); 0 = unknown, and
+	 * idle then stays at UVCD_IDLE_FPS. it_max_slow is the SDK's own limit
+	 * at UVCD_IDLE_SLOW_FPS, which a stream at that rate gets back. */
+	bool idle_settled;
+	bool it_capped;
+	uint32_t it_max_idle, it_max_slow;
+	int64_t settle_since_ms, idle_checked_ms;
+	int idle_samples, idle_changed;
+	float idle_l[3], idle_ev[3]; /* settling: the last three samples */
+	float settled_l, settled_ev;
 
 	/* The part of the sensor image the output shows (zoom/pan/tilt), in
 	 * sensor pixels, for output size view_frame. Metering follows it. */

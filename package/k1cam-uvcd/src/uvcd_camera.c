@@ -2,9 +2,10 @@
  * uvcd_camera.c -- the sensor, ISP and IMP system, as one long-lived camera
  *
  * The camera comes up with the daemon and stays up until it exits. With no
- * stream it runs the default output's view at UVCD_IDLE_FPS, so
- * auto-exposure, white balance and metering keep following the scene, and
- * a host that starts streaming gets a settled picture from the first
+ * stream it runs the default output's view, at UVCD_IDLE_FPS while
+ * exposure settles and UVCD_IDLE_SLOW_FPS once it has (idle pacing, below),
+ * so auto-exposure, white balance and metering keep following the scene,
+ * and a host that starts streaming gets a settled picture from the first
  * frame. A stream leases the camera (uvcd_camera_acquire): the lease sets
  * the frame rate, the view of the negotiated output size and the colour
  * space, and releasing it returns to idle. Every control applies here,
@@ -266,12 +267,41 @@ static void set_sensor_fps(uvcd_camera_t *cam, uint32_t fps)
 	if (cam->sensor_fps)
 		LOGI("sensor at %u fps", fps);
 	cam->sensor_fps = fps;
+	/* A new rate brings the SDK's own integration limit for it. */
+	cam->it_capped = false;
 }
 
-/* The rate the output runs at: the stream's negotiated one, else idle. */
+/* The rate the output runs at: the stream's negotiated one, else idle's. */
 static uint32_t output_fps(const uvcd_camera_t *cam)
 {
-	return cam->leased ? cam->lease_fps : UVCD_IDLE_FPS;
+	if (cam->leased)
+		return cam->lease_fps;
+	return cam->idle_settled && cam->it_max_idle ? UVCD_IDLE_SLOW_FPS : UVCD_IDLE_FPS;
+}
+
+/* At the slow idle rate a frame has room for far longer exposures than a
+ * UVCD_IDLE_FPS one, and auto-exposure would take them, trading gain for
+ * exposure time; a stream at that rate would then start on an exposure
+ * that no longer fits its frames. Hold the limit to the UVCD_IDLE_FPS one.
+ * If the ISP refuses, idle stays at UVCD_IDLE_FPS. */
+static void apply_idle_cap(uvcd_camera_t *cam)
+{
+	if (cam->it_capped)
+		return;
+	/* Still the SDK's own limit for this rate: keep it for a stream that
+	 * runs the same rate (uvcd_camera_acquire). */
+	uint32_t it = 0;
+	if (!cam->it_max_slow &&
+	    RSS_HAL_CALL(cam->ops, isp_get_ae_it_max, cam->hal_ctx, &it) == RSS_OK)
+		cam->it_max_slow = it;
+	if (RSS_HAL_CALL(cam->ops, isp_set_ae_it_max, cam->hal_ctx, cam->it_max_idle) == RSS_OK) {
+		cam->it_capped = true;
+		return;
+	}
+	LOGW("AE integration limit %u rejected; idle stays at %d fps", cam->it_max_idle,
+	     UVCD_IDLE_FPS);
+	cam->it_max_idle = 0;
+	set_sensor_fps(cam, UVCD_IDLE_FPS);
 }
 
 /* One listed step, at most `ceiling`, with a 15 fps priority floor.
@@ -388,6 +418,8 @@ static int apply_exposure(uvcd_camera_t *cam, const struct uvcd_control_state *c
 			}
 		}
 		set_sensor_fps(cam, fps);
+		if (fps == UVCD_IDLE_SLOW_FPS && !cam->leased)
+			apply_idle_cap(cam);
 		uint32_t running_fps = cam->sensor_fps ? cam->sensor_fps : fps;
 		if (us > 1000000 / running_fps)
 			us = 1000000 / running_fps;
@@ -400,6 +432,8 @@ static int apply_exposure(uvcd_camera_t *cam, const struct uvcd_control_state *c
 		/* Auto: start from the output's rate; with exposure priority
 		 * on, a stream's tick slows it down if the light calls for it. */
 		set_sensor_fps(cam, fps);
+		if (fps == UVCD_IDLE_SLOW_FPS && !cam->leased)
+			apply_idle_cap(cam);
 	}
 	cam->priority_checked_ms = uvcd_monotonic_ms();
 
@@ -574,13 +608,17 @@ static int apply_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c
  *   the brightest UVCD_GUARD_TOP of the picture: while it clips,
  *   exposure compensation is held back a step at a time (to at most
  *   UVCD_GUARD_MAX_CUT); once it sits well below clipping, it is given
- *   back. Anything smaller than UVCD_GUARD_TOP, such as a glint, may clip. */
+ *   back. Anything smaller than UVCD_GUARD_TOP, such as a glint, may clip.
+ *   It only judges a picture auto-exposure has locked on: the frames right
+ *   after the light goes up clip until AE catches up, and holding the
+ *   compensation back for those left the picture dark for seconds after
+ *   (in flickering light, ~8 s after the cut reached its floor). */
 #define UVCD_SUBJECT_PERIOD_MS 500
 #define UVCD_SUBJECT_RATIO_LO 1.5f /* zone / median: no extra weight below */
 #define UVCD_SUBJECT_RATIO_HI 3.0f /* full weight from here */
 #define UVCD_SUBJECT_MEDIAN_FLOOR 4.0f /* below it, ratios are dark-zone noise */
 #define UVCD_SUBJECT_EASE 0.5f     /* of the way to the target, per period */
-#define UVCD_GUARD_PERIOD_MS 1000  /* lets auto-exposure settle in between */
+#define UVCD_GUARD_PERIOD_MS 1000  /* at most one step per period */
 #define UVCD_GUARD_TOP 0.01f       /* the brightest 1% of the picture */
 /* The histogram is linear, taken before the gamma curve: on the K1, bin 219
  * came out at 251 of 255, bin 200 at about 238 and bin 150 at about 211.
@@ -684,6 +722,24 @@ static void highlight_guard(uvcd_camera_t *cam)
 		cam->ae_comp_cut = old_cut; /* not applied: try again next time */
 }
 
+struct uvcd_imp_ae_state { /* IMPISPAEState, T31 1.1.6 */
+	bool stable;
+	unsigned int target;
+	unsigned int mean;
+};
+
+/* Auto-exposure holds its target: GetAeState's stable is set once the
+ * metered mean is within 1 of the target and stays set while it is within
+ * -5%..+15% of it (reversed from tx-isp's ae0_tune2), and clear while AE
+ * adjusts or is pinned at a limit. Without the call, take it as locked. */
+static bool ae_locked(uvcd_camera_t *cam)
+{
+	struct uvcd_imp_ae_state state = {0};
+
+	return RSS_HAL_CALL(cam->ops, isp_get_ae_state, cam->hal_ctx, &state) != RSS_OK ||
+	       state.stable;
+}
+
 static void subject_metering_tick(uvcd_camera_t *cam)
 {
 	const struct uvcd_control_state *c = cam->controls;
@@ -695,7 +751,7 @@ static void subject_metering_tick(uvcd_camera_t *cam)
 		return;
 	cam->subject_checked_ms = now;
 	subject_weights(cam);
-	if (now - cam->guard_checked_ms >= UVCD_GUARD_PERIOD_MS) {
+	if (now - cam->guard_checked_ms >= UVCD_GUARD_PERIOD_MS && ae_locked(cam)) {
 		cam->guard_checked_ms = now;
 		highlight_guard(cam);
 	}
@@ -708,6 +764,161 @@ static int apply_rotation(uvcd_camera_t *cam, const struct uvcd_control_state *c
 	if (ret != RSS_OK)
 		return ret;
 	return RSS_HAL_CALL(cam->ops, isp_set_vflip, cam->hal_ctx, flip);
+}
+
+/* --------------------------------------------------------------------------
+ * Idle pacing. Auto-exposure and white balance take a step per frame, so
+ * idle runs at UVCD_IDLE_FPS while they settle, and at UVCD_IDLE_SLOW_FPS
+ * once they have: a sixth of the ISP work, with the scene still followed.
+ *
+ * What settled means comes from the ISP's statistics, not its AE state:
+ * GetAeState's mean is only updated while AE holds its target (it keeps
+ * the old value while AE adjusts, and while AE is pinned at a limit it
+ * never updates), so it can't see the light change. Instead, every
+ * UVCD_IDLE_PERIOD_MS: the brightness AE meters (the zone statistics under
+ * the weights in the ISP) and the exposure it uses (time x gain).
+ *
+ * - Settling: once three samples in a row agree, after at least
+ *   UVCD_SETTLE_MIN_MS, the camera has settled, also when AE is pinned at
+ *   a limit in a scene too dark or too bright for it -- nothing more full
+ *   rate could do there. UVCD_SETTLE_MAX_MS bounds a scene that never
+ *   holds still.
+ * - Settled: the scene changed when the brightness or the exposure moves
+ *   away from what it settled on, for UVCD_CHANGE_SAMPLES samples in a
+ *   row, so a single flickering frame doesn't count.
+ *
+ * A stream ending, a control that changes what AE does, and bring-up
+ * start settling again. Manual exposure has nothing to settle.
+ */
+#define UVCD_IDLE_PERIOD_MS 500
+#define UVCD_SETTLE_MIN_MS 1000  /* 30 frames at full rate, at least */
+#define UVCD_SETTLE_MAX_MS 10000
+#define UVCD_SETTLE_L_TOL 0.05f  /* brightness within 5% of the median */
+#define UVCD_SETTLE_EV_TOL 0.03f /* exposure within 3% */
+#define UVCD_CHANGE_L 1.25f      /* brightness 25% off what it settled on */
+#define UVCD_CHANGE_EV 1.10f     /* exposure 10% off */
+#define UVCD_CHANGE_SAMPLES 2
+#define UVCD_IDLE_L_FLOOR 1.0f   /* below, ratios are quantization noise */
+
+static void idle_reset(uvcd_camera_t *cam)
+{
+	cam->idle_samples = 0;
+	cam->idle_changed = 0;
+	cam->settle_since_ms = uvcd_monotonic_ms();
+}
+
+/* Settle again at UVCD_IDLE_FPS. */
+static void idle_settle(uvcd_camera_t *cam, const char *why)
+{
+	if (cam->leased)
+		return;
+	bool was = cam->idle_settled;
+	cam->idle_settled = false;
+	idle_reset(cam);
+	if (was && cam->up) {
+		LOGI("idle: %s; settling at %d fps", why, UVCD_IDLE_FPS);
+		apply_exposure(cam, cam->controls);
+	}
+}
+
+static void idle_go_slow(uvcd_camera_t *cam, float l, float ev)
+{
+	cam->idle_settled = true;
+	cam->settled_l = l;
+	cam->settled_ev = ev;
+	idle_reset(cam);
+	apply_exposure(cam, cam->controls);
+	if (cam->sensor_fps == UVCD_IDLE_SLOW_FPS)
+		LOGI("idle: settled; %d fps", UVCD_IDLE_SLOW_FPS);
+}
+
+/* The weights in the ISP now. */
+static const uint8_t (*weights_in_isp(const uvcd_camera_t *cam))[15]
+{
+	if (cam->metering_mode == UVCD_METERING_TUNING && cam->ae_weight_ref_valid)
+		return (const uint8_t(*)[15])cam->ae_weight_ref;
+	return (const uint8_t(*)[15])cam->subject_written;
+}
+
+/* Brightness as AE meters it and the exposure it uses, or false while AE
+ * has not run yet (time and gain still 0 after bring-up). */
+static bool idle_sample(uvcd_camera_t *cam, float *l, float *ev)
+{
+	rss_exposure_t e;
+	uint32_t zone[15][15];
+
+	if (RSS_HAL_CALL(cam->ops, isp_get_exposure, cam->hal_ctx, &e) != RSS_OK ||
+	    e.exposure_time == 0 || e.total_gain == 0 ||
+	    RSS_HAL_CALL(cam->ops, isp_get_ae_zone, cam->hal_ctx, zone) != RSS_OK)
+		return false;
+	const uint8_t(*w)[15] = weights_in_isp(cam);
+	float sum = 0.0f, weights = 0.0f;
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++) {
+			sum += (float)w[r][col] * (float)zone[r][col];
+			weights += w[r][col];
+		}
+	if (weights == 0.0f)
+		return false;
+	*l = sum / weights;
+	if (*l < UVCD_IDLE_L_FLOOR)
+		*l = UVCD_IDLE_L_FLOOR;
+	*ev = (float)e.exposure_time * ((float)e.total_gain / 256.0f);
+	return true;
+}
+
+static bool near(float v, float to, float tol)
+{
+	return fabsf(v - to) <= to * tol;
+}
+
+static bool moved(float v, float from, float ratio)
+{
+	return v > from * ratio || v * ratio < from;
+}
+
+static void idle_tick(uvcd_camera_t *cam)
+{
+	const struct uvcd_control_state *c = cam->controls;
+
+	if (cam->leased || !cam->it_max_idle)
+		return;
+	if (c->ae_mode == UVCD_AE_MANUAL) {
+		if (!cam->idle_settled)
+			idle_go_slow(cam, 0.0f, 0.0f);
+		return;
+	}
+	int64_t now = uvcd_monotonic_ms();
+	if (now - cam->idle_checked_ms < UVCD_IDLE_PERIOD_MS)
+		return;
+	cam->idle_checked_ms = now;
+
+	float l, ev;
+	if (!idle_sample(cam, &l, &ev))
+		return;
+	if (!cam->idle_settled) {
+		cam->idle_l[cam->idle_samples % 3] = l;
+		cam->idle_ev[cam->idle_samples % 3] = ev;
+		if (++cam->idle_samples < 3)
+			return;
+		bool steady = true;
+		for (int i = 0; i < 3; i++)
+			steady = steady && near(cam->idle_l[i], l, UVCD_SETTLE_L_TOL) &&
+				 near(cam->idle_ev[i], ev, UVCD_SETTLE_EV_TOL);
+		int64_t settling = now - cam->settle_since_ms;
+		if ((steady && settling >= UVCD_SETTLE_MIN_MS) || settling >= UVCD_SETTLE_MAX_MS)
+			idle_go_slow(cam, l, ev);
+		return;
+	}
+	if (moved(l, cam->settled_l, UVCD_CHANGE_L) || moved(ev, cam->settled_ev, UVCD_CHANGE_EV))
+		cam->idle_changed++;
+	else
+		cam->idle_changed = 0;
+	if (cam->idle_changed >= UVCD_CHANGE_SAMPLES) {
+		LOGD("idle: brightness %.1f -> %.1f, exposure %.0f -> %.0f", (double)cam->settled_l,
+		     (double)l, (double)cam->settled_ev, (double)ev);
+		idle_settle(cam, "the scene changed");
+	}
 }
 
 /* --------------------------------------------------------------------------
@@ -823,7 +1034,10 @@ int uvcd_camera_up(uvcd_camera_t *cam)
 	}
 	cam->up = true;
 	cam->sensor_fps = 0;          /* the driver boots at its own default rate */
+	cam->it_capped = false;
 	cam->metering_valid = false;  /* and the ISP with the tuning's weights */
+	cam->idle_settled = false;    /* and auto-exposure has everything to learn */
+	idle_reset(cam);
 
 	cam->caps = cam->ops->get_caps ? cam->ops->get_caps(cam->hal_ctx) : NULL;
 
@@ -873,6 +1087,18 @@ int uvcd_camera_up(uvcd_camera_t *cam)
 	apply_exposure(cam, cam->controls);
 	apply_metering(cam, cam->controls);
 
+	/* The integration limit idle holds while slow: what the SDK set for
+	 * the UVCD_IDLE_FPS just applied. */
+	cam->it_max_idle = 0;
+	uint32_t it = 0;
+	if (!cam->leased && cam->sensor_fps == UVCD_IDLE_FPS &&
+	    RSS_HAL_CALL(cam->ops, isp_get_ae_it_max, cam->hal_ctx, &it) == RSS_OK && it > 0 &&
+	    it <= UINT16_MAX)
+		cam->it_max_idle = it;
+	else
+		LOGW("no AE integration limit at %d fps; idle stays at %d fps", UVCD_IDLE_FPS,
+		     UVCD_IDLE_FPS);
+
 	LOGI("sensor + ISP up in %lld ms", (long long)(uvcd_monotonic_ms() - t0));
 	return RSS_OK;
 }
@@ -904,6 +1130,16 @@ int uvcd_camera_acquire(uvcd_camera_t *cam, uint8_t frame, uint32_t fps)
 	cam->leased = true;
 	cam->lease_frame = frame;
 	cam->lease_fps = fps;
+	/* A new rate brings the SDK's own integration limit, but setting the
+	 * rate the sensor already runs leaves idle's in place (seen at 5 fps
+	 * on the K1): put the SDK's back. */
+	if (cam->it_capped && fps == cam->sensor_fps) {
+		if (cam->it_max_slow && RSS_HAL_CALL(cam->ops, isp_set_ae_it_max, cam->hal_ctx,
+						     cam->it_max_slow) == RSS_OK)
+			cam->it_capped = false;
+		else
+			LOGW("AE integration limit for %u fps not restored", fps);
+	}
 	/* The sensor sets the pace: a 30 fps channel on a 25 fps sensor still
 	 * delivers 25 while the host was promised 30. */
 	set_sensor_fps(cam, fps);
@@ -931,6 +1167,9 @@ void uvcd_camera_release(uvcd_camera_t *cam)
 	cam->leased = false;
 	if (!cam->up)
 		return;
+	/* The stream may have run another rate and exposure: settle again. */
+	cam->idle_settled = false;
+	idle_reset(cam);
 	set_view(cam, cam->controls);
 	apply_exposure(cam, cam->controls); /* back to the idle rate */
 	apply_metering(cam, cam->controls);
@@ -950,6 +1189,7 @@ void uvcd_camera_tick(uvcd_camera_t *cam)
 	}
 	exposure_priority_tick(cam);
 	subject_metering_tick(cam);
+	idle_tick(cam);
 }
 
 /* --------------------------------------------------------------------------
@@ -958,7 +1198,7 @@ void uvcd_camera_tick(uvcd_camera_t *cam)
 
 #define FIELD(name) offsetof(struct uvcd_control_state, name)
 
-int uvcd_camera_apply(uvcd_camera_t *cam, struct uvcd_control_state *next, size_t field)
+static int apply_field(uvcd_camera_t *cam, struct uvcd_control_state *next, size_t field)
 {
 	const struct uvcd_control_state *now = cam->controls;
 
@@ -1048,4 +1288,34 @@ int uvcd_camera_apply(uvcd_camera_t *cam, struct uvcd_control_state *next, size_
 	default:
 		return RSS_OK; /* not the camera's: the encoder settings */
 	}
+}
+
+/* Controls that change what auto-exposure aims at, what it meters or what
+ * it may use. */
+static bool changes_ae(size_t field)
+{
+	switch (field) {
+	case FIELD(ae_mode):
+	case FIELD(ae_comp):
+	case FIELD(metering):
+	case FIELD(zoom):
+	case FIELD(pan):
+	case FIELD(tilt):
+	case FIELD(max_again):
+	case FIELD(max_dgain):
+	case FIELD(power_line_frequency):
+	case FIELD(highlight):
+		return true;
+	default:
+		return false;
+	}
+}
+
+int uvcd_camera_apply(uvcd_camera_t *cam, struct uvcd_control_state *next, size_t field)
+{
+	/* Idle settles at full rate again before the change, so that
+	 * auto-exposure takes it at full rate. */
+	if (cam->up && changes_ae(field))
+		idle_settle(cam, "a control changed");
+	return apply_field(cam, next, field);
 }

@@ -125,6 +125,14 @@ static int set_comp(void *ctx, int comp)
 	return 0;
 }
 
+static bool ae_stable;
+static int get_ae_state(void *ctx, void *state)
+{
+	(void)ctx;
+	((struct uvcd_imp_ae_state *)state)->stable = ae_stable;
+	return 0;
+}
+
 /* A dark bed (zones at 40) with a bright print over a 3x3 block left of
  * centre, and a histogram whose brightest 1% sits at `top_bin`. */
 static void fake_scene(uint32_t print, int top_bin)
@@ -222,6 +230,22 @@ static void test_subject_metering(void)
 	written_comp = -1;
 	highlight_guard(&cam);
 	assert(written_comp == -1 && cam.ae_comp_cut == 0.0f);
+
+	/* Clipping while auto-exposure still adjusts is the light having just
+	 * gone up, not the scene: the guard waits for AE to lock. */
+	ops.isp_get_ae_state = get_ae_state;
+	ae_stable = false;
+	fake_scene(400, 255);
+	written_comp = -1;
+	cam.guard_checked_ms = cam.subject_checked_ms = 0;
+	subject_metering_tick(&cam);
+	assert(written_comp == -1 && cam.ae_comp_cut == 0.0f && cam.guard_checked_ms == 0);
+	ae_stable = true;
+	cam.subject_checked_ms = 0;
+	subject_metering_tick(&cam);
+	assert(written_comp == 109 && cam.guard_checked_ms != 0);
+	ops.isp_get_ae_state = NULL;
+	cam.ae_comp_cut = 0.0f;
 
 	/* Clipping highlights hold compensation back, down to the floor. */
 	fake_scene(400, 255);
@@ -494,6 +518,193 @@ static void test_camera_lease(void)
 	assert(expr_writes == exprs);
 }
 
+
+/* Idle pacing: full rate until brightness and exposure hold still, slow
+ * after, full again when the scene changes. The fake ISP reports what a
+ * scene and an exposure would give. */
+static uint32_t it_limit_set, it_limit_now, fake_time = 30000, fake_gain = 2048;
+static int it_limit_error, rate_sets;
+
+static int count_rate(void *ctx, uint32_t num, uint32_t den)
+{
+	rate_sets++;
+	/* Only a new rate brings the SDK's limit for it (1125 lines a frame at
+	 * 30 fps on the GC2083, less 8). */
+	if (num != sensor_rate)
+		it_limit_now = 1125 * 30 / num - 8;
+	return set_sensor_rate(ctx, num, den);
+}
+
+/* The SDK's own limit follows the rate it was last set to; idle's cap
+ * stays until the rate changes. */
+static int get_it_limit(void *ctx, uint32_t *limit)
+{
+	(void)ctx;
+	*limit = it_limit_now;
+	return 0;
+}
+
+static int set_it_limit(void *ctx, uint32_t limit)
+{
+	(void)ctx;
+	if (it_limit_error)
+		return it_limit_error;
+	it_limit_set = it_limit_now = limit;
+	return 0;
+}
+
+static int get_scene_exposure(void *ctx, rss_exposure_t *e)
+{
+	(void)ctx;
+	memset(e, 0, sizeof(*e));
+	e->exposure_time = fake_time;
+	e->total_gain = fake_gain;
+	return 0;
+}
+
+static int set_level(void *ctx, int value)
+{
+	(void)ctx;
+	(void)value;
+	return 0;
+}
+
+static void flat_scene(uint32_t level)
+{
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++)
+			fake_zone[r][col] = level;
+}
+
+/* `n` idle ticks, each one sampling period apart. */
+static void idle_ticks(uvcd_camera_t *cam, int n)
+{
+	for (int i = 0; i < n; i++) {
+		cam->idle_checked_ms -= UVCD_IDLE_PERIOD_MS;
+		cam->settle_since_ms -= UVCD_IDLE_PERIOD_MS;
+		uvcd_camera_tick(cam);
+	}
+}
+
+static void test_idle_pacing(void)
+{
+	rss_hal_ops_t ops = {
+		.init = hal_init,
+		.isp_set_sensor_fps = count_rate,
+		.isp_get_ae_it_max = get_it_limit,
+		.isp_set_ae_it_max = set_it_limit,
+		.isp_set_ae_weight = set_weight,
+		.isp_get_ae_zone = get_zone,
+		.isp_set_expr = set_expr,
+		.isp_get_exposure = get_scene_exposure,
+		.isp_set_ae_comp = set_comp,
+		.isp_set_brightness = set_level,
+	};
+	struct uvcd_control_state controls = {0};
+	controls.zoom = 100;
+	controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	controls.ae_comp = 128;
+	controls.metering = UVCD_METERING_CENTER;
+	uvcd_camera_t cam = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080,
+			     .controls = &controls};
+	weight_error = comp_error = it_limit_error = 0;
+	flat_scene(40);
+	sensor_rate = 25; /* the GC2083 driver boots at 25 fps */
+	it_limit_now = 1125 * 30 / 25 - 8;
+
+	/* Bring-up runs full rate and reads the limit that rate gives. */
+	assert(uvcd_camera_up(&cam) == 0);
+	assert(sensor_rate == UVCD_IDLE_FPS && cam.it_max_idle == 1117 && !cam.idle_settled);
+	/* Not before AE has run ... */
+	fake_time = 0;
+	idle_ticks(&cam, 6);
+	assert(!cam.idle_settled && sensor_rate == UVCD_IDLE_FPS);
+	/* ... and not while the exposure still moves. */
+	fake_time = 30000;
+	for (int i = 0; i < 6; i++) {
+		fake_gain = 2048 + (uint32_t)i * 200;
+		idle_ticks(&cam, 1);
+	}
+	assert(!cam.idle_settled);
+	/* Held still: slow, with the full-rate exposure limit. */
+	idle_ticks(&cam, 3);
+	assert(cam.idle_settled && sensor_rate == UVCD_IDLE_SLOW_FPS && it_limit_set == 1117);
+	assert(cam.it_capped && cam.it_max_slow == 6742);
+
+	/* One flickering frame is not a scene change: the rate never moves. */
+	int flicker_sets = rate_sets;
+	flat_scene(80);
+	idle_ticks(&cam, 1);
+	flat_scene(40);
+	idle_ticks(&cam, 4);
+	assert(cam.idle_settled && sensor_rate == UVCD_IDLE_SLOW_FPS && rate_sets == flicker_sets);
+	/* The lights going off is: full rate, the SDK's own limit back. */
+	flat_scene(4);
+	idle_ticks(&cam, 4);
+	assert(!cam.idle_settled && sensor_rate == UVCD_IDLE_FPS && !cam.it_capped);
+	/* In the dark AE pins at its limits and the exposure stays put: that
+	 * is settled too, not a reason to stay at full rate. */
+	idle_ticks(&cam, 4);
+	assert(cam.idle_settled && sensor_rate == UVCD_IDLE_SLOW_FPS);
+	int sets = rate_sets;
+	idle_ticks(&cam, 20);
+	assert(cam.idle_settled && rate_sets == sets);
+	/* AE moving on its own counts as a change too. */
+	fake_gain = 4096;
+	idle_ticks(&cam, 4);
+	assert(!cam.idle_settled);
+	idle_ticks(&cam, 4);
+	assert(cam.idle_settled);
+
+	/* A control that changes what AE does settles again at once. */
+	struct uvcd_control_state next = controls;
+	next.ae_comp = 200;
+	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, ae_comp)) == 0);
+	assert(!cam.idle_settled && sensor_rate == UVCD_IDLE_FPS);
+	controls = next;
+	/* One that doesn't, doesn't. */
+	idle_ticks(&cam, 4);
+	assert(cam.idle_settled);
+	next.brightness = 90;
+	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, brightness)) == 0);
+	assert(cam.idle_settled && sensor_rate == UVCD_IDLE_SLOW_FPS);
+
+	/* A 5 fps stream after slow idle gets the SDK's limit for 5 fps back,
+	 * not idle's, although the rate stays what it was. */
+	sets = rate_sets;
+	assert(uvcd_camera_acquire(&cam, UVCD_FRAME_1080P, UVCD_IDLE_SLOW_FPS) == 0);
+	assert(rate_sets == sets && !cam.it_capped && it_limit_now == 6742);
+	idle_ticks(&cam, 10); /* streams aren't paced */
+	assert(rate_sets == sets);
+	/* A stream at another rate gets it from the rate change. */
+	uvcd_camera_release(&cam);
+	idle_ticks(&cam, 4);
+	assert(cam.it_capped && it_limit_now == 1117);
+	assert(uvcd_camera_acquire(&cam, UVCD_FRAME_1080P, 15) == 0);
+	assert(!cam.it_capped && it_limit_now == 2242);
+	/* Released: settle at full rate again. */
+	uvcd_camera_release(&cam);
+	assert(!cam.idle_settled && sensor_rate == UVCD_IDLE_FPS);
+
+	/* Manual exposure has nothing to settle. */
+	controls.ae_mode = UVCD_AE_MANUAL;
+	controls.exposure_time = 100;
+	uvcd_camera_tick(&cam);
+	assert(cam.idle_settled && sensor_rate == UVCD_IDLE_SLOW_FPS);
+	controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	uvcd_camera_release(&cam);
+	cam.idle_settled = false;
+	apply_exposure(&cam, &controls);
+
+	/* An ISP that refuses the limit keeps idle at full rate for good. */
+	it_limit_error = -EIO;
+	idle_ticks(&cam, 4);
+	assert(!cam.it_max_idle && sensor_rate == UVCD_IDLE_FPS);
+	idle_ticks(&cam, 10);
+	assert(sensor_rate == UVCD_IDLE_FPS);
+	it_limit_error = 0;
+}
+
 /* The stream's channel takes its crop from the camera's view, which a
  * lease sets for the output size. */
 static int configure(uvcd_pipeline_t *p, uint8_t format, uint8_t frame, uint32_t interval)
@@ -611,6 +822,7 @@ int main(void)
 	}
 	test_subject_metering();
 	test_camera_lease();
+	test_idle_pacing();
 	puts("pipeline regression tests passed");
 	return 0;
 }
