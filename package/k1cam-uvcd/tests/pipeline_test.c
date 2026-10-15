@@ -133,16 +133,70 @@ static int get_ae_state(void *ctx, void *state)
 	return 0;
 }
 
+/* Clipped pixels pile up in one bin: 247..250 on the K1 near unity gain. */
+#define FAKE_WHITE 249
+
 /* A dark bed (zones at 40) with a bright print over a 3x3 block left of
- * centre, and a histogram whose brightest 1% sits at `top_bin`. */
+ * centre, and a histogram whose brightest 1% sits at `top_bin`: spread up
+ * from there like the falloff of a highlight, or from FAKE_WHITE on all
+ * piled up in it, clipped. */
 static void fake_scene(uint32_t print, int top_bin)
 {
 	for (int r = 0; r < 15; r++)
 		for (int col = 0; col < 15; col++)
 			fake_zone[r][col] = r >= 8 && r <= 10 && col >= 3 && col <= 5 ? print : 40;
 	memset(fake_hist, 0, sizeof(fake_hist));
-	fake_hist[60] = 990;
-	fake_hist[top_bin] = 10;
+	fake_hist[60] = 9900;
+	if (top_bin > FAKE_WHITE)
+		top_bin = FAKE_WHITE;
+	fake_hist[FAKE_WHITE] = 100;
+	for (int i = top_bin; i < top_bin + 10 && i < FAKE_WHITE; i++) {
+		fake_hist[i] += 10;
+		fake_hist[FAKE_WHITE] -= 10;
+	}
+}
+
+/* The camera's answer to a compensation, measured on the K1 (gc2083,
+ * hyb_D blob) by sweeping it over a fixed scene: AE's locked target at each
+ * compensation, while the brightest 1% stayed proportional to it until it
+ * saturated. */
+static const int measured_comp[] = {0, 32, 48, 64, 96, 128, 176, 224, 255};
+static const int measured_target[] = {0, 7, 10, 14, 21, 27, 48, 72, 86};
+
+static float measured_ae_target(int comp)
+{
+	int i = 1;
+
+	while (i < 8 && comp > measured_comp[i])
+		i++;
+	return (float)measured_target[i - 1] +
+	       (float)(measured_target[i] - measured_target[i - 1]) *
+		       (float)(comp - measured_comp[i - 1]) /
+		       (float)(measured_comp[i] - measured_comp[i - 1]);
+}
+
+/* A scene whose brightest 1% would sit at `level` (past 255 if the sensor
+ * could go there) at compensation `at`, shown at the compensation the
+ * guard last wrote. */
+static void measured_scene(float level, int at)
+{
+	float top = level * measured_ae_target(written_comp) / measured_ae_target(at);
+
+	fake_scene(400, (int)(top + 0.5f));
+}
+
+/* Run the guard on a measured scene until it holds still; the steps it took. */
+static int guard_settle(uvcd_camera_t *cam, float level, int at)
+{
+	for (int steps = 0; steps < 20; steps++) {
+		int comp = written_comp;
+
+		measured_scene(level, at);
+		highlight_guard(cam);
+		if (written_comp == comp)
+			return steps;
+	}
+	return -1;
 }
 
 static void test_subject_metering(void)
@@ -243,34 +297,73 @@ static void test_subject_metering(void)
 	ae_stable = true;
 	cam.subject_checked_ms = 0;
 	subject_metering_tick(&cam);
-	assert(written_comp == 109 && cam.guard_checked_ms != 0);
+	assert(written_comp == 64 && cam.guard_checked_ms != 0);
 	ops.isp_get_ae_state = NULL;
 	cam.ae_comp_cut = 0.0f;
+	written_comp = 128;
 
-	/* Clipping highlights hold compensation back, down to the floor. */
-	fake_scene(400, 255);
+	/* The top of an LED hotspot, as the K1 measured it (in 0.01% of the
+	 * picture): 0.67% piled up at the white level, the falloff below it.
+	 * The brightest 1% reaches down into the falloff, so it is a real
+	 * pixel at 231, not a saturated one. */
+	static const uint32_t hotspot[] = {14, 14, 14, 14, 14, 14, 14, 14, /* 231.. */
+					   10, 10, 0, 10, 10, 20, 20, 40, 50, 50, 670};
+	memset(fake_hist, 0, sizeof(fake_hist));
+	fake_hist[60] = 100000;
+	for (int i = 0; i < 19; i++) {
+		fake_hist[231 + i] = hotspot[i];
+		fake_hist[60] -= hotspot[i];
+	}
 	highlight_guard(&cam);
-	assert(written_comp == 109); /* 128 * 0.85 */
-	for (int i = 0; i < 20; i++)
-		highlight_guard(&cam);
-	assert(written_comp == 64); /* never below half */
+	assert(written_comp == 94); /* 128 * 170 / 231 */
+	cam.ae_comp_cut = 0.0f;
+	written_comp = 128;
+	/* A saturated top halves the compensation: its true level is unknown. */
+	assert(guard_settle(&cam, 600.0f, 128) == 1 && written_comp == 64);
+	/* Never below half, however bright. */
+	assert(guard_settle(&cam, 2000.0f, 128) == 0 && written_comp == 64);
+	/* The light off again: given back in a step, and the last unit in a
+	 * second (the 64 -> 127 step is a square root, 1.99). */
+	assert(guard_settle(&cam, 83.0f, 128) == 2 && written_comp == 128);
+	assert(cam.ae_comp_cut == 0.0f);
+	/* Clipping but not saturated: one step, into the band. */
+	assert(guard_settle(&cam, 230.0f, 128) == 1 && written_comp == 95);
 	/* Between the thresholds it holds still. */
 	fake_scene(400, 175);
 	written_comp = -1;
 	highlight_guard(&cam);
 	assert(written_comp == -1);
 	/* Well below clipping, it gives the compensation back, never more. */
+	written_comp = 95;
 	fake_scene(400, 120);
 	for (int i = 0; i < 30; i++)
 		highlight_guard(&cam);
 	assert(written_comp == 128 && cam.ae_comp_cut == 0.0f);
+	/* Above 128 compensation moves AE more than in proportion, and giving
+	 * the full ratio back hunted 128 <-> 230 here. Now it settles in the
+	 * band, wherever the scene sits. */
+	controls.ae_comp = 255;
+	for (float level = 150.0f; level < 900.0f; level += 10.0f) {
+		cam.ae_comp_cut = 0.0f;
+		written_comp = 255;
+		int steps = guard_settle(&cam, level, 255), top = 255;
+
+		while (top > 0 && fake_hist[top] == 0)
+			top--;
+		assert(steps >= 0 && steps <= 4);
+		/* In the band, or pinned at either end of the cut. */
+		assert((top >= 150 && top < 200) || (top >= 200 && written_comp == 128) ||
+		       (top < 150 && written_comp == 255));
+	}
+	controls.ae_comp = 128;
+	cam.ae_comp_cut = 0.0f;
 
 	/* The control itself still applies under the guard ... */
 	fake_scene(400, 255);
 	highlight_guard(&cam);
 	struct uvcd_control_state c = controls;
 	c.ae_comp = 200;
-	assert(apply_ae_comp(&cam, &c) == 0 && written_comp == 170);
+	assert(apply_ae_comp(&cam, &c) == 0 && written_comp == 100);
 	/* ... and leaving subject metering gives back what it held. */
 	c.metering = UVCD_METERING_CENTER;
 	assert(apply_metering(&cam, &c) == 0);

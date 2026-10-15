@@ -606,9 +606,11 @@ static int apply_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c
  * - Guard the highlights: metering a white print to auto-exposure's target
  *   alone would make it grey, so the weights only steer. What decides is
  *   the brightest UVCD_GUARD_TOP of the picture: while it clips,
- *   exposure compensation is held back a step at a time (to at most
- *   UVCD_GUARD_MAX_CUT); once it sits well below clipping, it is given
- *   back. Anything smaller than UVCD_GUARD_TOP, such as a glint, may clip.
+ *   exposure compensation is held back (to at most UVCD_GUARD_MAX_CUT);
+ *   once it sits well below clipping, it is given back. Each step is sized
+ *   to bring it to UVCD_GUARD_AIM, so a light switched on or off takes a
+ *   step or two, not ten. Anything smaller than UVCD_GUARD_TOP, such as a
+ *   glint, may clip.
  *   It only judges a picture auto-exposure has locked on: the frames right
  *   after the light goes up clip until AE catches up, and holding the
  *   compensation back for those left the picture dark for seconds after
@@ -622,12 +624,28 @@ static int apply_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c
 #define UVCD_GUARD_TOP 0.01f       /* the brightest 1% of the picture */
 /* The histogram is linear, taken before the gamma curve: on the K1, bin 219
  * came out at 251 of 255, bin 200 at about 238 and bin 150 at about 211.
- * The band between the two is wider than one step either way, so the guard
- * comes to rest instead of hunting. */
+ *
+ * Sweeping exposure compensation over a fixed scene (comp 32..255), the
+ * brightest 1% stayed at 3.3x the histogram mean to within 3% until it
+ * saturated, so the top bin scales with exposure and one ratio sizes the
+ * step. Compensation is not linear in exposure, though: AE's target was
+ * proportional to it up to 128 (7 at 32, 27 at 128), then rose twice as
+ * steeply (48 at 176, 86 at 255). There a step overshoots, and giving back
+ * the full ratio after a cut hunts (comp 255 swinging 128 <-> 230 forever,
+ * simulated on the measured curve), so give-back takes the square root of
+ * it: settled within 4 steps for comp 64..255 in that simulation.
+ *
+ * UVCD_GUARD_AIM sits in the band where AE's -5%..+15% lock window keeps it.
+ *
+ * Clipped pixels pile up in the one bin at the white level, nothing above
+ * it. Which bin that is moves with gain (247..250 near unity, 255 at 2.3x
+ * on an LED hotspot), so the guard looks for the pile-up, not a bin. A top
+ * that falls in it has saturated and its true level is unknown: halve. A
+ * top below it, on the hotspot's falloff, is a real pixel and scales like
+ * any other. */
 #define UVCD_GUARD_CLIP_BIN 200
 #define UVCD_GUARD_LOW_BIN 150
-#define UVCD_GUARD_DOWN 0.85f
-#define UVCD_GUARD_UP 1.1f
+#define UVCD_GUARD_AIM 170.0f
 #define UVCD_GUARD_MAX_CUT 0.5f /* keep at least half the requested compensation */
 
 static int cmp_u32(const void *a, const void *b)
@@ -701,11 +719,15 @@ static void highlight_guard(uvcd_camera_t *cam)
 			break;
 	}
 
+	/* Saturated: half the brightest UVCD_GUARD_TOP in the top bin alone. */
+	bool saturated = (float)bins[top] * 2.0f >= (float)total * UVCD_GUARD_TOP;
 	float scale = 1.0f - cam->ae_comp_cut;
-	if (top >= UVCD_GUARD_CLIP_BIN)
-		scale *= UVCD_GUARD_DOWN;
+	if (top >= UVCD_GUARD_CLIP_BIN && saturated)
+		scale *= 0.5f;
+	else if (top >= UVCD_GUARD_CLIP_BIN)
+		scale *= UVCD_GUARD_AIM / (float)top;
 	else if (top < UVCD_GUARD_LOW_BIN)
-		scale *= UVCD_GUARD_UP;
+		scale = top > 0 ? scale * sqrtf(UVCD_GUARD_AIM / (float)top) : 1.0f;
 	if (scale > 1.0f)
 		scale = 1.0f;
 	if (scale < 1.0f - UVCD_GUARD_MAX_CUT)
