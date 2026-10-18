@@ -6,7 +6,7 @@ CFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c11
 all: uvcdctl
 
 uvcdctl: uvcdctl.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 install: uvcdctl
 	install -Dm755 uvcdctl $(DESTDIR)/usr/bin/uvcdctl
