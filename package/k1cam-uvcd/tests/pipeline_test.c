@@ -382,6 +382,52 @@ static void test_subject_metering(void)
 }
 
 
+/* Both ISP writes must succeed before a metering mode is accepted. */
+static void test_metering_exit_failure(void)
+{
+	rss_hal_ops_t ops = {.isp_set_ae_weight = set_weight, .isp_set_ae_comp = set_comp};
+	for (int mode = UVCD_METERING_TUNING; mode < UVCD_METERING_SUBJECT; mode++) {
+		struct uvcd_control_state controls = {.ae_comp = 128,
+			.ae_mode = UVCD_AE_APERTURE_PRIORITY, .metering = UVCD_METERING_SUBJECT};
+		uvcd_camera_t cam = {.ops = &ops, .controls = &controls, .up = true,
+			.sensor_w = 1920, .sensor_h = 1080, .ae_weight_ref_valid = true};
+		cam.view.w = 1920;
+		cam.view.h = 1080;
+		memset(cam.ae_weight_ref, 3, sizeof(cam.ae_weight_ref));
+		assert(apply_metering(&cam, &controls) == 0);
+		uint8_t old_weight[15][15];
+		memcpy(old_weight, written_weight, sizeof(old_weight));
+		cam.ae_comp_cut = 0.5f;
+		assert(apply_ae_comp(&cam, &controls) == 0 && written_comp == 64);
+		struct uvcd_control_state next = controls;
+		next.metering = mode;
+
+		/* Rejected weights leave compensation and its cut untouched. */
+		weight_error = -EIO;
+		assert(apply_metering(&cam, &next) == -EIO);
+		assert(written_comp == 64 && cam.ae_comp_cut == 0.5f);
+		assert(memcmp(old_weight, written_weight, sizeof(old_weight)) == 0);
+		weight_error = 0;
+
+		/* Accepted weights, rejected compensation: fail the change, keep
+		 * track of the actual weights, and retry the stored mode on tick. */
+		comp_error = -EIO;
+		assert(apply_metering(&cam, &next) == -EIO);
+		assert(!cam.metering_valid && cam.ae_comp_cut == 0.5f && written_comp == 64);
+		assert(memcmp(weights_in_isp(&cam), written_weight, sizeof(written_weight)) == 0);
+		comp_error = 0;
+		cam.metering_tried_ms = 0;
+		uvcd_camera_tick(&cam);
+		assert(cam.metering_valid && cam.metering_mode == UVCD_METERING_SUBJECT);
+		assert(cam.ae_comp_cut == 0.5f && written_comp == 64);
+		assert(memcmp(old_weight, written_weight, sizeof(old_weight)) == 0);
+
+		assert(apply_metering(&cam, &next) == 0);
+		assert(cam.metering_valid && cam.metering_mode == mode);
+		assert(cam.ae_comp_cut == 0.0f && written_comp == 128);
+	}
+}
+
 /* The camera's lease: rate, view, exposure and metering follow whoever
  * holds the camera, and the camera stays up throughout. */
 int rss_hal_get_imp_version(char *buf, int size)
@@ -914,6 +960,7 @@ int main(void)
 		assert(fps == (ceiling < 15 ? ceiling : 15));
 	}
 	test_subject_metering();
+	test_metering_exit_failure();
 	test_camera_lease();
 	test_idle_pacing();
 	puts("pipeline regression tests passed");

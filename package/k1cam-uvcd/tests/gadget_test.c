@@ -72,10 +72,12 @@ int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p) { (void)p; return 0; }
  * fill in a dependent value (leaving auto white balance keeps the measured
  * temperature). */
 static int applies, apply_error, camera_guard_arms;
+static bool apply_resets_sequence;
 static size_t last_field;
 int uvcd_pipeline_apply(uvcd_pipeline_t *p, struct uvcd_control_state *next, size_t field)
 {
-	(void)p;
+	if (apply_resets_sequence)
+		p->frame.seq = 0; /* restored stream after a rejected view change */
 	applies++;
 	last_field = field;
 	if (apply_error)
@@ -109,6 +111,66 @@ int test_ioctl(int fd, unsigned long request, ...)
 	assert(request == VIDIOC_QBUF);
 	queued++;
 	return 0;
+}
+
+static void test_rejected_view(void)
+{
+	static const char *names[] = {"zoom", "pan", "tilt"};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		uvcd_pipeline_t p = {0};
+		pthread_mutex_init(&p.frame.lock, NULL);
+		uvcd_config_defaults(&p.controls);
+		struct uvcd_control_state old = p.controls;
+		uint8_t data[] = {1, 2, 3, 4}, output[4] = {0};
+		p.frame.data = data;
+		p.frame.len = sizeof(data);
+		p.frame.seq = 1000;
+		gadget_t g = {.pipe = &p, .streaming = true, .read_seq = 1000,
+			     .watched_seq = 1000, .healthy_since_ms = 1,
+			     .cur_format = UVCD_FMT_MJPEG, .buf_count = 1};
+		g.buffers[0].start = output;
+		g.buffers[0].length = sizeof(output);
+		apply_error = -EIO;
+		apply_resets_sequence = true;
+		int applied = -123;
+		assert(uvcd_ctrl_set(&g, uvcd_ctrl_find(names[i]), 200, &applied) == -1);
+		assert(applied == -123 && !g.config_dirty);
+		assert(memcmp(&old, &p.controls, sizeof(old)) == 0);
+		assert(g.read_seq == 0 && g.watched_seq == 0 && g.healthy_since_ms == 0);
+		assert(g.last_frame_ms > 0);
+		/* The restored stream's very first frame can be delivered. */
+		p.frame.seq = 1;
+		int before = queued;
+		deliver_frame(&g);
+		assert(queued == before + 1 && g.read_seq == 1);
+		assert(memcmp(data, output, sizeof(data)) == 0);
+		pthread_mutex_destroy(&p.frame.lock);
+	}
+	apply_error = 0;
+	apply_resets_sequence = false;
+}
+
+static void test_gain_headroom(void)
+{
+	uvcd_pipeline_t p = {0};
+	gadget_t g = {.pipe = &p};
+	uvcd_config_defaults(&p.controls);
+	const struct uvcd_ctrl_def *again = uvcd_ctrl_find("max-analog-gain");
+	const struct uvcd_ctrl_def *dgain = uvcd_ctrl_find("max-digital-gain");
+	assert(custom_control_max(UVCD_CUSTOM_MAX_AGAIN) == 224);
+	assert(custom_control_def(UVCD_CUSTOM_MAX_AGAIN) == 160);
+	assert(custom_control_max(UVCD_CUSTOM_MAX_DGAIN) == 160);
+	assert(p.controls.max_again == 160 && p.controls.max_dgain == 80);
+	int applied;
+	assert(uvcd_ctrl_set(&g, again, 224, &applied) == 0 && applied == 224);
+	assert(p.controls.max_again == 224);
+	g.config_dirty = false;
+	apply_error = -EIO;
+	assert(uvcd_ctrl_set(&g, again, 192, &applied) == -1);
+	assert(p.controls.max_again == 224 && !g.config_dirty);
+	apply_error = 0;
+	assert(uvcd_ctrl_set(&g, again, 255, &applied) == 0 && applied == 224);
+	assert(uvcd_ctrl_set(&g, dgain, 224, &applied) == 0 && applied == 160);
 }
 
 int main(void)
@@ -264,6 +326,8 @@ int main(void)
 		assert(custom_ctrl_def(sel) == NULL && custom_control_value(&g, sel) == NULL);
 	assert(custom_ctrl_def(15) == NULL && custom_control_value(&g, 15) == NULL);
 	assert(uvcd_ctrl_find("h264-gop-frames") == NULL);
+	test_rejected_view();
+	test_gain_headroom();
 	puts("gadget regression tests passed");
 	pthread_mutex_destroy(&p.frame.lock);
 	return 0;

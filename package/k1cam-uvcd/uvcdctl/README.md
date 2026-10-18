@@ -36,6 +36,12 @@ camera, so it works without one attached:
 Control names and numeric IDs are accepted by `get`, `set`, and `describe`.
 `get` and `set` print `name=value`.
 
+Gain ceilings use the T31 SDK's logarithmic units: 0 is 1x, and every
+32 units doubles gain. `max-analog-gain` accepts 0-224, with the unchanged
+default of 160 (32x). A ceiling of 224 (128x) allows the GC2083 to reach
+its last analog step, about 125.4x. `max-digital-gain` still accepts 0-160,
+with a default of 80 (about 5.66x).
+
 ## Persistence
 
 Every change persists, whichever program makes it: `uvcdctl`, `v4l2-ctl`, or

@@ -541,41 +541,43 @@ static int apply_ae_comp(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 static int write_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 {
 	uint8_t weight[15][15];
-
-	/* Only subject metering holds exposure compensation back. */
-	if (c->metering != UVCD_METERING_SUBJECT && cam->ae_comp_cut != 0.0f) {
-		cam->ae_comp_cut = 0.0f;
-		apply_ae_comp(cam, c);
-	}
+	bool have_weights = true;
 
 	if (c->metering == UVCD_METERING_TUNING) {
 		/* Without the reference there is nothing to restore. */
-		if (cam->ae_weight_ref_valid) {
-			int ret = RSS_HAL_CALL(cam->ops, isp_set_ae_weight, cam->hal_ctx,
-					       (const uint8_t(*)[15])cam->ae_weight_ref);
-			if (ret != RSS_OK)
-				return ret;
-		}
-		cam->metering_valid = true;
-		cam->metering_mode = c->metering;
-		return RSS_OK;
+		if (cam->ae_weight_ref_valid)
+			memcpy(weight, cam->ae_weight_ref, sizeof(weight));
+		else
+			have_weights = false;
+	} else {
+		metering_weights(cam, c->metering, weight);
 	}
 
-	metering_weights(cam, c->metering, weight);
-	int ret = RSS_HAL_CALL(cam->ops, isp_set_ae_weight, cam->hal_ctx,
-			      (const uint8_t(*)[15])weight);
-	if (ret != RSS_OK)
-		return ret;
-	/* Subject metering starts from center-weighted and finds the subject
-	 * from the next statistics on. Only weights the ISP took count as
-	 * written, or a rejected write would never be retried. */
-	for (int r = 0; r < 15; r++)
-		for (int col = 0; col < 15; col++)
-			cam->subject_weight[r][col] = weight[r][col];
-	memcpy(cam->subject_written, weight, sizeof(weight));
-	cam->subject_checked_ms = cam->guard_checked_ms = uvcd_monotonic_ms();
-	cam->metering_valid = true;
+	if (have_weights) {
+		int ret = RSS_HAL_CALL(cam->ops, isp_set_ae_weight, cam->hal_ctx,
+				      (const uint8_t(*)[15])weight);
+		if (ret != RSS_OK)
+			return ret;
+		/* Track accepted weights even if restoring compensation below
+		 * fails. Subject metering starts from these on the next tick. */
+		for (int r = 0; r < 15; r++)
+			for (int col = 0; col < 15; col++)
+				cam->subject_weight[r][col] = weight[r][col];
+		memcpy(cam->subject_written, weight, sizeof(weight));
+		cam->subject_checked_ms = cam->guard_checked_ms = uvcd_monotonic_ms();
+	}
 	cam->metering_mode = c->metering;
+	cam->metering_valid = false;
+	/* Only subject metering holds compensation back. Keep its cut until
+	 * the ISP accepts the uncut value. On failure the caller keeps its
+	 * stored mode, which the tick restores because metering is invalid. */
+	if (c->metering != UVCD_METERING_SUBJECT && cam->ae_comp_cut != 0.0f) {
+		int ret = apply_ae_comp(cam, c);
+		if (ret != RSS_OK)
+			return ret;
+		cam->ae_comp_cut = 0.0f;
+	}
+	cam->metering_valid = true;
 	return RSS_OK;
 }
 

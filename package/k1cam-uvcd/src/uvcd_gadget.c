@@ -98,7 +98,10 @@ struct uvc_event {
 /* 23-25 were save, apply-on-boot and saved-query, from a short-lived
  * explicit save model. Retired, not reused: controls persist on their own. */
 #define UVCD_CUSTOM_GAIN_MIN 0
-#define UVCD_CUSTOM_GAIN_MAX 160
+/* T31 SDK units: 32 per doubling (160 = 32x). The GC2083's last
+ * analog step is 125.4375x: allow a 128x ceiling to reach it. */
+#define UVCD_CUSTOM_AGAIN_MAX 224
+#define UVCD_CUSTOM_DGAIN_MAX 160
 
 #define UVCD_CONTROL_MIN 0
 #define UVCD_CONTROL_MAX 255
@@ -361,9 +364,9 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 	UVCD_CTRL_ROW("exposure-compensation", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_AE_COMP,
 		      0, 255, 128, ae_comp),
 	UVCD_CTRL_ROW("max-analog-gain", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_AGAIN,
-		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_GAIN_MAX, 160, max_again),
+		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_AGAIN_MAX, 160, max_again),
 	UVCD_CTRL_ROW("max-digital-gain", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_MAX_DGAIN,
-		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_GAIN_MAX, 80, max_dgain),
+		      UVCD_CUSTOM_GAIN_MIN, UVCD_CUSTOM_DGAIN_MAX, 80, max_dgain),
 	/* Off: in the printer chamber the sensor runs at no gain, so noise is
 	 * already low, and denoise erases the fine texture being watched.
 	 * Measured there on time-averaged frames, 96/128/192 cost a textured bed
@@ -627,8 +630,7 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 	/* Applied before it is stored, so the stored state is only ever what
 	 * the camera took. The camera may fill in a dependent value (leaving
 	 * an automatic mode keeps what it measured). */
-	if (uvcd_pipeline_apply(g->pipe, &next, def->state_offset) != 0)
-		return -1;
+	int ret = uvcd_pipeline_apply(g->pipe, &next, def->state_offset);
 	/* A zoom/pan/tilt change re-creates a stream's channels, whose frame
 	 * sequence starts again at 0, also when a rejected change restores the
 	 * previous view. */
@@ -640,6 +642,8 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 		g->last_frame_ms = uvcd_monotonic_ms();
 		g->healthy_since_ms = 0;
 	}
+	if (ret != 0)
+		return -1;
 	if (memcmp(&next, &g->pipe->controls, sizeof(next)) != 0) {
 		g->pipe->controls = next;
 		config_mark_dirty(g);
