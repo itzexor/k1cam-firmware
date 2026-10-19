@@ -205,6 +205,74 @@ static int guard_settle(uvcd_camera_t *cam, float level, int at)
 	return -1;
 }
 
+/* Measured on the K1, 2026-10-19: a flashlight on a plate right of centre,
+ * the view zoomed in on the dark left (zoom 400, limited to 290 at 1080p,
+ * pan fully left). These are the zones as GetAeZone reported them; the
+ * whole-sensor histogram clipped at bins 250-252, all of it outside the
+ * view. The guard halved the compensation and the picture lost 40%. */
+static const uint32_t lit_plate[15][15] = {
+	{29, 32, 29, 14, 57, 30, 76, 98, 88, 52, 14, 11, 12, 13, 7},
+	{29, 34, 26, 8, 8, 10, 74, 115, 119, 157, 182, 154, 67, 13, 9},
+	{29, 34, 21, 7, 7, 10, 112, 109, 137, 143, 165, 128, 176, 20, 10},
+	{28, 33, 14, 6, 14, 22, 90, 124, 122, 180, 133, 180, 199, 23, 12},
+	{28, 29, 11, 4, 18, 33, 64, 134, 129, 101, 182, 224, 234, 29, 11},
+	{27, 24, 8, 3, 8, 13, 66, 153, 90, 167, 182, 252, 238, 34, 13},
+	{26, 20, 6, 3, 8, 12, 116, 96, 138, 103, 188, 252, 235, 33, 14},
+	{23, 15, 5, 4, 7, 15, 62, 124, 154, 165, 154, 235, 221, 28, 14},
+	{20, 12, 6, 11, 7, 12, 40, 126, 136, 182, 147, 197, 196, 22, 12},
+	{14, 9, 4, 7, 16, 20, 45, 76, 103, 158, 165, 144, 157, 16, 8},
+	{9, 6, 4, 7, 12, 20, 39, 75, 116, 161, 151, 183, 116, 11, 7},
+	{7, 4, 5, 10, 10, 15, 31, 33, 48, 175, 243, 204, 100, 11, 7},
+	{5, 5, 6, 5, 12, 15, 24, 29, 39, 89, 175, 214, 57, 7, 7},
+	{4, 4, 7, 10, 7, 13, 21, 24, 31, 74, 110, 201, 68, 9, 9},
+	{3, 3, 2, 5, 8, 12, 18, 20, 13, 43, 98, 205, 52, 11, 7},
+};
+
+static void test_guard_view(void)
+{
+	rss_hal_ops_t ops = {
+		.isp_get_ae_zone = get_zone,
+		.isp_get_ae_hist_origin = get_hist,
+		.isp_set_ae_comp = set_comp,
+	};
+	struct uvcd_control_state controls = {0};
+	uvcd_camera_t cam = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080, .up = true,
+			     .isp_clk_hz = UVCD_ISP_FAST_HZ, .controls = &controls};
+	controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
+	controls.ae_comp = 128;
+	controls.metering = UVCD_METERING_SUBJECT;
+	controls.zoom = 400;
+	controls.pan = -36000;
+	set_view(&cam, &controls);
+	assert(cam.view.x == 0 && cam.view.w == 662); /* zone columns 0-4 */
+	fake_scene(400, 255); /* a saturated histogram... */
+	memcpy(fake_zone, lit_plate, sizeof(fake_zone)); /* ...from the plate */
+
+	/* The clipping is outside the view: no cut... */
+	written_comp = -1;
+	highlight_guard(&cam);
+	assert(written_comp == -1 && cam.ae_comp_cut == 0.0f);
+	/* ...and a cut made before the view moved is given back. */
+	cam.ae_comp_cut = 0.5f;
+	for (int i = 0; i < 3; i++)
+		highlight_guard(&cam);
+	assert(written_comp == 128 && cam.ae_comp_cut == 0.0f);
+
+	/* Panned onto the plate, the same clipping is in view: halved. */
+	controls.pan = 36000;
+	set_view(&cam, &controls);
+	highlight_guard(&cam);
+	assert(written_comp == 64);
+	/* At full view the brightest zone is always in view. */
+	cam.ae_comp_cut = 0.0f;
+	written_comp = -1;
+	controls.zoom = 100;
+	controls.pan = 0;
+	set_view(&cam, &controls);
+	highlight_guard(&cam);
+	assert(written_comp == 64);
+}
+
 static void test_subject_metering(void)
 {
 	rss_hal_ops_t ops = {
@@ -1115,6 +1183,7 @@ int main(void)
 		assert(fps == (ceiling < 15 ? ceiling : 15));
 	}
 	test_subject_metering();
+	test_guard_view();
 	test_metering_exit_failure();
 	test_camera_lease();
 	test_idle_pacing();

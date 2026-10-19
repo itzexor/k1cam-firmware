@@ -635,7 +635,7 @@ static int apply_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c
  *   once it sits well below clipping, it is given back. Each step is sized
  *   to bring it to UVCD_GUARD_AIM, so a light switched on or off takes a
  *   step or two, not ten. Anything smaller than UVCD_GUARD_TOP, such as a
- *   glint, may clip.
+ *   glint, may clip. Only what is in the view counts (view_share).
  *   It only judges a picture auto-exposure has locked on: the frames right
  *   after the light goes up clip until AE catches up, and holding the
  *   compensation back for those left the picture dark for seconds after
@@ -725,6 +725,31 @@ static void subject_weights(uvcd_camera_t *cam)
 		memcpy(cam->subject_written, weight, sizeof(weight));
 }
 
+/* How much of the histogram's top is in the view. The histogram covers the
+ * whole sensor whatever the view: on the K1 it did not change with the
+ * weights, the view or a stream's crop, and neither SetAeHist's zone counts
+ * nor AE_SetROI narrow it. A crop beside a lit plate saw the plate clip
+ * outside it, had its compensation halved, and lost 40% of its brightness.
+ * The zones are in the histogram's units and say where the light is: the
+ * view's brightest zone against the sensor's. 1 whenever the brightest zone
+ * is in view, as it always is at full view. */
+static float view_share(uvcd_camera_t *cam)
+{
+	uint32_t zone[15][15], in = 0, all = 0;
+
+	if (RSS_HAL_CALL(cam->ops, isp_get_ae_zone, cam->hal_ctx, zone) != RSS_OK)
+		return 1.0f;
+	for (int r = 0; r < 15; r++) {
+		for (int col = 0; col < 15; col++) {
+			if (zone[r][col] > all)
+				all = zone[r][col];
+			if (zone_in_view(cam, r, col) && zone[r][col] > in)
+				in = zone[r][col];
+		}
+	}
+	return in < all ? (float)in / (float)all : 1.0f;
+}
+
 static void highlight_guard(uvcd_camera_t *cam)
 {
 	uint32_t bins[256];
@@ -744,23 +769,27 @@ static void highlight_guard(uvcd_camera_t *cam)
 			break;
 	}
 
-	/* Saturated: half the brightest UVCD_GUARD_TOP in the top bin alone. */
-	bool saturated = (float)bins[top] * 2.0f >= (float)total * UVCD_GUARD_TOP;
+	/* Saturated: half the brightest UVCD_GUARD_TOP in the top bin alone.
+	 * A pile-up brighter than anything in view is outside it. */
+	float share = view_share(cam);
+	float level = (float)top * share;
+	bool saturated = share == 1.0f &&
+			 (float)bins[top] * 2.0f >= (float)total * UVCD_GUARD_TOP;
 	float scale = 1.0f - cam->ae_comp_cut;
-	if (top >= UVCD_GUARD_CLIP_BIN && saturated)
+	if (level >= UVCD_GUARD_CLIP_BIN && saturated)
 		scale *= 0.5f;
-	else if (top >= UVCD_GUARD_CLIP_BIN)
-		scale *= UVCD_GUARD_AIM / (float)top;
-	else if (top < UVCD_GUARD_LOW_BIN)
-		scale = top > 0 ? scale * sqrtf(UVCD_GUARD_AIM / (float)top) : 1.0f;
+	else if (level >= UVCD_GUARD_CLIP_BIN)
+		scale *= UVCD_GUARD_AIM / level;
+	else if (level < UVCD_GUARD_LOW_BIN)
+		scale = level > 0.0f ? scale * sqrtf(UVCD_GUARD_AIM / level) : 1.0f;
 	if (scale > 1.0f)
 		scale = 1.0f;
 	if (scale < 1.0f - UVCD_GUARD_MAX_CUT)
 		scale = 1.0f - UVCD_GUARD_MAX_CUT;
 
 	float cut = 1.0f - scale;
-	LOGD("highlight guard: top %.1f%% at bin %d, compensation cut %.0f%%",
-	     (double)(UVCD_GUARD_TOP * 100.0f), top, (double)(cut * 100.0f));
+	LOGD("highlight guard: top %.1f%% at bin %d, %.0f in view, compensation cut %.0f%%",
+	     (double)(UVCD_GUARD_TOP * 100.0f), top, (double)level, (double)(cut * 100.0f));
 	if (cut == cam->ae_comp_cut)
 		return;
 	float old_cut = cam->ae_comp_cut;
