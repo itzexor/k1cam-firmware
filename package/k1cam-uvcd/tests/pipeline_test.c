@@ -445,7 +445,7 @@ int rss_hal_get_imp_version(char *buf, int size)
 
 static uint32_t sensor_rate, encoder_rate;
 static int csc_mode, expr_writes, inits;
-static int rate_errors, expr_errors, vflip_errors, hflip, vflip;
+static int rate_errors, expr_errors, vflip_errors, hal_hflip, hal_vflip, isp_flip;
 static struct uvcd_imp_expr last_expr;
 static rss_wb_config_t last_wb;
 
@@ -531,15 +531,32 @@ static int set_level(void *ctx, int value);
 static int set_isp_mode(void *ctx, rss_isp_mode_t mode) { return set_level(ctx, mode); }
 static int set_flicker(void *ctx, rss_antiflicker_t mode) { return set_level(ctx, mode); }
 static int hal_deinit(void *ctx) { (void)ctx; return 0; }
-static int set_hflip(void *ctx, int value) { (void)ctx; hflip = value; return 0; }
+/* The T31 HAL (raptor-hal hal_isp.c) keeps its own copy of each flip bit,
+ * updates it before calling, and writes both bits as one
+ * IMP_ISP_Tuning_SetHVFLIP mode (bit 0 horizontal, bit 1 vertical); its
+ * getter reads the ISP. On the K1 with a rejected vflip injected into
+ * libimp, restoring hflip alone wrote SetHVFLIP 1, then 3 (rejected), then
+ * 2, and isp-m0 showed the picture flipped vertically. */
+static int set_hvflip(void)
+{
+	isp_flip = hal_hflip | hal_vflip << 1;
+	return 0;
+}
+static int set_hflip(void *ctx, int value) { (void)ctx; hal_hflip = !!value; return set_hvflip(); }
 static int set_vflip(void *ctx, int value)
 {
 	(void)ctx;
+	hal_vflip = !!value;
 	if (vflip_errors) { vflip_errors--; return -EIO; }
-	vflip = value;
+	return set_hvflip();
+}
+static int get_flip(void *ctx, int *h, int *v)
+{
+	(void)ctx;
+	*h = isp_flip & 1;
+	*v = isp_flip >> 1;
 	return 0;
 }
-static int get_flip(void *ctx, int *h, int *v) { (void)ctx; *h = hflip; *v = vflip; return 0; }
 static int reject_level(void *ctx, int value) { (void)ctx; (void)value; return -EIO; }
 
 /* A real T31 supplies these setters; focused tests override individual ones. */
@@ -610,12 +627,16 @@ static void test_control_failures(void)
 
 	struct uvcd_control_state next = c;
 	next.rotation = 180;
-	hflip = vflip = 0;
+	hal_hflip = hal_vflip = isp_flip = 0;
 	vflip_errors = 1;
 	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, rotation)) == -EIO);
-	assert(hflip == 0 && vflip == 0);
+	assert(isp_flip == 0 && hal_hflip == 0 && hal_vflip == 0);
 	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, rotation)) == 0);
-	assert(hflip == 1 && vflip == 1);
+	assert(isp_flip == 3);
+	next.rotation = 0; /* and back, from both bits set */
+	vflip_errors = 1;
+	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, rotation)) == -EIO);
+	assert(isp_flip == 3 && hal_hflip == 1 && hal_vflip == 1);
 
 	c.ae_mode = UVCD_AE_MANUAL;
 	c.exposure_time = 100;

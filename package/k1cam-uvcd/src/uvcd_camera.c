@@ -807,20 +807,27 @@ static void subject_metering_tick(uvcd_camera_t *cam)
 static int apply_rotation(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 {
 	int flip = c->rotation >= 90 ? 1 : 0;
-	int old_h = cam->controls->rotation >= 90;
+	int old_h = cam->controls->rotation >= 90, old_v = old_h;
 	/* Prefer the actual bits, including during startup. */
 	int h = 0, v = 0;
 	if (RSS_HAL_CALL(cam->ops, isp_get_hvflip, cam->hal_ctx, &h, &v) == RSS_OK) {
 		old_h = h;
+		old_v = v;
 	}
 	int ret = RSS_HAL_CALL(cam->ops, isp_set_hflip, cam->hal_ctx, flip);
 	if (ret != RSS_OK)
 		return ret;
 	ret = RSS_HAL_CALL(cam->ops, isp_set_vflip, cam->hal_ctx, flip);
 	if (ret != RSS_OK) {
-		int restore = RSS_HAL_CALL(cam->ops, isp_set_hflip, cam->hal_ctx, old_h);
-		if (restore != RSS_OK)
-			LOGE("could not restore horizontal flip after rejected rotation (%d)", restore);
+		/* On T31 each setter writes both bits from the HAL's own copy,
+		 * which the rejected call has already changed: restoring hflip
+		 * alone left the K1 flipped vertically. Restore vflip first,
+		 * which writes what the ISP still has, then hflip. */
+		int rv = RSS_HAL_CALL(cam->ops, isp_set_vflip, cam->hal_ctx, old_v);
+		int rh = RSS_HAL_CALL(cam->ops, isp_set_hflip, cam->hal_ctx, old_h);
+		if (rv != RSS_OK || rh != RSS_OK)
+			LOGE("could not restore flips after rejected rotation (%d)",
+			     rv != RSS_OK ? rv : rh);
 	}
 	return ret;
 }
