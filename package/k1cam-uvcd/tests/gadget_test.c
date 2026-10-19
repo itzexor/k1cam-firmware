@@ -245,6 +245,13 @@ static void test_encoder_failures(void)
 	assert(applies == calls && p.controls.h264_max_qp == -1);
 
 	char reply_buf[128];
+	assert(uvcd_ctl_command(&g, "info h264-max-qp", reply_buf, sizeof(reply_buf)) == 0);
+	assert(!strcmp(reply_buf, "-1 -1 51 -1\nok\n"));
+	assert(uvcd_ctl_command(&g, "info auto-exposure", reply_buf, sizeof(reply_buf)) == 0);
+	assert(!strcmp(reply_buf, "8 1 8 8\nok\n"));
+	assert(uvcd_ctl_command(&g, "info unknown", reply_buf, sizeof(reply_buf)) == 0);
+	assert(!strcmp(reply_buf, "err unknown control\n"));
+	assert(uvcd_ctl_command(&g, "info brightness", reply_buf, 4) == -1);
 	assert(uvcd_ctl_command(&g, "set brightness 9999999999999999999999999999", reply_buf, sizeof(reply_buf)) == 0);
 	assert(!strcmp(reply_buf, "err bad value\n"));
 	int before = good_saves;

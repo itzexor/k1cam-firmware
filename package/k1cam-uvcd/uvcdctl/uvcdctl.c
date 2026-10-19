@@ -163,10 +163,10 @@ static void usage(FILE *out, const char *prog)
 		"commands:\n"
 		"  get <key>          read one control\n"
 		"  set <key> <value>  change one control (persists automatically)\n"
-		"  list               show every control's id, value, range and default\n"
-		"  describe [key]     explain what a control's values mean (all if no key)\n"
-		"  reset              restore factory defaults\n"
-		"  keyframe           make the H.264 stream emit a keyframe now\n"
+		"  list [key]        show values, ranges and defaults (all if no key)\n"
+		"  describe [key]    list with value descriptions\n"
+		"  reset             restore factory defaults\n"
+		"  keyframe          make the H.264 stream emit a keyframe now\n"
 		"\n"
 		"<key> is a control name or its numeric id (see list).\n"
 		"The camera is found automatically; override with --device /dev/videoN.\n",
@@ -377,13 +377,33 @@ static void print_value(const struct ctrl_def *def, int value)
 	printf("%s=%d\n", def->name, value);
 }
 
-/* Static text only -- needs no camera, so it works as offline reference. */
-static void describe(const struct ctrl_def *def)
+static int socket_request(const char *command, char *buf, size_t size);
+
+/* A negative fd selects the camera's local control socket. */
+static int list_read(int fd, const struct ctrl_def *def, int *value,
+		     int *min, int *max, int *dv)
 {
-	printf("%3u  %-28s %s\n", def->id, def->name, def->help);
+	if (fd >= 0)
+		return ctrl_range(fd, def, min, max, dv) == 0 &&
+		       ctrl_get(fd, def, value) == 0 ? 0 : -1;
+
+	char request[96], reply[160];
+	snprintf(request, sizeof(request), "info %s", def->name);
+	if (socket_request(request, reply, sizeof(reply)) != 0 ||
+	    sscanf(reply, "%d %d %d %d", value, min, max, dv) != 4) {
+		errno = EIO;
+		return -1;
+	}
+	/* The daemon stores UVC AE mode bits; the CLI uses V4L2 menu values. */
+	if (def->cid == V4L2_CID_EXPOSURE_AUTO) {
+		*value = *value == 1 ? V4L2_EXPOSURE_MANUAL : V4L2_EXPOSURE_APERTURE_PRIORITY;
+		*min = V4L2_EXPOSURE_MANUAL;
+		*max = *dv = V4L2_EXPOSURE_APERTURE_PRIORITY;
+	}
+	return 0;
 }
 
-static int cmd_list(int fd)
+static int cmd_list(int fd, const struct ctrl_def *selected, bool descriptions)
 {
 	int rc = 0;
 	/* Values changed from their default stand out -- on a terminal only,
@@ -391,29 +411,30 @@ static int cmd_list(int fd)
 	bool color = isatty(STDOUT_FILENO) && !getenv("NO_COLOR");
 	const char *hl_on = color ? "\033[1;33m" : "";
 	const char *hl_off = color ? "\033[0m" : "";
-	printf("%3s  %-28s %-4s %6s %6s %6s %7s\n", "ID", "NAME", "UNIT", "VALUE", "MIN", "MAX",
-	       "DEFAULT");
+	printf("%3s  %-28s %-4s %6s %6s %6s %7s%s\n", "ID", "NAME", "UNIT", "VALUE", "MIN", "MAX",
+	       "DEFAULT", descriptions ? "  DESCRIPTION" : "");
 	for (size_t i = 0; i < CTRL_COUNT; i++) {
 		const struct ctrl_def *def = &ctrl_defs[i];
+		if (selected && def != selected)
+			continue;
 		const char *kind = def->kind == CTRL_CUSTOM ? "xu" :
 				   def->kind == CTRL_CAMERA ? "ct" : "pu";
 		int min, max, dv, value;
 
 		/* Show unsupported controls rather than dropping them, so it
 		 * is obvious which ones a given firmware is missing. */
-		if (ctrl_range(fd, def, &min, &max, &dv) != 0) {
-			printf("%3u  %-28s %-4s %6s\n", def->id, def->name, kind,
-			       is_unsupported(errno) ? "unsupported" : "error");
-			rc = 1;
-			continue;
-		}
-		if (ctrl_get(fd, def, &value) != 0) {
+		if (list_read(fd, def, &value, &min, &max, &dv) != 0) {
+			printf("%3u  %-28s %-4s %6s %6s %6s %7s  %s%s%s\n",
+			       def->id, def->name, kind, "-", "-", "-", "-",
+			       is_unsupported(errno) ? "unsupported" : "error",
+			       descriptions ? ": " : "", descriptions ? def->help : "");
 			rc = 1;
 			continue;
 		}
 		bool changed = value != dv;
-		printf("%3u  %-28s %-4s %s%6d%s %6d %6d %7d\n", def->id, def->name, kind,
-		       changed ? hl_on : "", value, changed ? hl_off : "", min, max, dv);
+		printf("%3u  %-28s %-4s %s%6d%s %6d %6d %7d%s%s\n", def->id, def->name, kind,
+		       changed ? hl_on : "", value, changed ? hl_off : "", min, max, dv,
+		       descriptions ? "  " : "", descriptions ? def->help : "");
 	}
 	return rc;
 }
@@ -497,7 +518,7 @@ static int parse_int(const char *text, int *value)
 	return 0;
 }
 
-static int socket_command(const char *command)
+static int socket_request(const char *command, char *buf, size_t size)
 {
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -508,11 +529,10 @@ static int socket_command(const char *command)
 		return -1;
 	}
 	dprintf(fd, "%s\n", command);
-	char buf[4097];
 	size_t used = 0;
 	ssize_t n = 0;
-	while (used < sizeof(buf) - 1) {
-		n = read(fd, buf + used, sizeof(buf) - 1 - used);
+	while (used < size - 1) {
+		n = read(fd, buf + used, size - 1 - used);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n <= 0)
@@ -520,12 +540,19 @@ static int socket_command(const char *command)
 		used += (size_t)n;
 	}
 	buf[used] = '\0';
-	fwrite(buf, 1, used, stdout);
 	close(fd);
 	/* The final protocol line decides success, including fragmented reads.
 	 * A full buffer without EOF is an oversized or incomplete reply. */
 	return n == 0 && used >= 3 && !memcmp(buf + used - 3, "ok\n", 3) &&
 	       (used == 3 || buf[used - 4] == '\n') ? 0 : 1;
+}
+
+static int socket_command(const char *command)
+{
+	char buf[4097] = {0};
+	int rc = socket_request(command, buf, sizeof(buf));
+	fputs(buf, stdout);
+	return rc;
 }
 
 int main(int argc, char **argv)
@@ -549,6 +576,8 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	const char *cmd = argv[argi++];
+	bool descriptions = strcmp(cmd, "describe") == 0;
+	bool listing = strcmp(cmd, "list") == 0 || descriptions;
 
 	/* Validate arity before opening anything, so a usage error never
 	 * depends on whether a camera happens to be plugged in. */
@@ -571,9 +600,13 @@ int main(int argc, char **argv)
 			fprintf(stderr, "uvcdctl: '%s' is not a number\n", argv[argi + 1]);
 			return 2;
 		}
-	} else if (strcmp(cmd, "describe") == 0) {
+	} else if (listing) {
+		if (argc - argi > 1) {
+			usage(stderr, argv[0]);
+			return 2;
+		}
 		key = argi < argc ? argv[argi] : NULL;
-	} else if (strcmp(cmd, "list") != 0 && strcmp(cmd, "reset") != 0 &&
+	} else if (strcmp(cmd, "reset") != 0 &&
 		   strcmp(cmd, "keyframe") != 0) {
 		usage(stderr, argv[0]);
 		return 2;
@@ -588,18 +621,9 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (strcmp(cmd, "describe") == 0) {
-		printf("%3s  %-28s %s\n", "ID", "NAME", "VALUES");
-		if (def) {
-			describe(def);
-		} else {
-			for (size_t i = 0; i < CTRL_COUNT; i++)
-				describe(&ctrl_defs[i]);
-		}
-		return 0;
-	}
-
 	if (!device && access(UVCD_SOCKET_PATH, F_OK) == 0) {
+		if (listing)
+			return cmd_list(-1, def, descriptions);
 		char request[160];
 		if (!strcmp(cmd, "get"))
 			snprintf(request, sizeof(request), "get %s", def->name);
@@ -637,8 +661,8 @@ int main(int argc, char **argv)
 				}
 			}
 		}
-	} else if (strcmp(cmd, "list") == 0) {
-		rc = cmd_list(fd);
+	} else if (listing) {
+		rc = cmd_list(fd, def, descriptions);
 	} else if (strcmp(cmd, "keyframe") == 0) {
 		rc = cmd_keyframe(fd);
 	} else {

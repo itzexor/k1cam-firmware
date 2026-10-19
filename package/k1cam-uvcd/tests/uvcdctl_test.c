@@ -1,4 +1,4 @@
-/* Exercise socket reply framing without a camera or a running daemon. */
+/* Exercise socket framing, USB writes and listings without a camera. */
 #include <assert.h>
 #include <stdarg.h>
 #define main uvcdctl_program_main
@@ -9,11 +9,20 @@
 #define dprintf test_dprintf
 #define ioctl test_ioctl
 #define open test_open
+#define access test_access
 #include "../uvcdctl/uvcdctl.c"
 #undef main
 
 static const char **chunks;
 static size_t chunk_index;
+static char last_request[160];
+static bool local_socket;
+
+int test_access(const char *path, int mode)
+{
+	assert(!strcmp(path, UVCD_SOCKET_PATH) && mode == F_OK);
+	return local_socket ? 0 : -1;
+}
 
 int test_socket(int domain, int type, int protocol)
 {
@@ -30,9 +39,12 @@ int test_connect(int fd, const struct sockaddr *addr, socklen_t len)
 int test_close(int fd) { assert(fd == 7); return 0; }
 int test_dprintf(int fd, const char *fmt, ...)
 {
-	(void)fmt;
 	assert(fd == 7);
-	return 1;
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(last_request, sizeof(last_request), fmt, ap);
+	va_end(ap);
+	return n;
 }
 ssize_t test_read(int fd, void *buf, size_t size)
 {
@@ -47,7 +59,7 @@ ssize_t test_read(int fd, void *buf, size_t size)
 	return (ssize_t)n;
 }
 
-static int current_qp = 30, get_error;
+static int current_qp = 30, get_error, range_error;
 int test_open(const char *path, int flags, ...)
 {
 	(void)flags;
@@ -76,7 +88,10 @@ int test_ioctl(int fd, unsigned long request, ...)
 	struct uvc_xu_control_query *q = arg;
 	int v = 0;
 	switch (q->query) {
-	case UVC_GET_MIN: v = -1; break;
+	case UVC_GET_MIN:
+		if (range_error) { errno = range_error; return -1; }
+		v = -1;
+		break;
 	case UVC_GET_MAX: v = 51; break;
 	case UVC_GET_DEF: v = -1; break;
 	case UVC_SET_CUR: return 0; /* USB ACK, even if the daemon rejects it */
@@ -96,6 +111,101 @@ static void check(const char **reply_chunks, int expected)
 	chunks = reply_chunks;
 	chunk_index = 0;
 	assert(socket_command("set brightness 128") == expected);
+}
+
+static int capture_list(const char *command, const char *key, char *out, size_t size)
+{
+	FILE *capture = tmpfile();
+	assert(capture);
+	fflush(stdout);
+	int saved = dup(STDOUT_FILENO);
+	assert(saved >= 0 && dup2(fileno(capture), STDOUT_FILENO) >= 0);
+	char *args[] = {"uvcdctl", "--device", "/fake", (char *)command, (char *)key, NULL};
+	char *local_args[] = {"uvcdctl", (char *)command, (char *)key, NULL};
+	int rc = local_socket ? uvcdctl_program_main(key ? 3 : 2, local_args) :
+		uvcdctl_program_main(key ? 5 : 4, args);
+	fflush(stdout);
+	assert(dup2(saved, STDOUT_FILENO) >= 0);
+	FILE *saved_stream = fdopen(saved, "w");
+	assert(saved_stream);
+	fclose(saved_stream);
+	rewind(capture);
+	size_t n = fread(out, 1, size - 1, capture);
+	assert(feof(capture));
+	out[n] = '\0';
+	fclose(capture);
+	return rc;
+}
+
+static void check_listings(void)
+{
+	char brief[16384], detailed[16384], numeric[16384];
+	assert(capture_list("list", "h264-max-qp", brief, sizeof(brief)) == 0);
+	assert(capture_list("describe", "h264-max-qp", detailed, sizeof(detailed)) == 0);
+	assert(capture_list("describe", "44", numeric, sizeof(numeric)) == 0);
+	assert(!strcmp(detailed, numeric));
+	assert(strstr(brief, "h264-max-qp") && !strstr(brief, "brightness"));
+	assert(strstr(brief, "DEFAULT") && !strstr(brief, "DESCRIPTION"));
+	assert(!strstr(brief, find_ctrl("44")->help));
+	assert(strstr(detailed, "DESCRIPTION") && strstr(detailed, find_ctrl("44")->help));
+	assert(!strchr(detailed, '\033')); /* redirected output has no colour */
+	/* The detailed row is the brief row with the help text appended. */
+	const char *brief_row = strchr(brief, '\n') + 1;
+	const char *detailed_row = strchr(detailed, '\n') + 1;
+	assert(!strncmp(brief_row, detailed_row, strcspn(brief_row, "\n")));
+	assert(capture_list("list", NULL, brief, sizeof(brief)) == 0);
+	assert(capture_list("describe", NULL, detailed, sizeof(detailed)) == 0);
+	for (size_t i = 0; i < CTRL_COUNT; i++) {
+		assert(strstr(brief, ctrl_defs[i].name));
+		assert(strstr(detailed, ctrl_defs[i].help));
+	}
+	range_error = ENOENT;
+	assert(capture_list("describe", "44", detailed, sizeof(detailed)) == 1);
+	assert(strstr(detailed, "unsupported") && strstr(detailed, find_ctrl("44")->help));
+	range_error = 0;
+	get_error = 1;
+	assert(capture_list("describe", "44", detailed, sizeof(detailed)) == 1);
+	assert(strstr(detailed, "error") && strstr(detailed, find_ctrl("44")->help));
+	get_error = 0;
+	assert(capture_list("list", "unknown", brief, sizeof(brief)) == 2);
+	assert(!*brief);
+	char *extra[] = {"uvcdctl", "list", "44", "extra", NULL};
+	assert(uvcdctl_program_main(4, extra) == 2);
+	extra[1] = "describe";
+	assert(uvcdctl_program_main(4, extra) == 2);
+
+	int value, min, max, dv;
+	const char *info[] = {"20 -1 ", "51 -1\nok\n", NULL};
+	chunks = info;
+	chunk_index = 0;
+	assert(list_read(-1, find_ctrl("44"), &value, &min, &max, &dv) == 0);
+	assert(value == 20 && min == -1 && max == 51 && dv == -1);
+	assert(!strcmp(last_request, "info h264-max-qp\n"));
+	/* Both transports pass their data through exactly the same formatter. */
+	assert(capture_list("describe", "44", detailed, sizeof(detailed)) == 0);
+	assert(capture_list("list", "44", brief, sizeof(brief)) == 0);
+	local_socket = true;
+	chunks = info;
+	chunk_index = 0;
+	assert(capture_list("describe", "44", numeric, sizeof(numeric)) == 0);
+	assert(!strcmp(detailed, numeric));
+	chunk_index = 0;
+	assert(capture_list("list", "44", numeric, sizeof(numeric)) == 0);
+	assert(!strcmp(brief, numeric));
+	local_socket = false;
+	const char *ae[] = {"8 1 8 8\nok\n", NULL};
+	chunks = ae;
+	chunk_index = 0;
+	assert(list_read(-1, find_ctrl("auto-exposure"), &value, &min, &max, &dv) == 0);
+	assert(value == 3 && min == 1 && max == 3 && dv == 3);
+	const char *bad_info[] = {"err unknown control\n", NULL};
+	chunks = bad_info;
+	chunk_index = 0;
+	assert(list_read(-1, find_ctrl("44"), &value, &min, &max, &dv) == -1);
+	const char *malformed[] = {"20 -1\nok\n", NULL};
+	chunks = malformed;
+	chunk_index = 0;
+	assert(list_read(-1, find_ctrl("44"), &value, &min, &max, &dv) == -1);
 }
 
 int main(void)
@@ -120,6 +230,7 @@ int main(void)
 	args[4] = "pan";
 	args[5] = "200";
 	assert(uvcdctl_program_main(6, args) == 0); /* host step alignment to 0 */
+	check_listings();
 	puts("uvcdctl regression tests passed");
 	return 0;
 }

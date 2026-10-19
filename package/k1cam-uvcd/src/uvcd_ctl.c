@@ -39,6 +39,10 @@ int uvcd_ctl_command(gadget_t *g, const char *line, char *out, size_t size)
 	const struct uvcd_ctrl_def *def = n >= 2 ? uvcd_ctrl_find(name) : NULL;
 	if (!def)
 		return reply(out, size, "err unknown control");
+	if (!strcmp(command, "info") && n == 2) {
+		return snprintf(out, size, "%d %d %d %d\nok\n", uvcd_ctrl_get(g, def),
+				def->min, def->max, def->def) < (int)size ? 0 : -1;
+	}
 	if (!strcmp(command, "get") && n == 2) {
 		snprintf(out, size, "%d\nok\n", uvcd_ctrl_get(g, def));
 		return 0;

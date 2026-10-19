@@ -14,7 +14,7 @@ on the standard path.
 ## Commands
 
 ```sh
-uvcdctl list
+uvcdctl list [control]
 uvcdctl describe [control]
 uvcdctl get <control>
 uvcdctl set <control> <value>
@@ -22,18 +22,19 @@ uvcdctl keyframe
 uvcdctl reset
 ```
 
-`list` displays every control's ID, current value, range, and default. On a
-terminal, values that differ from the default are highlighted (set `NO_COLOR`
-to turn this off).
-`describe` explains what each control's values mean; it reads nothing from the
-camera, so it works without one attached:
+`list` and `describe` share the same listing: each control's ID, unit, current
+value, range, and default. `describe` also includes a description column
+explaining the values. Pass a control name or numeric ID to either command to
+show just that control; omit it to show all controls. Both commands read from
+the camera. On a terminal, values that differ from the default are highlighted
+(set `NO_COLOR` to turn this off). For example, `describe h264-bitrate-kbps`:
 
 ```
- ID  NAME                         VALUES
- 40  h264-bitrate-kbps            0: automatic, 1-16000: target kbps
+ ID  NAME                         UNIT  VALUE    MIN    MAX DEFAULT  DESCRIPTION
+ 40  h264-bitrate-kbps             xu        0      0  16000       0  0: automatic, 1-16000: target kbps
 ```
 
-Control names and numeric IDs are accepted by `get`, `set`, and `describe`.
+Control names and numeric IDs are accepted by `get`, `set`, `list`, and `describe`.
 `get` and `set` print `name=value`. After a USB write, `set` checks the
 returned value and exits with status 1 if it differs or cannot be read.
 Standard V4L2 controls can be cached by the host driver; this is not an
@@ -93,7 +94,10 @@ other size takes the full 400. (On firmware that leaves the ISP at its
 for 1280x720.) `get zoom` still reports what was set, so switching to a
 smaller size gets the rest of it back.
 
-By default, `uvcdctl` selects the `uvcvideo` node that answers an Extension
-Unit 4 query. Use `--device /dev/videoN` to select a device explicitly.
+On the camera, `uvcdctl` uses the daemon's local socket at `/var/run/uvcd.sock`.
+On a USB host, it selects the `uvcvideo` node that answers an Extension Unit 4
+query. Both paths use the same `list`/`describe` formatting. Local readings
+come from the daemon's control state. Use `--device /dev/videoN` to select a
+V4L2 device explicitly.
 
 Exit status is 0 on success, 1 on a device error, 2 on a usage error.
