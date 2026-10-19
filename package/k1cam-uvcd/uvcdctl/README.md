@@ -20,7 +20,14 @@ uvcdctl get <control>
 uvcdctl set <control> <value>
 uvcdctl keyframe
 uvcdctl reset
+uvcdctl help [command]
 ```
+
+`help` shows the command list; `help <command>` shows that command's syntax,
+description, and examples without accessing a camera. For example, use
+`uvcdctl help set` for writing controls. `get` and `set` without their required
+arguments print their own usage to standard error and exit with status 2.
+`<command> --help` and `<command> -h` also show command-specific help.
 
 `list` and `describe` share the same listing: each control's ID, unit, current
 value, range, and default. `describe` also includes a description column

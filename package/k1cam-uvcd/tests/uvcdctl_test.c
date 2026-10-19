@@ -113,19 +113,17 @@ static void check(const char **reply_chunks, int expected)
 	assert(socket_command("set brightness 128") == expected);
 }
 
-static int capture_list(const char *command, const char *key, char *out, size_t size)
+static int capture_command(int argc, char **argv, FILE *stream, char *out, size_t size)
 {
 	FILE *capture = tmpfile();
 	assert(capture);
-	fflush(stdout);
-	int saved = dup(STDOUT_FILENO);
-	assert(saved >= 0 && dup2(fileno(capture), STDOUT_FILENO) >= 0);
-	char *args[] = {"uvcdctl", "--device", "/fake", (char *)command, (char *)key, NULL};
-	char *local_args[] = {"uvcdctl", (char *)command, (char *)key, NULL};
-	int rc = local_socket ? uvcdctl_program_main(key ? 3 : 2, local_args) :
-		uvcdctl_program_main(key ? 5 : 4, args);
-	fflush(stdout);
-	assert(dup2(saved, STDOUT_FILENO) >= 0);
+	fflush(stream);
+	int target = fileno(stream);
+	int saved = dup(target);
+	assert(saved >= 0 && dup2(fileno(capture), target) >= 0);
+	int rc = uvcdctl_program_main(argc, argv);
+	fflush(stream);
+	assert(dup2(saved, target) >= 0);
 	FILE *saved_stream = fdopen(saved, "w");
 	assert(saved_stream);
 	fclose(saved_stream);
@@ -135,6 +133,64 @@ static int capture_list(const char *command, const char *key, char *out, size_t 
 	out[n] = '\0';
 	fclose(capture);
 	return rc;
+}
+
+static int capture_list(const char *command, const char *key, char *out, size_t size)
+{
+	char *args[] = {"uvcdctl", "--device", "/fake", (char *)command, (char *)key, NULL};
+	char *local_args[] = {"uvcdctl", (char *)command, (char *)key, NULL};
+	return local_socket ? capture_command(key ? 3 : 2, local_args, stdout, out, size) :
+		capture_command(key ? 5 : 4, args, stdout, out, size);
+}
+
+static void check_help(void)
+{
+	char out[4096];
+	/* Any attempted device open would fail the /fake assertion in test_open. */
+	char *args[] = {"uvcdctl", "--device", "/must-not-open", "get", NULL, NULL, NULL};
+	assert(capture_command(4, args, stderr, out, sizeof(out)) == 2);
+	assert(strstr(out, "usage: uvcdctl [--device PATH] get <key>\n"));
+	assert(!strstr(out, "commands:") && !strstr(out, "no k1cam camera"));
+	args[3] = "set";
+	assert(capture_command(4, args, stderr, out, sizeof(out)) == 2);
+	assert(strstr(out, "usage: uvcdctl [--device PATH] set <key> <value>\n"));
+	assert(!strstr(out, "commands:"));
+	args[4] = "brightness";
+	assert(capture_command(5, args, stderr, out, sizeof(out)) == 2);
+	assert(strstr(out, "set <key> <value>"));
+	args[3] = "get";
+	args[5] = "extra";
+	assert(capture_command(6, args, stderr, out, sizeof(out)) == 2);
+	assert(strstr(out, "get <key>") && !strstr(out, "commands:"));
+
+	args[3] = "help";
+	args[4] = NULL;
+	assert(capture_command(4, args, stdout, out, sizeof(out)) == 0);
+	assert(strstr(out, "commands:") && strstr(out, "help [command]"));
+	const char *topics[] = {"get", "set", "list", "describe", "reset", "keyframe", "help"};
+	for (size_t i = 0; i < sizeof(topics) / sizeof(topics[0]); i++) {
+		char expected[96], help[4096];
+		args[3] = "help";
+		args[4] = (char *)topics[i];
+		assert(capture_command(5, args, stdout, help, sizeof(help)) == 0);
+		snprintf(expected, sizeof(expected), "usage: uvcdctl [--device PATH] %s", topics[i]);
+		assert(strstr(help, expected) && strstr(help, "Example"));
+		assert(!strstr(help, "commands:"));
+		args[3] = (char *)topics[i];
+		args[4] = "--help";
+		assert(capture_command(5, args, stdout, out, sizeof(out)) == 0);
+		assert(!strcmp(out, help));
+		args[4] = "-h";
+		assert(capture_command(5, args, stdout, out, sizeof(out)) == 0);
+		assert(!strcmp(out, help));
+	}
+	args[3] = "help";
+	args[4] = "unknown";
+	assert(capture_command(5, args, stderr, out, sizeof(out)) == 2);
+	assert(strstr(out, "unknown command 'unknown'") && strstr(out, "help [command]"));
+	args[4] = "get";
+	assert(capture_command(6, args, stderr, out, sizeof(out)) == 2);
+	assert(strstr(out, "help [command]") && !strstr(out, "commands:"));
 }
 
 static void check_listings(void)
@@ -231,6 +287,7 @@ int main(void)
 	args[5] = "200";
 	assert(uvcdctl_program_main(6, args) == 0); /* host step alignment to 0 */
 	check_listings();
+	check_help();
 	puts("uvcdctl regression tests passed");
 	return 0;
 }

@@ -156,21 +156,83 @@ static const struct ctrl_def ctrl_defs[] = {
 };
 #define CTRL_COUNT (sizeof(ctrl_defs) / sizeof(ctrl_defs[0]))
 
+struct command_def {
+	const char *name;
+	const char *args;
+	unsigned min_args, max_args;
+	const char *summary;
+	const char *description;
+};
+
+static const struct command_def commands[] = {
+	{"get", "<key>", 1, 1, "read one control",
+	 "Read the current value of one control.\n"
+	 "<key> is a control name or numeric ID from list.\n"
+	 "USB standard controls may reflect the host driver's cache; local reads\n"
+	 "use the daemon's control state.\n\n"
+	 "Examples:\n  uvcdctl get brightness\n  uvcdctl get 1\n"},
+	{"set", "<key> <value>", 2, 2, "change one control (persists automatically)",
+	 "Change one control to a numeric value. Accepted changes persist\n"
+	 "automatically; there is no save step. USB writes are checked by readback.\n"
+	 "<key> is a control name or numeric ID from list. Use describe <key>\n"
+	 "to see the range, default and meaning of its values.\n\n"
+	 "Examples:\n  uvcdctl set brightness 128\n  uvcdctl set 1 128\n"},
+	{"list", "[key]", 0, 1, "show values, ranges and defaults (all if no key)",
+	 "Show each control's ID, name, unit, current value, range and default.\n"
+	 "Omit <key> for all controls, or pass a control name or numeric ID.\n"
+	 "Changed values are highlighted on a terminal unless NO_COLOR is set.\n"
+	 "Use describe for the same table with value descriptions.\n\n"
+	 "Examples:\n  uvcdctl list\n  uvcdctl list brightness\n"},
+	{"describe", "[key]", 0, 1, "list with value descriptions",
+	 "Show the list table with an extra column explaining control values.\n"
+	 "Omit <key> for all controls, or pass a control name or numeric ID.\n"
+	 "Like list, this reads current values, ranges and defaults from the camera.\n\n"
+	 "Examples:\n  uvcdctl describe\n  uvcdctl describe h264-rate-control\n"},
+	{"reset", "", 0, 0, "restore factory defaults",
+	 "Restore every control to its factory default and persist the reset\n"
+	 "immediately. This affects all controls, including encoder settings.\n\n"
+	 "Example:\n  uvcdctl reset\n"},
+	{"keyframe", "", 0, 0, "make the H.264 stream emit a keyframe now",
+	 "Request an IDR keyframe from the running H.264 encoder.\n"
+	 "This has no effect unless an H.264 stream is active.\n\n"
+	 "Example:\n  uvcdctl keyframe\n"},
+	{"help", "[command]", 0, 1, "show general or command-specific help",
+	 "Omit <command> for the command list, or name a command to see its\n"
+	 "syntax, description and examples. Help works without a camera.\n\n"
+	 "Examples:\n  uvcdctl help\n  uvcdctl help set\n"},
+};
+#define COMMAND_COUNT (sizeof(commands) / sizeof(commands[0]))
+
+static const struct command_def *find_command(const char *name)
+{
+	for (size_t i = 0; i < COMMAND_COUNT; i++) {
+		if (!strcmp(name, commands[i].name))
+			return &commands[i];
+	}
+	return NULL;
+}
+
 static void usage(FILE *out, const char *prog)
 {
+	fprintf(out, "usage: %s [--device PATH] <command> [args]\ncommands:\n", prog);
+	for (size_t i = 0; i < COMMAND_COUNT; i++) {
+		char syntax[64];
+		snprintf(syntax, sizeof(syntax), "%s%s%s", commands[i].name,
+			 *commands[i].args ? " " : "", commands[i].args);
+		fprintf(out, "  %-18s %s\n", syntax, commands[i].summary);
+	}
 	fprintf(out,
-		"usage: %s [--device PATH] <command> [args]\n"
-		"commands:\n"
-		"  get <key>          read one control\n"
-		"  set <key> <value>  change one control (persists automatically)\n"
-		"  list [key]        show values, ranges and defaults (all if no key)\n"
-		"  describe [key]    list with value descriptions\n"
-		"  reset             restore factory defaults\n"
-		"  keyframe          make the H.264 stream emit a keyframe now\n"
 		"\n"
 		"<key> is a control name or its numeric id (see list).\n"
-		"The camera is found automatically; override with --device /dev/videoN.\n",
+		"The camera is found automatically; override with --device /dev/videoN.\n"
+		"Use %s help <command> for details and examples.\n",
 		prog);
+}
+
+static void command_usage(FILE *out, const char *prog, const struct command_def *cmd)
+{
+	fprintf(out, "usage: %s [--device PATH] %s%s%s\n\n%s", prog, cmd->name,
+		*cmd->args ? " " : "", cmd->args, cmd->description);
 }
 
 static int xioctl(int fd, unsigned long request, void *arg)
@@ -576,40 +638,54 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	const char *cmd = argv[argi++];
+	const struct command_def *command = find_command(cmd);
+	if (!command) {
+		fprintf(stderr, "uvcdctl: unknown command '%s'\n", cmd);
+		usage(stderr, argv[0]);
+		return 2;
+	}
+	if (argc - argi == 1 &&
+	    (!strcmp(argv[argi], "--help") || !strcmp(argv[argi], "-h"))) {
+		command_usage(stdout, argv[0], command);
+		return 0;
+	}
+	/* Validate arity before opening anything, so a usage error never
+	 * depends on whether a camera happens to be plugged in. */
+	unsigned nargs = (unsigned)(argc - argi);
+	if (nargs < command->min_args || nargs > command->max_args) {
+		command_usage(stderr, argv[0], command);
+		return 2;
+	}
+	if (!strcmp(cmd, "help")) {
+		if (!nargs) {
+			usage(stdout, argv[0]);
+			return 0;
+		}
+		const struct command_def *topic = find_command(argv[argi]);
+		if (!topic) {
+			fprintf(stderr, "uvcdctl: unknown command '%s'\n", argv[argi]);
+			command_usage(stderr, argv[0], command);
+			return 2;
+		}
+		command_usage(stdout, argv[0], topic);
+		return 0;
+	}
 	bool descriptions = strcmp(cmd, "describe") == 0;
 	bool listing = strcmp(cmd, "list") == 0 || descriptions;
 
-	/* Validate arity before opening anything, so a usage error never
-	 * depends on whether a camera happens to be plugged in. */
 	const char *key = NULL;
 	int value = 0;
 
 	if (strcmp(cmd, "get") == 0) {
-		if (argi >= argc) {
-			usage(stderr, argv[0]);
-			return 2;
-		}
 		key = argv[argi];
 	} else if (strcmp(cmd, "set") == 0) {
-		if (argi + 1 >= argc) {
-			usage(stderr, argv[0]);
-			return 2;
-		}
 		key = argv[argi];
 		if (parse_int(argv[argi + 1], &value) != 0) {
 			fprintf(stderr, "uvcdctl: '%s' is not a number\n", argv[argi + 1]);
 			return 2;
 		}
 	} else if (listing) {
-		if (argc - argi > 1) {
-			usage(stderr, argv[0]);
-			return 2;
-		}
 		key = argi < argc ? argv[argi] : NULL;
-	} else if (strcmp(cmd, "reset") != 0 &&
-		   strcmp(cmd, "keyframe") != 0) {
-		usage(stderr, argv[0]);
-		return 2;
 	}
 
 	const struct ctrl_def *def = NULL;
