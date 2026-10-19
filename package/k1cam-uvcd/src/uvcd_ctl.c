@@ -1,6 +1,7 @@
 #include "uvcd_ctl.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,8 +32,7 @@ int uvcd_ctl_command(gadget_t *g, const char *line, char *out, size_t size)
 		return snprintf(out + used, size - used, "ok\n") < (int)(size - used) ? 0 : -1;
 	}
 	if (!strcmp(command, "reset")) {
-		uvcd_ctrl_reset(g);
-		return reply(out, size, "ok");
+		return reply(out, size, uvcd_ctrl_reset(g) == 0 ? "ok" : "err reset incomplete");
 	}
 	if (!strcmp(command, "keyframe"))
 		return reply(out, size, uvcd_ctrl_keyframe(g) == 0 ? "ok" : "err keyframe failed");
@@ -45,9 +45,11 @@ int uvcd_ctl_command(gadget_t *g, const char *line, char *out, size_t size)
 	}
 	if (!strcmp(command, "set") && n == 3) {
 		char *end;
+		errno = 0;
 		long value = strtol(arg, &end, 10);
 		int applied;
-		if (*arg == '\0' || *end != '\0')
+		if (*arg == '\0' || *end != '\0' || errno == ERANGE ||
+		    value < INT_MIN || value > INT_MAX)
 			return reply(out, size, "err bad value");
 		if (uvcd_ctrl_set(g, def, (int)value, &applied) != 0)
 			return reply(out, size, "err apply failed");

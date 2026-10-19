@@ -20,9 +20,9 @@
 /* Seed *out with every control's compiled-in default. */
 void uvcd_config_defaults(struct uvcd_control_state *out);
 
-/* Seed *out with defaults, then override from path if it exists. A missing
- * file, or missing/unrecognized/out-of-range keys within it, are not
- * errors -- the corresponding field is just left at its default. */
+/* Seed *out with defaults, then override from path if it exists. Missing,
+ * unknown or malformed values keep their defaults. Valid integers clamp and
+ * normalize exactly as live controls do; crossed QP bounds become automatic. */
 void uvcd_config_load(const char *path, struct uvcd_control_state *out);
 
 /* Atomically write *in to path as flat "name=value" lines (temp file +

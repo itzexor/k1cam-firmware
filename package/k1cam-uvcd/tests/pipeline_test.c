@@ -1,5 +1,6 @@
 /* Host regression tests. Link with --gc-sections to discard hardware paths. */
 #include <assert.h>
+#include <stdarg.h>
 #include "../src/uvcd_camera.c"
 #include "../src/uvcd_pipeline.c"
 
@@ -32,10 +33,15 @@ static rss_video_config_t enc;
 static uint32_t stream_size;
 static int stream_count, buffer_error, encoder_calls, destroyed;
 
+static char log_text[8192];
 void uvcd_log(int level, const char *fmt, ...)
 {
 	(void)level;
-	(void)fmt;
+	size_t used = strlen(log_text);
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(log_text + used, sizeof(log_text) - used, fmt, ap);
+	va_end(ap);
 }
 
 static int channel_ok(void *ctx, int chn)
@@ -439,6 +445,7 @@ int rss_hal_get_imp_version(char *buf, int size)
 
 static uint32_t sensor_rate, encoder_rate;
 static int csc_mode, expr_writes, inits;
+static int rate_errors, expr_errors, vflip_errors, hflip, vflip;
 static struct uvcd_imp_expr last_expr;
 static rss_wb_config_t last_wb;
 
@@ -454,6 +461,10 @@ static int set_sensor_rate(void *ctx, uint32_t num, uint32_t den)
 {
 	(void)ctx;
 	assert(den == 1);
+	if (rate_errors) {
+		rate_errors--;
+		return -EIO;
+	}
 	sensor_rate = num;
 	return 0;
 }
@@ -484,8 +495,12 @@ static int set_csc(void *ctx, const void *attr)
 static int set_expr(void *ctx, const void *attr)
 {
 	(void)ctx;
-	last_expr = *(const struct uvcd_imp_expr *)attr;
 	expr_writes++;
+	if (expr_errors) {
+		expr_errors--;
+		return -EIO;
+	}
+	last_expr = *(const struct uvcd_imp_expr *)attr;
 	return 0;
 }
 
@@ -512,6 +527,119 @@ static int set_wb(void *ctx, const rss_wb_config_t *cfg)
 	return 0;
 }
 
+static int set_level(void *ctx, int value);
+static int set_isp_mode(void *ctx, rss_isp_mode_t mode) { return set_level(ctx, mode); }
+static int set_flicker(void *ctx, rss_antiflicker_t mode) { return set_level(ctx, mode); }
+static int hal_deinit(void *ctx) { (void)ctx; return 0; }
+static int set_hflip(void *ctx, int value) { (void)ctx; hflip = value; return 0; }
+static int set_vflip(void *ctx, int value)
+{
+	(void)ctx;
+	if (vflip_errors) { vflip_errors--; return -EIO; }
+	vflip = value;
+	return 0;
+}
+static int get_flip(void *ctx, int *h, int *v) { (void)ctx; *h = hflip; *v = vflip; return 0; }
+static int reject_level(void *ctx, int value) { (void)ctx; (void)value; return -EIO; }
+
+/* A real T31 supplies these setters; focused tests override individual ones. */
+static void startup_ops(rss_hal_ops_t *ops)
+{
+	ops->isp_set_brightness = set_level;
+	ops->isp_set_contrast = set_level;
+	ops->isp_set_saturation = set_level;
+	ops->isp_set_sharpness = set_level;
+	ops->isp_set_sinter_strength = set_level;
+	ops->isp_set_temper_strength = set_level;
+	ops->isp_set_hue = set_level;
+	ops->isp_set_max_again = set_level;
+	ops->isp_set_max_dgain = set_level;
+	ops->isp_set_dpc_strength = set_level;
+	ops->isp_set_drc_strength = set_level;
+	ops->isp_set_backlight_comp = set_level;
+	ops->isp_set_highlight_depress = set_level;
+	ops->isp_set_running_mode = set_isp_mode;
+	ops->isp_set_bypass = set_level;
+	ops->isp_set_antiflicker = set_flicker;
+	ops->isp_set_hflip = set_hflip;
+	ops->isp_set_vflip = set_vflip;
+	ops->isp_get_hvflip = get_flip;
+	ops->isp_set_wb = set_wb;
+	ops->deinit = hal_deinit;
+}
+
+static void test_control_failures(void)
+{
+	rss_hal_ops_t ops = {.init = hal_init, .isp_set_sensor_fps = set_sensor_rate,
+		.isp_set_expr = set_expr, .isp_set_ae_comp = set_comp, .isp_set_ae_weight = set_weight};
+	startup_ops(&ops);
+	struct uvcd_control_state c = {.zoom = 100, .gamma = 100, .wb_auto = 1,
+		.ae_mode = UVCD_AE_APERTURE_PRIORITY, .metering = UVCD_METERING_CENTER};
+	uvcd_camera_t cam = {.ops = &ops, .controls = &c};
+	int before;
+	/* Rejected startup writes are named in the log; the camera comes up. */
+	log_text[0] = '\0';
+	ops.isp_set_brightness = reject_level;
+	assert(uvcd_camera_up(&cam) == 0 && cam.up);
+	assert(strstr(log_text, "startup brightness rejected (-5)"));
+	uvcd_camera_down(&cam);
+	ops.isp_set_brightness = set_level;
+	log_text[0] = '\0';
+	c.gamma = 120; /* a non-default curve cannot be applied without a reference */
+	assert(uvcd_camera_up(&cam) == 0 && cam.up);
+	assert(strstr(log_text, "startup gamma rejected"));
+	uvcd_camera_down(&cam);
+	log_text[0] = '\0';
+	c.gamma = 100;
+	assert(uvcd_camera_up(&cam) == 0 && !strstr(log_text, "startup gamma"));
+	uvcd_camera_down(&cam);
+	log_text[0] = '\0';
+	rate_errors = 1;
+	assert(uvcd_camera_up(&cam) == 0 && cam.up);
+	assert(strstr(log_text, "startup exposure rejected (-5)"));
+	uvcd_camera_down(&cam);
+	assert(uvcd_camera_up(&cam) == 0 && cam.up && cam.sensor_fps == 30);
+
+	/* A rejected stream rate still streams, at the sensor's current rate. */
+	log_text[0] = '\0';
+	rate_errors = 1;
+	assert(uvcd_camera_acquire(&cam, UVCD_FRAME_720P, 15) == 0);
+	assert(cam.leased && cam.sensor_fps == 30);
+	assert(strstr(log_text, "sensor fps 15 rejected (-5)"));
+	uvcd_camera_release(&cam);
+
+	struct uvcd_control_state next = c;
+	next.rotation = 180;
+	hflip = vflip = 0;
+	vflip_errors = 1;
+	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, rotation)) == -EIO);
+	assert(hflip == 0 && vflip == 0);
+	assert(uvcd_camera_apply(&cam, &next, offsetof(struct uvcd_control_state, rotation)) == 0);
+	assert(hflip == 1 && vflip == 1);
+
+	c.ae_mode = UVCD_AE_MANUAL;
+	c.exposure_time = 100;
+	cam.leased = true;
+	cam.lease_fps = 30;
+	assert(apply_exposure(&cam, &c) == 0);
+	next = c;
+	next.ae_priority = 1;
+	next.exposure_time = 500; /* needs 20 fps */
+	rate_errors = 1;
+	before = expr_writes;
+	assert(apply_exposure(&cam, &next) == -EIO && expr_writes == before);
+	assert(cam.sensor_fps == 30);
+	expr_errors = 1;
+	assert(apply_exposure(&cam, &next) == -EIO);
+	assert(cam.sensor_fps == 30 && sensor_rate == 30 && last_expr.time == 10000);
+	assert(apply_exposure(&cam, &next) == 0 && cam.sensor_fps == 20 && last_expr.time == 50000);
+
+	next = c;
+	next.metering = UVCD_METERING_TUNING;
+	assert(apply_metering(&cam, &next) == -ENOTSUP);
+	uvcd_camera_down(&cam);
+}
+
 static void test_camera_lease(void)
 {
 	rss_hal_ops_t ops = {
@@ -530,7 +658,9 @@ static void test_camera_lease(void)
 		.enc_set_fps = set_encoder_rate,
 	};
 	uvcd_pipeline_t p = {.cam = {.ops = &ops, .sensor_w = 1920, .sensor_h = 1080}};
+	startup_ops(&ops);
 	p.cam.controls = &p.controls;
+	p.controls.gamma = 100;
 	p.controls.zoom = 100;
 	p.controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
 	p.controls.ae_comp = 128;
@@ -739,7 +869,10 @@ static void test_idle_pacing(void)
 		.isp_set_ae_comp = set_comp,
 		.isp_set_brightness = set_level,
 	};
+	startup_ops(&ops);
 	struct uvcd_control_state controls = {0};
+	controls.gamma = 100;
+	controls.wb_auto = 1;
 	controls.zoom = 100;
 	controls.ae_mode = UVCD_AE_APERTURE_PRIORITY;
 	controls.ae_comp = 128;
@@ -855,6 +988,7 @@ static int configure(uvcd_pipeline_t *p, uint8_t format, uint8_t frame, uint32_t
 int main(void)
 {
 	rss_hal_ops_t ops = {
+		.isp_set_sensor_fps = set_sensor_rate,
 		.fs_create_channel = create_fs,
 		.fs_destroy_channel = destroy,
 		.fs_set_fifo = depth_ok,
@@ -963,6 +1097,7 @@ int main(void)
 	test_metering_exit_failure();
 	test_camera_lease();
 	test_idle_pacing();
+	test_control_failures();
 	puts("pipeline regression tests passed");
 	return 0;
 }

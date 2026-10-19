@@ -520,12 +520,13 @@ static void config_mark_dirty(gadget_t *g)
 }
 
 /* Write pending changes once they have settled, or now if force. */
-static void config_flush(gadget_t *g, bool force)
+static int config_flush(gadget_t *g, bool force)
 {
 	if (!g->config_dirty ||
 	    (!force && uvcd_monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_MS))
-		return;
-	if (uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls) != 0)
+		return 0;
+	int ret = uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls);
+	if (ret != 0)
 		/* Don't spin retrying a write that keeps failing (read-only
 		 * rootfs, full flash): drop the flag and let the next accepted
 		 * control change arm another attempt. */
@@ -533,6 +534,7 @@ static void config_flush(gadget_t *g, bool force)
 	else
 		LOGI("controls persisted to %s", UVCD_CONFIG_PATH);
 	g->config_dirty = false;
+	return ret;
 }
 
 const struct uvcd_ctrl_def *uvcd_ctrl_find(const char *name)
@@ -552,26 +554,32 @@ int uvcd_ctrl_get(gadget_t *g, const struct uvcd_ctrl_def *def)
 }
 
 /* Encoder settings whose value the pipeline reads from the stored state. */
-static void encoder_restart(gadget_t *g, uint8_t format)
+static void resync_reader(gadget_t *g)
+{
+	g->read_seq = 0;
+	g->watched_seq = 0;
+	g->last_frame_ms = uvcd_monotonic_ms();
+	g->healthy_since_ms = 0;
+}
+
+static int encoder_restart(gadget_t *g, uint8_t format)
 {
 	if (g->defer_encoder_restart) {
 		if (format == UVCD_FMT_H264)
 			g->restart_h264 = true;
 		else
 			g->restart_mjpeg = true;
-		return;
+		return 0;
 	}
-	/* The pipeline's frame sequence restarts at 0, so resync the reader or
-	 * it would wait for the old count to be passed again. */
-	if (uvcd_pipeline_restart_encoder(g->pipe, format)) {
-		g->read_seq = 0;
-		g->watched_seq = 0;
-		g->last_frame_ms = uvcd_monotonic_ms();
-		g->healthy_since_ms = 0;
-	}
+	if (!g->pipe->running || g->pipe->cur_format != format)
+		return 0; /* inactive format: staged for its next stream */
+	bool ok = uvcd_pipeline_restart_encoder(g->pipe, format);
+	/* A failed restart can also reset the sequence during recovery. */
+	resync_reader(g);
+	return ok ? 0 : -EIO;
 }
 
-static void encoder_after_store(gadget_t *g, uint8_t selector)
+static int encoder_after_store(gadget_t *g, uint8_t selector)
 {
 	int ret = 0;
 
@@ -583,39 +591,20 @@ static void encoder_after_store(gadget_t *g, uint8_t selector)
 	case UVCD_CUSTOM_H264_MIN_QP:
 	case UVCD_CUSTOM_H264_MAX_QP:
 	case UVCD_CUSTOM_H264_PROFILE:
-		encoder_restart(g, UVCD_FMT_H264);
+		ret = encoder_restart(g, UVCD_FMT_H264);
 		break;
 	case UVCD_CUSTOM_MJPEG_QUALITY:
-		encoder_restart(g, UVCD_FMT_MJPEG);
+		ret = encoder_restart(g, UVCD_FMT_MJPEG);
 		break;
 	default:
 		break;
 	}
-	/* Stored either way: a setting the live encoder refused still applies
-	 * from the next stream start. */
-	if (ret != 0)
-		LOGW("encoder did not take selector %u live (%d); applies next stream", selector,
-		     ret);
-}
-
-/* Controls whose values mean one of a few things: store the meaning, not
- * whatever in-between number arrived. */
-static int normalize_value(const struct uvcd_ctrl_def *def, int value)
-{
-	if (def->kind == UVCD_CTRL_CUSTOM && def->selector == UVCD_CUSTOM_ROTATION)
-		return value >= 90 ? 180 : 0;
-	if (def->kind == UVCD_CTRL_CAMERA && def->selector == UVC_CT_AE_MODE_CONTROL)
-		return value == UVCD_AE_MANUAL ? UVCD_AE_MANUAL : UVCD_AE_APERTURE_PRIORITY;
-	return value;
+	return ret;
 }
 
 int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *out_applied)
 {
-	if (value < def->min)
-		value = def->min;
-	if (value > def->max)
-		value = def->max;
-	value = normalize_value(def, value);
+	value = uvcd_ctrl_normalize(def, value);
 
 	/* Hosts rewrite values they already have (uvcvideo probes
 	 * power-line-frequency on every connect): nothing to persist or
@@ -624,6 +613,10 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 	int *field = uvcd_ctrl_field(&next, def);
 	bool changed = *field != value;
 	*field = value;
+	if (!uvcd_ctrl_qp_valid(&next)) {
+		LOGW("%s=%d would cross H.264 QP bounds", def->name, value);
+		return -1;
+	}
 	if (changed)
 		guard_change(g);
 
@@ -637,19 +630,30 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 	if (changed && def->kind == UVCD_CTRL_CAMERA &&
 	    (def->selector == UVC_CT_ZOOM_ABSOLUTE_CONTROL ||
 	     def->selector == UVC_CT_PANTILT_ABSOLUTE_CONTROL)) {
-		g->read_seq = 0;
-		g->watched_seq = 0;
-		g->last_frame_ms = uvcd_monotonic_ms();
-		g->healthy_since_ms = 0;
+		resync_reader(g);
 	}
-	if (ret != 0)
+	if (ret != 0) {
+		LOGW("%s=%d rejected (%d)", def->name, value, ret);
 		return -1;
+	}
 	if (memcmp(&next, &g->pipe->controls, sizeof(next)) != 0) {
+		struct uvcd_control_state old = g->pipe->controls;
+		uint8_t format = g->pipe->cur_format, frame = g->pipe->cur_frame;
+		uint32_t interval = g->pipe->cur_interval;
 		g->pipe->controls = next;
+		ret = def->kind == UVCD_CTRL_CUSTOM
+			? encoder_after_store(g, (uint8_t)def->selector) : 0;
+		if (ret != 0) {
+			g->pipe->controls = old;
+			int restore = def->selector == UVCD_CUSTOM_H264_BITRATE
+				? uvcd_enc_apply_bitrate(g->pipe)
+				: uvcd_pipeline_start(g->pipe, format, frame, interval);
+			LOGW("%s=%d rejected by encoder (%d); restoring previous settings (%d)",
+			     def->name, value, ret, restore);
+			return -1;
+		}
 		config_mark_dirty(g);
 	}
-	if (def->kind == UVCD_CTRL_CUSTOM)
-		encoder_after_store(g, (uint8_t)def->selector);
 	if (out_applied)
 		*out_applied = value;
 	return 0;
@@ -660,31 +664,41 @@ int uvcd_ctrl_keyframe(gadget_t *g)
 	return uvcd_enc_request_keyframe(g->pipe);
 }
 
-void uvcd_ctrl_reset(gadget_t *g)
+int uvcd_ctrl_reset(gadget_t *g)
 {
+	int ret = 0;
 	g->defer_encoder_restart = true;
 	g->restart_h264 = g->restart_mjpeg = false;
 	for (size_t i = 0; i < UVCD_CTRL_DEF_COUNT; i++) {
 		int applied;
-		if (uvcd_ctrl_set(g, &uvcd_ctrl_defs[i], uvcd_ctrl_defs[i].def, &applied) != 0)
+		if (uvcd_ctrl_set(g, &uvcd_ctrl_defs[i], uvcd_ctrl_defs[i].def, &applied) != 0) {
 			LOGW("reset: HAL rejected default for %s", uvcd_ctrl_defs[i].name);
+			ret = -1;
+		}
 	}
 	g->defer_encoder_restart = false;
-	if (g->restart_h264)
-		encoder_restart(g, UVCD_FMT_H264);
-	if (g->restart_mjpeg)
-		encoder_restart(g, UVCD_FMT_MJPEG);
+	if (g->restart_h264 && encoder_restart(g, UVCD_FMT_H264) != 0)
+		ret = -1;
+	if (g->restart_mjpeg && encoder_restart(g, UVCD_FMT_MJPEG) != 0)
+		ret = -1;
 
 	/* Written at once, even if nothing changed, and the old proven
 	 * controls go with it: a crash after a reset must not bring back what
 	 * the reset threw away. */
 	g->config_dirty = true;
-	config_flush(g, true);
-	if (uvcd_config_save(UVCD_CONFIG_GOOD_PATH, &g->pipe->controls) != 0)
+	if (config_flush(g, true) != 0)
+		ret = -1;
+	if (ret != 0) {
+		LOGW("factory reset incomplete; retaining last proven controls");
+		return ret;
+	}
+	if (uvcd_config_save(UVCD_CONFIG_GOOD_PATH, &g->pipe->controls) != 0) {
 		LOGW("persist %s: %s", UVCD_CONFIG_GOOD_PATH, strerror(errno));
-	else
-		g->pipe->good = g->pipe->controls;
+		return -1;
+	}
+	g->pipe->good = g->pipe->controls;
 	LOGI("factory reset: all controls restored to defaults");
+	return 0;
 }
 
 static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,

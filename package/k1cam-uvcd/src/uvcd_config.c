@@ -14,8 +14,10 @@
 #include "uvcd_config.h"
 #include "uvcd_gadget.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,8 +43,15 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *out)
 	char line[128];
 	while (fgets(line, sizeof(line), f)) {
 		char *nl = strchr(line, '\n');
-		if (nl)
+		if (nl) {
 			*nl = '\0';
+		} else if (!feof(f)) {
+			int ch;
+			while ((ch = fgetc(f)) != EOF && ch != '\n')
+				;
+			LOGW("%s: oversized config line, ignoring", path);
+			continue;
+		}
 
 		char *eq = strchr(line, '=');
 		if (!eq)
@@ -58,18 +67,22 @@ void uvcd_config_load(const char *path, struct uvcd_control_state *out)
 		}
 
 		char *end;
+		errno = 0;
 		long v = strtol(val, &end, 10);
-		if (end == val) {
+		bool empty = end == val;
+		while (isspace((unsigned char)*end))
+			end++;
+		if (empty || *end || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
 			LOGW("%s: bad value for '%s', ignoring", path, key);
 			continue;
 		}
-		if (v < def->min)
-			v = def->min;
-		if (v > def->max)
-			v = def->max;
-		*uvcd_ctrl_field(out, def) = (int)v;
+		*uvcd_ctrl_field(out, def) = uvcd_ctrl_normalize(def, (int)v);
 	}
 	fclose(f);
+	if (!uvcd_ctrl_qp_valid(out)) {
+		LOGW("%s: crossed H.264 QP bounds; restoring automatic bounds", path);
+		out->h264_min_qp = out->h264_max_qp = -1;
+	}
 }
 
 /* Best-effort: make a create or rename in path's directory durable too. */

@@ -119,7 +119,7 @@ static const struct ctrl_def ctrl_defs[] = {
 	{22, "max-digital-gain", CTRL_CUSTOM, 0, 2,
 	 "0-160: digital gain ceiling, 32 per doubling; 80: ~5.66x (default)"},
 	{23, "spatial-denoise", CTRL_CUSTOM, 0, 4,
-	 "0-255: strength, 128: as tuned, 192: default"},
+	 "0-255: strength, 128: as tuned, 0: default"},
 	{24, "temporal-denoise", CTRL_CUSTOM, 0, 5,
 	 "0-255: strength, 128: as tuned"},
 	{25, "defective-pixel-correction", CTRL_CUSTOM, 0, 6,
@@ -339,11 +339,16 @@ static int ctrl_range(int fd, const struct ctrl_def *def, int *min, int *max, in
 	return 0;
 }
 
-static int ctrl_set(int fd, const struct ctrl_def *def, int value)
+static int ctrl_set(int fd, const struct ctrl_def *def, int value, int *expected)
 {
 	int min, max, dv;
-
-	if (ctrl_range(fd, def, &min, &max, &dv) == 0 && (value < min || value > max)) {
+	*expected = def->kind == CTRL_CUSTOM && def->selector == 22
+		? (value >= 90 ? 180 : 0) : value;
+	if (ctrl_range(fd, def, &min, &max, &dv) != 0) {
+		report_ctrl_error(def, "range query", errno);
+		return -1;
+	}
+	if (value < min || value > max) {
 		fprintf(stderr, "uvcdctl: %s must be between %d and %d\n", def->name, min, max);
 		return -1;
 	}
@@ -363,6 +368,7 @@ static int ctrl_set(int fd, const struct ctrl_def *def, int value)
 		fprintf(stderr, "uvcdctl: %s: VIDIOC_S_CTRL: %s\n", def->name, strerror(errno));
 		return -1;
 	}
+	*expected = c.value; /* V4L2 may align the request to the control's step. */
 	return 0;
 }
 
@@ -502,16 +508,24 @@ static int socket_command(const char *command)
 		return -1;
 	}
 	dprintf(fd, "%s\n", command);
-	char buf[4096];
-	ssize_t n;
-	int rc = 1;
-	while ((n = read(fd, buf, sizeof(buf))) > 0) {
-		fwrite(buf, 1, (size_t)n, stdout);
-		if (n >= 3 && strstr(buf, "ok\n"))
-			rc = 0;
+	char buf[4097];
+	size_t used = 0;
+	ssize_t n = 0;
+	while (used < sizeof(buf) - 1) {
+		n = read(fd, buf + used, sizeof(buf) - 1 - used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		used += (size_t)n;
 	}
+	buf[used] = '\0';
+	fwrite(buf, 1, used, stdout);
 	close(fd);
-	return rc;
+	/* The final protocol line decides success, including fragmented reads.
+	 * A full buffer without EOF is an oversized or incomplete reply. */
+	return n == 0 && used >= 3 && !memcmp(buf + used - 3, "ok\n", 3) &&
+	       (used == 3 || buf[used - 4] == '\n') ? 0 : 1;
 }
 
 int main(int argc, char **argv)
@@ -608,14 +622,20 @@ int main(int argc, char **argv)
 		if (rc == 0)
 			print_value(def, v);
 	} else if (strcmp(cmd, "set") == 0) {
-		rc = ctrl_set(fd, def, value) != 0 ? 1 : 0;
+		int expected;
+		rc = ctrl_set(fd, def, value, &expected) != 0 ? 1 : 0;
 		if (rc == 0) {
 			int v;
-			/* Echo what actually took effect: the daemon clamps. */
-			if (ctrl_get(fd, def, &v) == 0)
+			if (ctrl_get(fd, def, &v) != 0) {
+				rc = 1;
+			} else {
 				print_value(def, v);
-			else
-				print_value(def, value);
+				if (v != expected) {
+					fprintf(stderr, "uvcdctl: %s requested %d, read back %d\n",
+						def->name, expected, v);
+					rc = 1;
+				}
+			}
 		}
 	} else if (strcmp(cmd, "list") == 0) {
 		rc = cmd_list(fd);

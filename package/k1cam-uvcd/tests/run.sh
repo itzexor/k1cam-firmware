@@ -22,7 +22,7 @@ trap 'rm -rf "$bin"' EXIT
 set -- -std=gnu11 -D_GNU_SOURCE -g -O1 -Wall -Wextra \
 	-fsanitize=address,undefined -fno-sanitize-recover=all \
 	-ffunction-sections -fdata-sections -I"$(dirname "$hal")" -I"$src"
-for test in config gadget pipeline startup; do
+for test in config gadget pipeline startup uvcdctl; do
 	${CC:-cc} "$@" "$here/${test}_test.c" -o "$bin/$test" -Wl,--gc-sections -lpthread -lm
 	"$bin/$test"
 done

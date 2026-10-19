@@ -42,6 +42,25 @@ static inline int *uvcd_ctrl_field(struct uvcd_control_state *s, const struct uv
 	return (int *)((char *)s + def->state_offset);
 }
 
+/* Use the same interpretation for saved settings and live writes. */
+static inline int uvcd_ctrl_normalize(const struct uvcd_ctrl_def *def, int value)
+{
+	if (value < def->min)
+		value = def->min;
+	if (value > def->max)
+		value = def->max;
+	if (def->state_offset == offsetof(struct uvcd_control_state, rotation))
+		return value >= 90 ? 180 : 0;
+	if (def->state_offset == offsetof(struct uvcd_control_state, ae_mode))
+		return value == UVCD_AE_MANUAL ? UVCD_AE_MANUAL : UVCD_AE_APERTURE_PRIORITY;
+	return value;
+}
+
+static inline bool uvcd_ctrl_qp_valid(const struct uvcd_control_state *s)
+{
+	return s->h264_min_qp < 0 || s->h264_max_qp < 0 || s->h264_min_qp <= s->h264_max_qp;
+}
+
 size_t uvcd_ctrl_count(void);
 const struct uvcd_ctrl_def *uvcd_ctrl_at(size_t i);
 const struct uvcd_ctrl_def *uvcd_ctrl_find(const char *name);
@@ -60,7 +79,8 @@ int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *
 int uvcd_ctrl_keyframe(gadget_t *g);
 
 /* Restore every control to its compiled-in factory default and persist the
- * result immediately. Reachable from the host as UVC XU selector 10. */
-void uvcd_ctrl_reset(gadget_t *g);
+ * result immediately. Returns -1 for a partial reset or persistence failure;
+ * only a complete reset replaces the last proven controls. UVC XU selector 10. */
+int uvcd_ctrl_reset(gadget_t *g);
 
 #endif /* UVCD_GADGET_H */

@@ -34,7 +34,11 @@ camera, so it works without one attached:
 ```
 
 Control names and numeric IDs are accepted by `get`, `set`, and `describe`.
-`get` and `set` print `name=value`.
+`get` and `set` print `name=value`. After a USB write, `set` checks the
+returned value and exits with status 1 if it differs or cannot be read.
+Standard V4L2 controls can be cached by the host driver; this is not an
+independent ISP readback. Settings for an inactive mode or format are staged
+for when it is used.
 
 Gain ceilings use the T31 SDK's logarithmic units: 0 is 1x, and every
 32 units doubles gain. `max-analog-gain` accepts 0-224, with the unchanged
@@ -50,7 +54,10 @@ an application's own camera settings. The camera writes accepted changes to
 startup. There is no save step.
 
 `reset` restores every control to its factory default and persists that
-immediately.
+immediately. On the camera's local socket, a partial reset or a persistence
+failure returns an error and leaves the last proven settings intact.
+Crossed explicit H.264 QP bounds are rejected; an old config containing them
+loads automatic bounds with a warning.
 
 If a stream dies within ten seconds of starting, or of a change made while it
 runs, the camera assumes the newest settings caused it. It restarts with the

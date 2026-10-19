@@ -6,6 +6,14 @@
 #include "../src/uvcd_config.c"
 
 static const struct uvcd_ctrl_def defs[] = {
+	{.name = "rotation", .min = 0, .max = 180, .def = 0,
+	 .state_offset = offsetof(struct uvcd_control_state, rotation)},
+	{.name = "auto-exposure", .min = 1, .max = 8, .def = 8,
+	 .state_offset = offsetof(struct uvcd_control_state, ae_mode)},
+	{.name = "h264-min-qp", .min = -1, .max = 51, .def = -1,
+	 .state_offset = offsetof(struct uvcd_control_state, h264_min_qp)},
+	{.name = "h264-max-qp", .min = -1, .max = 51, .def = -1,
+	 .state_offset = offsetof(struct uvcd_control_state, h264_max_qp)},
 	{.name = "brightness", .min = 0, .max = 255, .def = 128,
 	 .state_offset = offsetof(struct uvcd_control_state, brightness)},
 	{.name = "contrast", .min = 0, .max = 255, .def = 128,
@@ -82,6 +90,26 @@ int main(void)
 	write_raw(path, "apply-on-boot=0\nbrightness=200\ncontrast=999\n");
 	uvcd_config_load(path, &loaded);
 	assert(loaded.brightness == 200 && loaded.contrast == 255);
+
+	write_raw(path, "brightness=150garbage\ncontrast=999999999999999999999999\n"
+		"rotation=90\nauto-exposure=2\nh264-min-qp=40\nh264-max-qp=20\n");
+	uvcd_config_load(path, &loaded);
+	assert(loaded.brightness == 128 && loaded.contrast == 128);
+	assert(loaded.rotation == 180 && loaded.ae_mode == UVCD_AE_APERTURE_PRIORITY);
+	assert(loaded.h264_min_qp == -1 && loaded.h264_max_qp == -1);
+	write_raw(path, "brightness=150  \r\ncontrast=\nrotation=45\nauto-exposure=1\n");
+	uvcd_config_load(path, &loaded);
+	assert(loaded.brightness == 150 && loaded.contrast == 128);
+	assert(loaded.rotation == 0 && loaded.ae_mode == UVCD_AE_MANUAL);
+
+	char oversized[256];
+	memset(oversized, ' ', sizeof(oversized));
+	memcpy(oversized, "brightness=200", 14);
+	memcpy(oversized + 240, "contrast=200\n", 13);
+	oversized[253] = '\0';
+	write_raw(path, oversized);
+	uvcd_config_load(path, &loaded);
+	assert(loaded.brightness == 128 && loaded.contrast == 128);
 
 	unlink(path);
 	rmdir(dir);

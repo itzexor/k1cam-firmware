@@ -256,19 +256,21 @@ static void apply_csc(uvcd_camera_t *cam, uint8_t format)
 /* Run the sensor at `fps`. A stream keeps its encoder at the same rate
  * (uvcd_pipeline_tick), so rate control holds bits per second rather than
  * bits per frame. */
-static void set_sensor_fps(uvcd_camera_t *cam, uint32_t fps)
+static int set_sensor_fps(uvcd_camera_t *cam, uint32_t fps)
 {
 	if (fps == cam->sensor_fps)
-		return;
-	if (RSS_HAL_CALL(cam->ops, isp_set_sensor_fps, cam->hal_ctx, fps, 1) != RSS_OK) {
-		LOGW("sensor fps %u rejected", fps);
-		return;
+		return RSS_OK;
+	int ret = RSS_HAL_CALL(cam->ops, isp_set_sensor_fps, cam->hal_ctx, fps, 1);
+	if (ret != RSS_OK) {
+		LOGW("sensor fps %u rejected (%d)", fps, ret);
+		return ret;
 	}
 	if (cam->sensor_fps)
 		LOGI("sensor at %u fps", fps);
 	cam->sensor_fps = fps;
 	/* A new rate brings the SDK's own integration limit for it. */
 	cam->it_capped = false;
+	return RSS_OK;
 }
 
 /* The rate the output runs at: the stream's negotiated one, else idle's. */
@@ -284,10 +286,10 @@ static uint32_t output_fps(const uvcd_camera_t *cam)
  * exposure time; a stream at that rate would then start on an exposure
  * that no longer fits its frames. Hold the limit to the UVCD_IDLE_FPS one.
  * If the ISP refuses, idle stays at UVCD_IDLE_FPS. */
-static void apply_idle_cap(uvcd_camera_t *cam)
+static int apply_idle_cap(uvcd_camera_t *cam)
 {
 	if (cam->it_capped)
-		return;
+		return RSS_OK;
 	/* Still the SDK's own limit for this rate: keep it for a stream that
 	 * runs the same rate (uvcd_camera_acquire). */
 	uint32_t it = 0;
@@ -296,12 +298,12 @@ static void apply_idle_cap(uvcd_camera_t *cam)
 		cam->it_max_slow = it;
 	if (RSS_HAL_CALL(cam->ops, isp_set_ae_it_max, cam->hal_ctx, cam->it_max_idle) == RSS_OK) {
 		cam->it_capped = true;
-		return;
+		return RSS_OK;
 	}
 	LOGW("AE integration limit %u rejected; idle stays at %d fps", cam->it_max_idle,
 	     UVCD_IDLE_FPS);
 	cam->it_max_idle = 0;
-	set_sensor_fps(cam, UVCD_IDLE_FPS);
+	return set_sensor_fps(cam, UVCD_IDLE_FPS);
 }
 
 /* One listed step, at most `ceiling`, with a 15 fps priority floor.
@@ -397,47 +399,71 @@ bool uvcd_camera_view_moves(const uvcd_camera_t *cam, const struct uvcd_control_
 	return x != cam->view.x || y != cam->view.y || w != cam->view.w || h != cam->view.h;
 }
 
-static int apply_exposure(uvcd_camera_t *cam, const struct uvcd_control_state *c)
+/* Build the SDK write for the rate that actually reached the sensor. */
+static struct uvcd_imp_expr exposure_expr(const struct uvcd_control_state *c, uint32_t fps)
 {
 	struct uvcd_imp_expr e = {0};
-	uint32_t fps = output_fps(cam);
-
 	if (c->ae_mode == UVCD_AE_MANUAL) {
 		uint32_t us = (uint32_t)c->exposure_time * 100;
-
-		/* Exposure priority lets a stream's frame rate drop to make
-		 * room; otherwise the exposure is cut to fit a frame. Idle
-		 * always runs the idle rate. */
-		if (cam->leased && c->ae_priority) {
-			uint32_t fits = 1000000 / us;
-			while (fps > fits) {
-				uint32_t slower = fps_step(fps, -1, cam->lease_fps);
-				if (slower == fps)
-					break;
-				fps = slower;
-			}
-		}
-		set_sensor_fps(cam, fps);
-		if (fps == UVCD_IDLE_SLOW_FPS && !cam->leased)
-			apply_idle_cap(cam);
-		uint32_t running_fps = cam->sensor_fps ? cam->sensor_fps : fps;
-		if (us > 1000000 / running_fps)
-			us = 1000000 / running_fps;
+		if (us > 1000000 / fps)
+			us = 1000000 / fps;
 		if (us > UINT16_MAX)
 			us = UINT16_MAX;
 		e.mode = 1;
 		e.unit = 1;
 		e.time = (uint16_t)us;
-	} else {
-		/* Auto: start from the output's rate; with exposure priority
-		 * on, a stream's tick slows it down if the light calls for it. */
-		set_sensor_fps(cam, fps);
-		if (fps == UVCD_IDLE_SLOW_FPS && !cam->leased)
-			apply_idle_cap(cam);
 	}
-	cam->priority_checked_ms = uvcd_monotonic_ms();
+	return e;
+}
 
-	return RSS_HAL_CALL(cam->ops, isp_set_expr, cam->hal_ctx, &e);
+static int apply_exposure(uvcd_camera_t *cam, const struct uvcd_control_state *c)
+{
+	uint32_t fps = output_fps(cam), old_fps = cam->sensor_fps;
+	bool old_capped = cam->it_capped;
+	uint32_t old_limit = old_capped ? cam->it_max_idle : cam->it_max_slow;
+
+	if (c->ae_mode == UVCD_AE_MANUAL && cam->leased && c->ae_priority) {
+		uint32_t us = (uint32_t)c->exposure_time * 100;
+		uint32_t fits = 1000000 / us;
+		while (fps > fits) {
+			uint32_t slower = fps_step(fps, -1, cam->lease_fps);
+			if (slower == fps)
+				break;
+			fps = slower;
+		}
+	}
+	int ret = set_sensor_fps(cam, fps);
+	if (ret != RSS_OK)
+		return ret;
+	if (fps == UVCD_IDLE_SLOW_FPS && !cam->leased) {
+		ret = apply_idle_cap(cam);
+		if (ret != RSS_OK)
+			goto restore_exposure;
+	}
+	struct uvcd_imp_expr e = exposure_expr(c, cam->sensor_fps);
+	ret = RSS_HAL_CALL(cam->ops, isp_set_expr, cam->hal_ctx, &e);
+	if (ret == RSS_OK) {
+		cam->priority_checked_ms = uvcd_monotonic_ms();
+		return RSS_OK;
+	}
+
+restore_exposure:
+	LOGW("exposure update rejected (%d)", ret);
+	if (old_fps) {
+		int restore = set_sensor_fps(cam, old_fps);
+		if (restore == RSS_OK && old_limit && old_fps == UVCD_IDLE_SLOW_FPS) {
+			restore = RSS_HAL_CALL(cam->ops, isp_set_ae_it_max, cam->hal_ctx, old_limit);
+			if (restore == RSS_OK)
+				cam->it_capped = old_capped;
+		}
+		if (restore == RSS_OK) {
+			struct uvcd_imp_expr old = exposure_expr(cam->controls, old_fps);
+			restore = RSS_HAL_CALL(cam->ops, isp_set_expr, cam->hal_ctx, &old);
+		}
+		if (restore != RSS_OK)
+			LOGE("could not restore exposure after rejected write (%d)", restore);
+	}
+	return ret;
 }
 
 int uvcd_camera_live_exposure(uvcd_camera_t *cam)
@@ -541,31 +567,28 @@ static int apply_ae_comp(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 static int write_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 {
 	uint8_t weight[15][15];
-	bool have_weights = true;
 
 	if (c->metering == UVCD_METERING_TUNING) {
 		/* Without the reference there is nothing to restore. */
 		if (cam->ae_weight_ref_valid)
 			memcpy(weight, cam->ae_weight_ref, sizeof(weight));
 		else
-			have_weights = false;
+			return -ENOTSUP;
 	} else {
 		metering_weights(cam, c->metering, weight);
 	}
 
-	if (have_weights) {
-		int ret = RSS_HAL_CALL(cam->ops, isp_set_ae_weight, cam->hal_ctx,
-				      (const uint8_t(*)[15])weight);
-		if (ret != RSS_OK)
-			return ret;
-		/* Track accepted weights even if restoring compensation below
-		 * fails. Subject metering starts from these on the next tick. */
-		for (int r = 0; r < 15; r++)
-			for (int col = 0; col < 15; col++)
-				cam->subject_weight[r][col] = weight[r][col];
-		memcpy(cam->subject_written, weight, sizeof(weight));
-		cam->subject_checked_ms = cam->guard_checked_ms = uvcd_monotonic_ms();
-	}
+	int ret = RSS_HAL_CALL(cam->ops, isp_set_ae_weight, cam->hal_ctx,
+			      (const uint8_t(*)[15])weight);
+	if (ret != RSS_OK)
+		return ret;
+	/* Track accepted weights even if restoring compensation below
+	 * fails. Subject metering starts from these on the next tick. */
+	for (int r = 0; r < 15; r++)
+		for (int col = 0; col < 15; col++)
+			cam->subject_weight[r][col] = weight[r][col];
+	memcpy(cam->subject_written, weight, sizeof(weight));
+	cam->subject_checked_ms = cam->guard_checked_ms = uvcd_monotonic_ms();
 	cam->metering_mode = c->metering;
 	cam->metering_valid = false;
 	/* Only subject metering holds compensation back. Keep its cut until
@@ -784,10 +807,22 @@ static void subject_metering_tick(uvcd_camera_t *cam)
 static int apply_rotation(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 {
 	int flip = c->rotation >= 90 ? 1 : 0;
+	int old_h = cam->controls->rotation >= 90;
+	/* Prefer the actual bits, including during startup. */
+	int h = 0, v = 0;
+	if (RSS_HAL_CALL(cam->ops, isp_get_hvflip, cam->hal_ctx, &h, &v) == RSS_OK) {
+		old_h = h;
+	}
 	int ret = RSS_HAL_CALL(cam->ops, isp_set_hflip, cam->hal_ctx, flip);
 	if (ret != RSS_OK)
 		return ret;
-	return RSS_HAL_CALL(cam->ops, isp_set_vflip, cam->hal_ctx, flip);
+	ret = RSS_HAL_CALL(cam->ops, isp_set_vflip, cam->hal_ctx, flip);
+	if (ret != RSS_OK) {
+		int restore = RSS_HAL_CALL(cam->ops, isp_set_hflip, cam->hal_ctx, old_h);
+		if (restore != RSS_OK)
+			LOGE("could not restore horizontal flip after rejected rotation (%d)", restore);
+	}
+	return ret;
 }
 
 /* --------------------------------------------------------------------------
@@ -832,17 +867,18 @@ static void idle_reset(uvcd_camera_t *cam)
 }
 
 /* Settle again at UVCD_IDLE_FPS. */
-static void idle_settle(uvcd_camera_t *cam, const char *why)
+static int idle_settle(uvcd_camera_t *cam, const char *why)
 {
 	if (cam->leased)
-		return;
+		return RSS_OK;
 	bool was = cam->idle_settled;
 	cam->idle_settled = false;
 	idle_reset(cam);
 	if (was && cam->up) {
 		LOGI("idle: %s; settling at %d fps", why, UVCD_IDLE_FPS);
-		apply_exposure(cam, cam->controls);
+		return apply_exposure(cam, cam->controls);
 	}
+	return RSS_OK;
 }
 
 static void idle_go_slow(uvcd_camera_t *cam, float l, float ev)
@@ -949,6 +985,15 @@ static void idle_tick(uvcd_camera_t *cam)
  * Lifecycle
  */
 
+/* Bring-up never stops on a rejected write: a camera that won't stream can
+ * only be diagnosed from its console. The setting stays at the tuning's
+ * value and the log names it. */
+static void startup_write(const char *name, int ret)
+{
+	if (ret != RSS_OK)
+		LOGW("startup %s rejected (%d)", name, ret);
+}
+
 /* Push every stored control to the ISP, which starts from its factory
  * tuning every time it is opened. Rate, view, exposure and metering follow
  * in uvcd_camera_up(), once the view is known. */
@@ -956,30 +1001,47 @@ static void apply_controls(uvcd_camera_t *cam)
 {
 	const struct uvcd_control_state *c = cam->controls;
 
-	RSS_HAL_CALL(cam->ops, isp_set_brightness, cam->hal_ctx, c->brightness);
-	RSS_HAL_CALL(cam->ops, isp_set_contrast, cam->hal_ctx, c->contrast);
-	RSS_HAL_CALL(cam->ops, isp_set_saturation, cam->hal_ctx, c->saturation);
-	RSS_HAL_CALL(cam->ops, isp_set_sharpness, cam->hal_ctx, c->sharpness);
-	RSS_HAL_CALL(cam->ops, isp_set_sinter_strength, cam->hal_ctx, c->sinter);
-	RSS_HAL_CALL(cam->ops, isp_set_temper_strength, cam->hal_ctx, c->temper);
+	startup_write("brightness",
+		      RSS_HAL_CALL(cam->ops, isp_set_brightness, cam->hal_ctx, c->brightness));
+	startup_write("contrast",
+		      RSS_HAL_CALL(cam->ops, isp_set_contrast, cam->hal_ctx, c->contrast));
+	startup_write("saturation",
+		      RSS_HAL_CALL(cam->ops, isp_set_saturation, cam->hal_ctx, c->saturation));
+	startup_write("sharpness",
+		      RSS_HAL_CALL(cam->ops, isp_set_sharpness, cam->hal_ctx, c->sharpness));
+	startup_write("spatial-denoise",
+		      RSS_HAL_CALL(cam->ops, isp_set_sinter_strength, cam->hal_ctx, c->sinter));
+	startup_write("temporal-denoise",
+		      RSS_HAL_CALL(cam->ops, isp_set_temper_strength, cam->hal_ctx, c->temper));
 	/* Hue is stored signed, -128..127; the HAL wants it offset to 0..255. */
-	RSS_HAL_CALL(cam->ops, isp_set_hue, cam->hal_ctx, c->hue + 128);
-	apply_ae_comp(cam, c);
-	RSS_HAL_CALL(cam->ops, isp_set_max_again, cam->hal_ctx, c->max_again);
-	RSS_HAL_CALL(cam->ops, isp_set_max_dgain, cam->hal_ctx, c->max_dgain);
-	RSS_HAL_CALL(cam->ops, isp_set_dpc_strength, cam->hal_ctx, c->dpc);
-	RSS_HAL_CALL(cam->ops, isp_set_drc_strength, cam->hal_ctx, c->drc);
+	startup_write("hue", RSS_HAL_CALL(cam->ops, isp_set_hue, cam->hal_ctx, c->hue + 128));
+	startup_write("exposure-compensation", apply_ae_comp(cam, c));
+	startup_write("max-analog-gain",
+		      RSS_HAL_CALL(cam->ops, isp_set_max_again, cam->hal_ctx, c->max_again));
+	startup_write("max-digital-gain",
+		      RSS_HAL_CALL(cam->ops, isp_set_max_dgain, cam->hal_ctx, c->max_dgain));
+	startup_write("defective-pixel-correction",
+		      RSS_HAL_CALL(cam->ops, isp_set_dpc_strength, cam->hal_ctx, c->dpc));
+	startup_write("dynamic-range-compression",
+		      RSS_HAL_CALL(cam->ops, isp_set_drc_strength, cam->hal_ctx, c->drc));
 	/* Off, and not a control: at any strength auto-exposure hunted (frame
 	 * brightness swinging 20x more than at 0) and clipped more. */
-	RSS_HAL_CALL(cam->ops, isp_set_backlight_comp, cam->hal_ctx, 0);
-	RSS_HAL_CALL(cam->ops, isp_set_highlight_depress, cam->hal_ctx, c->highlight);
-	RSS_HAL_CALL(cam->ops, isp_set_running_mode, cam->hal_ctx, RSS_ISP_DAY);
-	RSS_HAL_CALL(cam->ops, isp_set_bypass, cam->hal_ctx, 1);
-	RSS_HAL_CALL(cam->ops, isp_set_antiflicker, cam->hal_ctx,
-		     (rss_antiflicker_t)c->power_line_frequency);
-	apply_rotation(cam, c);
-	apply_gamma(cam, c->gamma);
-	apply_wb(cam, c->wb_temp, c->wb_auto);
+	startup_write("backlight-comp",
+		      RSS_HAL_CALL(cam->ops, isp_set_backlight_comp, cam->hal_ctx, 0));
+	startup_write("highlight-suppression",
+		      RSS_HAL_CALL(cam->ops, isp_set_highlight_depress, cam->hal_ctx, c->highlight));
+	startup_write("running-mode",
+		      RSS_HAL_CALL(cam->ops, isp_set_running_mode, cam->hal_ctx, RSS_ISP_DAY));
+	startup_write("bypass", RSS_HAL_CALL(cam->ops, isp_set_bypass, cam->hal_ctx, 1));
+	startup_write("power-line-frequency",
+		      RSS_HAL_CALL(cam->ops, isp_set_antiflicker, cam->hal_ctx,
+				   (rss_antiflicker_t)c->power_line_frequency));
+	startup_write("rotation", apply_rotation(cam, c));
+	/* Without a reference the factory curve is already what gamma 100
+	 * asks for: nothing to write, nothing to report. */
+	if (cam->gamma_ref_valid || c->gamma != UVCD_GAMMA_DEF)
+		startup_write("gamma", apply_gamma(cam, c->gamma));
+	startup_write("white-balance", apply_wb(cam, c->wb_temp, c->wb_auto));
 }
 
 int uvcd_camera_init(uvcd_camera_t *cam, const struct uvcd_control_state *controls)
@@ -1108,8 +1170,9 @@ int uvcd_camera_up(uvcd_camera_t *cam)
 	/* Rate and view of the output, idle unless a stream already holds the
 	 * camera (a stream start that had to bring it up again). */
 	set_view(cam, cam->controls);
-	apply_exposure(cam, cam->controls);
-	apply_metering(cam, cam->controls);
+	startup_write("exposure", apply_exposure(cam, cam->controls));
+	/* Retried by the tick while rejected. */
+	startup_write("metering", apply_metering(cam, cam->controls));
 
 	/* The integration limit idle holds while slow: what the SDK set for
 	 * the UVCD_IDLE_FPS just applied. */
@@ -1165,7 +1228,8 @@ int uvcd_camera_acquire(uvcd_camera_t *cam, uint8_t frame, uint32_t fps)
 			LOGW("AE integration limit for %u fps not restored", fps);
 	}
 	/* The sensor sets the pace: a 30 fps channel on a 25 fps sensor still
-	 * delivers 25 while the host was promised 30. */
+	 * delivers 25 while the host was promised 30. A rejected rate is
+	 * logged, and the stream runs at the sensor's current one. */
 	set_sensor_fps(cam, fps);
 	set_view(cam, cam->controls);
 	return RSS_OK;
@@ -1179,7 +1243,8 @@ void uvcd_camera_stream_on(uvcd_camera_t *cam, uint8_t format)
 	/* Now that there is a frame rate to hold or give up: manual exposure
 	 * with exposure priority may need a slower sensor. And metering
 	 * follows the stream's view, keeping what it learned if the view is
-	 * the one the camera already had. */
+	 * the one the camera already had. Both log a rejection and the stream
+	 * runs anyway; metering is retried by the tick. */
 	apply_exposure(cam, cam->controls);
 	apply_metering(cam, cam->controls);
 }
@@ -1339,7 +1404,10 @@ int uvcd_camera_apply(uvcd_camera_t *cam, struct uvcd_control_state *next, size_
 {
 	/* Idle settles at full rate again before the change, so that
 	 * auto-exposure takes it at full rate. */
-	if (cam->up && changes_ae(field))
-		idle_settle(cam, "a control changed");
+	if (cam->up && changes_ae(field)) {
+		int ret = idle_settle(cam, "a control changed");
+		if (ret != RSS_OK)
+			return ret;
+	}
 	return apply_field(cam, next, field);
 }

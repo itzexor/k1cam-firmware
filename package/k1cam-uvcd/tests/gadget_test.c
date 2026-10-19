@@ -3,10 +3,13 @@
 #define ioctl test_ioctl
 #define unlink test_unlink
 #include "../src/uvcd_gadget.c"
+#include "../src/uvcd_ctl.c"
 
 static int saves, good_saves, queued, idrs, restarts;
+static int restart_errors, start_errors, start_calls, bitrate_errors, bitrate_calls;
+static struct uvcd_control_state restarted_controls;
 static struct uvcd_control_state last_saved, last_good;
-static int unlinks, streak_writes, last_streak;
+static int unlinks, streak_writes, last_streak, save_errors;
 
 int test_unlink(const char *path)
 {
@@ -39,6 +42,7 @@ void uvcd_config_defaults(struct uvcd_control_state *out)
 
 int uvcd_config_save(const char *path, const struct uvcd_control_state *c)
 {
+	if (save_errors) { save_errors--; errno = ENOSPC; return -1; }
 	if (!strcmp(path, UVCD_CONFIG_GOOD_PATH)) {
 		good_saves++;
 		last_good = *c;
@@ -55,7 +59,26 @@ bool uvcd_pipeline_restart_encoder(uvcd_pipeline_t *p, uint8_t format)
 	(void)format;
 	restarts++;
 	p->frame.seq = 0;
+	if (restart_errors) {
+		restart_errors--;
+		p->running = false;
+		return false;
+	}
 	return true;
+}
+
+int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame, uint32_t interval)
+{
+	assert(format == p->cur_format && frame == p->cur_frame && interval == p->cur_interval);
+	start_calls++;
+	restarted_controls = p->controls;
+	p->frame.seq = 0;
+	if (start_errors) {
+		start_errors--;
+		return -EIO;
+	}
+	p->running = true;
+	return 0;
 }
 
 int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
@@ -66,7 +89,16 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
 }
 
 int uvcd_camera_live_exposure(uvcd_camera_t *cam) { (void)cam; return -1; }
-int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p) { (void)p; return 0; }
+int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p)
+{
+	bitrate_calls++;
+	restarted_controls = p->controls;
+	if (bitrate_errors) {
+		bitrate_errors--;
+		return -EIO;
+	}
+	return 0;
+}
 
 /* The camera, as the gadget sees it: it takes or rejects a change, and may
  * fill in a dependent value (leaving auto white balance keeps the measured
@@ -171,6 +203,58 @@ static void test_gain_headroom(void)
 	apply_error = 0;
 	assert(uvcd_ctrl_set(&g, again, 255, &applied) == 0 && applied == 224);
 	assert(uvcd_ctrl_set(&g, dgain, 224, &applied) == 0 && applied == 160);
+}
+
+static void test_encoder_failures(void)
+{
+	static const char *names[] = {"h264-rate-control", "h264-min-qp", "h264-max-qp",
+		"h264-profile", "mjpeg-quality"};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		uvcd_pipeline_t p = {.running = true, .cur_format = i == 4 ? UVCD_FMT_MJPEG : UVCD_FMT_H264,
+			.cur_frame = UVCD_FRAME_720P, .cur_interval = 333333};
+		uvcd_config_defaults(&p.controls);
+		struct uvcd_control_state old = p.controls;
+		gadget_t g = {.pipe = &p, .streaming = true, .read_seq = 1000};
+		restart_errors = 1;
+		int starts = start_calls, applied = -123;
+		assert(uvcd_ctrl_set(&g, uvcd_ctrl_find(names[i]), i == 4 ? 60 : 1, &applied) == -1);
+		assert(p.running && start_calls == starts + 1 && !g.config_dirty);
+		assert(applied == -123 && g.read_seq == 0);
+		assert(memcmp(&old, &p.controls, sizeof(old)) == 0);
+		assert(memcmp(&old, &restarted_controls, sizeof(old)) == 0);
+	}
+	uvcd_pipeline_t p = {.running = true, .cur_format = UVCD_FMT_H264};
+	uvcd_config_defaults(&p.controls);
+	gadget_t g = {.pipe = &p, .streaming = true};
+	int calls = bitrate_calls, applied;
+	bitrate_errors = 1;
+	assert(uvcd_ctrl_set(&g, uvcd_ctrl_find("h264-bitrate-kbps"), 2000, &applied) == -1);
+	assert(bitrate_calls == calls + 2 && restarted_controls.h264_bitrate_kbps == 0);
+	assert(p.controls.h264_bitrate_kbps == 0 && !g.config_dirty);
+	/* An inactive format is staged, and an unchanged value never restarts. */
+	calls = restarts;
+	p.cur_format = UVCD_FMT_MJPEG;
+	assert(uvcd_ctrl_set(&g, uvcd_ctrl_find("h264-profile"), 0, &applied) == 0);
+	assert(restarts == calls && p.controls.h264_profile == 0);
+	assert(uvcd_ctrl_set(&g, uvcd_ctrl_find("mjpeg-quality"), 80, &applied) == 0);
+	assert(restarts == calls);
+	/* Crossed bounds are rejected before they reach the pipeline. */
+	p.controls.h264_min_qp = 30;
+	calls = applies;
+	assert(uvcd_ctrl_set(&g, uvcd_ctrl_find("h264-max-qp"), 20, &applied) == -1);
+	assert(applies == calls && p.controls.h264_max_qp == -1);
+
+	char reply_buf[128];
+	assert(uvcd_ctl_command(&g, "set brightness 9999999999999999999999999999", reply_buf, sizeof(reply_buf)) == 0);
+	assert(!strcmp(reply_buf, "err bad value\n"));
+	int before = good_saves;
+	apply_error = -EIO;
+	assert(uvcd_ctl_command(&g, "reset", reply_buf, sizeof(reply_buf)) == 0);
+	assert(!strcmp(reply_buf, "err reset incomplete\n") && good_saves == before);
+	apply_error = 0;
+	p.running = false;
+	save_errors = 1;
+	assert(uvcd_ctrl_reset(&g) == -1 && good_saves == before);
 }
 
 int main(void)
@@ -328,6 +412,7 @@ int main(void)
 	assert(uvcd_ctrl_find("h264-gop-frames") == NULL);
 	test_rejected_view();
 	test_gain_headroom();
+	test_encoder_failures();
 	puts("gadget regression tests passed");
 	pthread_mutex_destroy(&p.frame.lock);
 	return 0;
