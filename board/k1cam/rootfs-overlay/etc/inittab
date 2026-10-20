@@ -19,5 +19,8 @@ console::respawn:/sbin/getty -L console 0 vt100
 null::respawn:/bin/sh -c 'while [ ! -e /dev/ttyGS0 ]; do sleep 1; done; /sbin/getty -L -w -n -l /usr/bin/k1-console ttyGS0 0 vt100; sleep 1'
 # Keep the webcam daemon alive whenever the system is running.
 null::respawn:/etc/init.d/S31uvcd supervise
+# A trial boot of a new slot: hand the watchdog over once uvcd confirms it,
+# reboot if it doesn't (a no-op on other boots).
+null::once:/usr/sbin/k1cam-trial-gate
 ::shutdown:/etc/init.d/rcK
 ::shutdown:/bin/umount -a -f

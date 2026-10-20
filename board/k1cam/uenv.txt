@@ -3,17 +3,38 @@ enable_updates=true
 loadaddr=0x80600000
 panic_timeout=2
 serialport=ttyS1
-root=/dev/mtdblock4
-kern_addr=0x70000
-kern_size=0x190000
-data_addr=0x480000
-data_size=0x380000
-flash_len=0x800000
-mtdparts=jz_sfc:320k(boot),64k(env),64k(backup),1600k(kernel),2560k(rootfs),3584k(data),8192k@0(all)
-bootcmd=sf probe;setenv bootargs mem=${osmem} rmem=${rmem}  console=${serialport},${baudrate}n8 panic=${panic_timeout} root=${root} rootfstype=${rootfstype} init=${init} mtdparts=${mtdparts};sf read ${loadaddr} ${kern_addr} ${kern_size};bootm ${loadaddr}
 osmem=41M@0x0
 rmem=23M@0x2900000
 rootfstype=squashfs
 init=/init
 disable_sd=true
 disable_eth=true
+flash_len=0x800000
+mtdparts=jz_sfc:320k(boot),64k(env_a),64k(env_b),1280k(kernel_a),1792k(rootfs_a),1280k(kernel_b),1792k(rootfs_b),1600k(data),8192k@0(all)
+kernel_a_addr=0x70000
+kernel_b_addr=0x370000
+kernel_size=0x140000
+rootfs_a_dev=/dev/mtdblock4
+rootfs_b_dev=/dev/mtdblock6
+data_addr=0x670000
+data_size=0x190000
+k1_layout=k1cam-ab-8m-v1
+k1_boot_compat=1
+active_slot=a
+upgrade_available=0
+bootcount=0
+bootlimit=3
+k1_wdt_dev=watchdog@0
+k1_wdt_ms=120000
+bootcmd=run k1_boot
+k1_boot=sf probe || echo "k1cam: no SPI flash"; if test "${upgrade_available}" = 1; then run k1_trial; fi; run k1_confirmed
+k1_trial=if test "${trial_slot}" != a && test "${trial_slot}" != b; then echo "k1cam: trial_slot (${trial_slot}) is not a or b"; run k1_reject; elif test "${trial_slot}" = "${active_slot}"; then echo "k1cam: trial slot ${trial_slot} is the confirmed slot"; run k1_reject; else run k1_attempt; fi
+k1_attempt=test -n "${bootcount}" || setenv bootcount 0; if setexpr bootcount ${bootcount} + 1 && itest ${bootcount} -le ${bootlimit}; then if run k1_save; then echo "k1cam: trial boot ${bootcount} of ${bootlimit} of slot ${trial_slot}"; setenv k1_slot ${trial_slot}; setenv k1_mode trial; if run k1_wdt; then run k1_load; fi; echo "k1cam: trial slot ${trial_slot} did not boot"; run k1_reject; else echo "k1cam: cannot record the trial boot; booting the confirmed slot"; fi; else echo "k1cam: trial slot ${trial_slot} failed ${bootlimit} boots"; run k1_reject; fi
+k1_reject=echo "k1cam: dropping trial slot ${trial_slot}, back to slot ${active_slot}"; run k1_tidy; setenv trial_slot; setenv upgrade_available 0; setenv bootcount 0; run k1_save || echo "k1cam: could not save that"
+k1_tidy=setenv k1_slot; setenv k1_mode; setenv k1_kaddr; setenv k1_root; setenv bootargs
+k1_confirmed=if test "${active_slot}" = b; then setenv k1_slot b; else setenv k1_slot a; test "${active_slot}" = a || echo "k1cam: active_slot (${active_slot}) is not a or b; using a"; fi; setenv k1_mode confirmed; run k1_load; echo "k1cam: confirmed slot ${k1_slot} did not boot"; run k1_fallback
+k1_fallback=if test "${k1_slot}" = a; then setenv k1_slot b; else setenv k1_slot a; fi; setenv k1_mode fallback; echo "k1cam: trying slot ${k1_slot}"; run k1_wdt; run k1_load; echo "k1cam: no slot booted"
+k1_wdt=wdt dev ${k1_wdt_dev} && wdt start ${k1_wdt_ms}
+k1_load=if test "${k1_slot}" = b; then setenv k1_kaddr ${kernel_b_addr}; setenv k1_root ${rootfs_b_dev}; else setenv k1_kaddr ${kernel_a_addr}; setenv k1_root ${rootfs_a_dev}; fi; setenv bootargs mem=${osmem} rmem=${rmem} console=${serialport},${baudrate}n8 panic=${panic_timeout} root=${k1_root} rootfstype=${rootfstype} init=${init} mtdparts=${mtdparts} k1cam.slot=${k1_slot} k1cam.boot=${k1_mode} k1cam.layout=${k1_layout}; sf read ${loadaddr} ${k1_kaddr} ${kernel_size} && run k1_bootm
+k1_bootm=bootm ${loadaddr}
+k1_save=saveenv

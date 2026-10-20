@@ -76,4 +76,23 @@ EOF
 cat "$BUILDROOT_RELEASE" >>"$OS_RELEASE"
 rm -f "$BUILDROOT_RELEASE"
 
+# The firmware identity uvcd reports to uvcdctl and the update bundle
+# carries (key=value, one per line; os-release above is for people). The
+# build id names exactly this build, so a host can tell after an update
+# whether the camera runs it. min_boot_compat is the U-Boot environment this
+# release needs: level 1 passes k1cam.slot and k1cam.boot, which /init
+# mounts the slot's settings layer by.
+K1CAM_MIN_BOOT_COMPAT=1
+K1CAM_LAYOUT=$(sed -n 's/^k1_layout=//p' "$EXTERNAL_DIR/board/k1cam/uenv.txt")
+K1CAM_BUILD="k1cam-$(env -u SOURCE_DATE_EPOCH TZ=UTC date -d "@$BUILD_EPOCH" '+%Y%m%dT%H%M%SZ')-$GIT_SHORT_HASH"
+mkdir -p "$TARGET_DIR/usr/lib/k1cam"
+cat >"$TARGET_DIR/usr/lib/k1cam/firmware-release" <<EOF
+board=k1cam-t31l-gc2083
+layout=$K1CAM_LAYOUT
+build=$K1CAM_BUILD
+kernel=$KERNEL_COMMIT
+min_boot_compat=$K1CAM_MIN_BOOT_COMPAT
+protocol=1
+EOF
+
 "$EXTERNAL_DIR/scripts/check-busybox-lopts.sh" "$TARGET_DIR" 1

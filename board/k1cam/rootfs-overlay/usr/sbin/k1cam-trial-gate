@@ -1,0 +1,38 @@
+#!/bin/sh
+# k1cam-trial-gate -- the watchdog side of a trial boot (k1cam.boot=trial).
+#
+# U-Boot counted this boot and started the hardware watchdog before booting
+# the new slot. Nothing services the watchdog until uvcd has shown that the
+# release runs the camera and has confirmed the slot (/run/k1cam/confirmed):
+# then this starts the watchdog daemon as on any other boot. If uvcd reports
+# that the trial failed (/run/k1cam/trial-failed), or nothing is confirmed by
+# the deadline, it reboots: U-Boot counts the attempt and, once bootlimit
+# trial boots have failed, boots the confirmed slot again. A hang that keeps
+# this script from running is left to the watchdog.
+
+DEADLINE=75 # seconds of uptime; U-Boot's watchdog gives the trial 120
+RUN=/run/k1cam
+
+grep -q 'k1cam.boot=trial' /proc/cmdline || exit 0
+
+log() {
+	echo "<4>k1cam-trial-gate: $*" >/dev/kmsg
+}
+
+while :; do
+	if [ -e "$RUN/confirmed" ]; then
+		log "slot $(cat "$RUN/confirmed") confirmed; starting the watchdog daemon"
+		exec /etc/init.d/K99watchdog start
+	fi
+	if [ -e "$RUN/trial-failed" ]; then
+		log "trial failed: $(cat "$RUN/trial-failed"); rebooting to count it"
+		break
+	fi
+	if [ "$(cut -d. -f1 /proc/uptime)" -ge "$DEADLINE" ]; then
+		log "not confirmed within ${DEADLINE} s; rebooting to count the attempt"
+		break
+	fi
+	sleep 1
+done
+sync
+exec reboot

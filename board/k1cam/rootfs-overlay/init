@@ -1,27 +1,92 @@
 #!/bin/sh
+# init -- put a writable layer over the read-only rootfs, then start /sbin/init.
+#
+# The data partition is shared by both slots of the A/B layout, and each
+# slot keeps its own settings layer on it, slots/a and slots/b, so that a
+# release never sees (or masks with its whiteouts) the other release's
+# files: going back to the other slot gets its settings back unchanged.
+# U-Boot says which slot it booted with k1cam.slot. /opt is shared.
 
 die() {
 	echo "init: $*" >&2
 	exit 1
 }
 
+say() {
+	echo "init: $*" >&2
+	echo "<3>init: $*" >/dev/kmsg 2>/dev/null
+}
+
 mount -t proc proc /proc || die "cannot mount /proc"
+[ -d /overlay ] && [ -d /rom ] || die "rootfs lacks /overlay or /rom"
 mtd=$(awk -F: '/"data"/{print $1}' /proc/mtd)
 [ -n "$mtd" ] || die "data partition not found"
 block=$(printf '%s\n' "$mtd" | sed 's/^mtd/mtdblock/')
-# A missing mount point also fails the mount; never erase the data for that.
-[ -d /overlay ] && [ -d /rom ] || die "rootfs lacks /overlay or /rom"
-mount -t jffs2 -o noatime "/dev/$block" /overlay 2>/dev/null || {
-	echo "init: formatting empty data partition" >&2
-	flash_eraseall -j "/dev/$mtd" || die "cannot format data partition"
-	mount -t jffs2 -o noatime "/dev/$block" /overlay || die "cannot mount data partition"
+
+slot=
+root=
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+		k1cam.slot=*) slot=${arg#k1cam.slot=} ;;
+		root=*) root=${arg#root=} ;;
+	esac
+done
+
+# Format the data partition only when it is entirely erased. Anything else
+# that won't mount (a flash error, another filesystem) is left alone and
+# the system runs on a RAM layer instead: settings don't persist this boot,
+# but nothing is lost.
+blank() {
+	[ -z "$(tr -d '\377' <"/dev/$1" | head -c 1)" ]
 }
+if ! mount -t jffs2 -o noatime "/dev/$block" /overlay; then
+	if blank "$mtd"; then
+		say "formatting the empty data partition"
+		flash_eraseall -j "/dev/$mtd" && mount -t jffs2 -o noatime "/dev/$block" /overlay ||
+			die "cannot format the data partition"
+	else
+		say "data partition will not mount; running without saved settings"
+		mount -t tmpfs -o mode=0755,size=4m tmpfs /overlay || die "cannot mount a RAM layer"
+	fi
+fi
+
+if grep -q '"kernel_a"' /proc/mtd; then
+	# The slot must be a or b and the root device its rootfs: a mismatch
+	# would put one release's settings under the other release.
+	rootfs=
+	case "$root" in
+		/dev/mtdblock*) rootfs=$(sed -n "s/^mtd${root#/dev/mtdblock}: [0-9a-f]* [0-9a-f]* \"\(.*\)\"$/\1/p" /proc/mtd) ;;
+	esac
+	case "$slot" in
+		a | b) [ "$rootfs" = "rootfs_$slot" ] || slot= ;;
+		*) slot= ;;
+	esac
+	if [ -n "$slot" ]; then
+		upper=/overlay/slots/$slot
+	else
+		say "booted without a valid k1cam.slot for $root; running without saved settings"
+		umount /overlay
+		mount -t tmpfs -o mode=0755,size=4m tmpfs /overlay || die "cannot mount a RAM layer"
+		upper=/overlay/ram
+	fi
+	mkdir -p "$upper/root" "$upper/work" /overlay/opt || die "cannot create $upper"
+	layer=$upper/root
+	work=$upper/work
+else
+	# The original single-slot layout: the whole partition is the layer.
+	layer=/overlay
+	work=
+fi
 
 # Linux 3.10 uses the original overlayfs interface. Keep the modern form as a
 # fallback so the root mount remains understandable if the kernel is updated.
-if ! mount -t overlayfs -o noatime,lowerdir=/,upperdir=/overlay overlay /mnt; then
-	mkdir -p /overlay/root /overlay/work
-	mount -t overlay -o noatime,lowerdir=/,upperdir=/overlay/root,workdir=/overlay/work overlay /mnt ||
+if ! mount -t overlayfs -o noatime,lowerdir=/,upperdir="$layer" overlay /mnt; then
+	[ -n "$work" ] || {
+		mkdir -p /overlay/root /overlay/work
+		layer=/overlay/root
+		work=/overlay/work
+	}
+	mount -t overlay -o noatime,lowerdir=/,upperdir="$layer",workdir="$work" overlay /mnt ||
 		die "cannot mount writable overlay"
 fi
 
@@ -29,4 +94,7 @@ pivot_root /mnt /mnt/rom || die "cannot pivot root"
 mount -o noatime,move /rom/proc /proc
 mount -o noatime,move /rom/dev /dev
 mount -o noatime,move /rom/overlay /overlay
+if [ -d /overlay/opt ] && [ "$layer" != /overlay ]; then
+	mkdir -p /opt && mount -o bind /overlay/opt /opt
+fi
 exec /sbin/init "$@"

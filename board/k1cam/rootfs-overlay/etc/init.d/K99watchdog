@@ -20,6 +20,13 @@ stop_daemon() {
 }
 
 start() {
+	# In a trial boot U-Boot has started the watchdog, and it stays
+	# unserviced until uvcd confirms the slot: k1cam-trial-gate starts the
+	# daemon then. A trial that hangs before that is reset and counted.
+	if grep -q 'k1cam.boot=trial' /proc/cmdline && [ ! -e /run/k1cam/confirmed ]; then
+		printf '%s\n' "Watchdog: left to the trial until this slot is confirmed"
+		return 0
+	fi
 	printf '%s\n' "Starting watchdog"
 
 	# shellcheck disable=SC2086
