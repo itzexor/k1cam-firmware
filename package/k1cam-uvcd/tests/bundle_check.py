@@ -4,9 +4,11 @@
 Written from the format description in src/fw_bundle.h, not from the C
 code, so the two implementations check each other:
 
-  bundle_check.py FILE      validate a bundle, print its manifest
-  bundle_check.py --golden  build the test bundle fw_test.c builds and
-                            print its SHA-256 (the frozen golden vector)
+  bundle_check.py FILE      validate a bundle, print its manifest and
+                            release information (info: lines)
+  bundle_check.py --golden  build the test bundle fw_test.c builds, alone
+                            and with release information, and print their
+                            SHA-256s (the frozen golden vectors)
 
 Standard library only. Exit status 0 when valid.
 """
@@ -24,6 +26,9 @@ ALIGN = 64
 KERNEL_CAPACITY = 0x140000
 ROOTFS_CAPACITY = 0x1C0000
 DIGEST_AT = 0x0C0
+INFO_MAGIC = b"K1CAMINF"
+INFO_HEADER_SIZE = 0x50
+INFO_TEXT_MAX = 4096
 
 
 class Invalid(Exception):
@@ -122,6 +127,30 @@ def parse(buf):
     return info
 
 
+def split(buf):
+    """The bundle and the release information after it (None if absent)."""
+    if len(buf) < MANIFEST_SIZE or buf[:8] != MAGIC:
+        return buf, None
+    end, = struct.unpack_from("<I", buf, 0x98)
+    if end < MANIFEST_SIZE or end >= len(buf):
+        return buf, None
+    info = buf[end:]
+    if len(info) < INFO_HEADER_SIZE or info[:8] != INFO_MAGIC:
+        raise Invalid("bytes after the bundle")
+    size, flags = struct.unpack_from("<II", info, 8)
+    if flags or size != len(info) - INFO_HEADER_SIZE:
+        raise Invalid("release information header")
+    text = info[INFO_HEADER_SIZE:]
+    if info[0x10:0x30] != buf[DIGEST_AT:DIGEST_AT + 32]:
+        raise Invalid("release information is for another bundle")
+    if hashlib.sha256(text).digest() != info[0x30:0x50]:
+        raise Invalid("release information digest")
+    if not 1 <= size <= INFO_TEXT_MAX or any(
+            (c < 0x20 or c > 0x7E) and c not in b"\t\n" for c in text):
+        raise Invalid("release information text")
+    return buf[:end], text.decode()
+
+
 def build(board, layout, build_id, min_boot, kernel, rootfs):
     kernel_off = MANIFEST_SIZE
     rootfs_off = (kernel_off + len(kernel) + ALIGN - 1) // ALIGN * ALIGN
@@ -141,6 +170,15 @@ def build(board, layout, build_id, min_boot, kernel, rootfs):
         out[off:off + len(data)] = data
     out[DIGEST_AT:DIGEST_AT + 32] = manifest_digest(out)
     return bytes(out)
+
+
+def build_info(bundle, text):
+    raw = text.encode()
+    return (INFO_MAGIC + struct.pack("<II", len(raw), 0) + bundle[DIGEST_AT:DIGEST_AT + 32]
+            + hashlib.sha256(raw).digest() + raw)
+
+
+GOLDEN_INFO = 'NAME=k1cam\nBUILD_ID="k1cam+test, 2026-01-01 00:00:00 +0000"\n'
 
 
 def test_uimage(data_len):
@@ -175,6 +213,10 @@ def main(argv):
                   test_uimage(5000), test_squashfs(9000))
         parse(b)
         print(hashlib.sha256(b).hexdigest())
+        f = b + build_info(b, GOLDEN_INFO)
+        bundle, text = split(f)
+        assert bundle == b and text == GOLDEN_INFO
+        print(hashlib.sha256(f).hexdigest())
         return 0
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
@@ -182,12 +224,15 @@ def main(argv):
     with open(argv[1], "rb") as f:
         buf = f.read()
     try:
-        info = parse(buf)
+        bundle, text = split(buf)
+        info = parse(bundle)
     except Invalid as e:
         print("%s: invalid: %s" % (argv[1], e), file=sys.stderr)
         return 1
     for key, value in info.items():
         print("%s=%s" % (key, value))
+    for line in (text or "").splitlines():
+        print("info:" + line)
     return 0
 
 

@@ -318,6 +318,91 @@ static uint8_t *read_fixture(const char *dir, const char *name, size_t *len)
 }
 
 /* The build's own kernel and rootfs pass the checks the camera applies. */
+static enum fw_bundle_status split(const uint8_t *buf, size_t len, size_t *at, const char **text,
+				   size_t *tlen)
+{
+	char why[160];
+	return fw_bundle_split(buf, len, at, text, tlen, why, sizeof(why));
+}
+
+static void test_bundle_info(void)
+{
+	static const char text[] = "NAME=k1cam\nBUILD_ID=\"k1cam+test, 2026-01-01 00:00:00 +0000\"\n";
+	size_t blen, at, tlen, n = strlen(text);
+	const char *t;
+	uint8_t *b = make_bundle(&blen, "k1cam-test-1");
+
+	size_t ilen = fw_bundle_info_build(NULL, NULL, text, n);
+	assert(ilen == FW_INFO_HEADER_SIZE + n);
+	size_t len = blen + ilen;
+	uint8_t *f = malloc(len), *m = malloc(len + 1);
+	memcpy(f, b, blen);
+	assert(fw_bundle_info_build(f + blen, b, text, n) == ilen);
+
+	/* Golden vector, shared with tests/bundle_check.py like the bundle's. */
+	uint8_t d[FW_SHA256_SIZE];
+	fw_sha256(f, len, d);
+	hex_is(d, "d0feccc486f3f9cc2542e15680f81652c79da5f8e7ab0d5ca2514691e5b34c09");
+
+	assert(split(f, len, &at, &t, &tlen) == FW_BUNDLE_OK);
+	assert(at == blen && tlen == n && !memcmp(t, text, n));
+	assert(parse(f, at) == FW_BUNDLE_OK);
+	/* The camera's parser takes the bundle only. */
+	assert(parse(f, len) == FW_BUNDLE_FORMAT);
+	/* A bundle alone has none, and what isn't a bundle is parse()'s to refuse. */
+	assert(split(b, blen, &at, &t, &tlen) == FW_BUNDLE_OK && at == blen && !t && !tlen);
+	assert(split((const uint8_t *)"K1CAM", 5, &at, &t, &tlen) == FW_BUNDLE_OK && at == 5 && !t);
+
+	uint8_t *info = m + blen;
+#define MUTATE(edit, want)                                                                    \
+	do {                                                                                  \
+		memcpy(m, f, len);                                                            \
+		edit;                                                                         \
+		enum fw_bundle_status got = split(m, len, &at, &t, &tlen);                    \
+		if (got != (want)) {                                                          \
+			fprintf(stderr, "%s: got %d want %d\n", #edit, got, want);            \
+			assert(0);                                                            \
+		}                                                                             \
+	} while (0)
+	MUTATE(info[0] ^= 1, FW_BUNDLE_FORMAT);                      /* magic */
+	MUTATE(info[FW_INFO_OFF_LENGTH] ^= 1, FW_BUNDLE_FORMAT);     /* length */
+	MUTATE(info[FW_INFO_OFF_FLAGS] = 1, FW_BUNDLE_FORMAT);       /* flags */
+	MUTATE(info[FW_INFO_OFF_MANIFEST_SHA] ^= 1, FW_BUNDLE_HASH); /* another bundle's */
+	MUTATE(m[FW_BUNDLE_OFF_MANIFEST_SHA] ^= 1, FW_BUNDLE_HASH);  /* or a damaged one */
+	MUTATE(info[FW_INFO_OFF_SHA] ^= 1, FW_BUNDLE_HASH);
+	MUTATE(info[FW_INFO_HEADER_SIZE + 3] ^= 1, FW_BUNDLE_HASH); /* text byte */
+	/* Sealed but not printable text. */
+	MUTATE((info[FW_INFO_HEADER_SIZE + 3] = '\r',
+		fw_sha256(info + FW_INFO_HEADER_SIZE, n, info + FW_INFO_OFF_SHA)),
+	       FW_BUNDLE_FORMAT);
+#undef MUTATE
+	/* Cut anywhere after the bundle, or one byte more: refused. */
+	for (size_t cut = blen + 1; cut < len; cut++)
+		assert(split(f, cut, &at, &t, &tlen) == FW_BUNDLE_FORMAT);
+	memcpy(m, f, len);
+	m[len] = '\n';
+	assert(split(m, len + 1, &at, &t, &tlen) == FW_BUNDLE_FORMAT);
+	free(m);
+	free(f);
+
+	/* Text the builder refuses, and the largest it takes. */
+	char *big = malloc(FW_INFO_TEXT_MAX + 1);
+	memset(big, 'x', FW_INFO_TEXT_MAX + 1);
+	assert(fw_bundle_info_build(NULL, NULL, big, 0) == 0);
+	assert(fw_bundle_info_build(NULL, NULL, big, FW_INFO_TEXT_MAX + 1) == 0);
+	assert(fw_bundle_info_build(NULL, NULL, "a\0b", 3) == 0);
+	assert(fw_bundle_info_build(NULL, NULL, "\xc3\xa9", 2) == 0);
+	assert(fw_bundle_info_build(NULL, NULL, "a\tb\n", 4) == FW_INFO_HEADER_SIZE + 4);
+	ilen = fw_bundle_info_build(NULL, NULL, big, FW_INFO_TEXT_MAX);
+	f = malloc(blen + ilen);
+	memcpy(f, b, blen);
+	fw_bundle_info_build(f + blen, b, big, FW_INFO_TEXT_MAX);
+	assert(split(f, blen + ilen, &at, &t, &tlen) == FW_BUNDLE_OK && tlen == FW_INFO_TEXT_MAX);
+	free(f);
+	free(big);
+	free(b);
+}
+
 static void test_real_images(const char *dir)
 {
 	size_t klen, rlen;
@@ -610,6 +695,7 @@ int main(void)
 	test_sha256();
 	test_crc();
 	test_bundle();
+	test_bundle_info();
 	test_flash();
 	test_env_choose();
 	test_env_edit();

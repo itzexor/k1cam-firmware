@@ -43,12 +43,13 @@ The current build is 0.9 MiB of kernel (73% of a slot) and 1.4 MiB of rootfs
   environment and an empty data partition. For installation only: flashing it
   resets the settings.
 - `k1cam.upd`: the routine update, this kernel and rootfs in a checked
-  bundle (format below).
+  bundle (format below), followed by the build's os-release for whoever
+  picks the file.
 - `k1cam.bin.sha256sum`, `k1cam.upd.sha256sum`, and `k1cam-layout.txt`.
 
 `post-image.sh` reads every part of `k1cam.bin` back and compares it with its
-source, checks that the rest of each partition is erased, and parses
-`k1cam.upd` back with the camera's own parser.
+source, checks that the rest of each partition is erased, parses
+`k1cam.upd` back with the camera's own parser, and reads its os-release back.
 
 ## Using it
 
@@ -220,6 +221,16 @@ rootfs: offset, length, SHA-256), and the payloads. `k1cam-mkupd` builds it
 `package/k1cam-uvcd/tests/bundle_check.py` is an independent reading of the
 format from its description. The digests detect corruption, they do not
 authenticate the publisher.
+
+After the bundle, `k1cam.upd` carries the release information: magic
+`K1CAMINF`, the text's length, the bundle's manifest digest (so it can't be
+taken for another bundle's), a SHA-256 of the text, and the build's
+`/usr/lib/os-release` (`k1cam-mkupd -i`; `--check` prints it as `info:`
+lines). It is for the person choosing the file, as k1cam-flasher shows it:
+hosts send the camera only the bundle, whose length field says where it
+ends, so the camera never sees it and firmware from before it updates from
+these files too. Host tools from before it refuse them (bytes after the
+bundle).
 
 ## Tests
 

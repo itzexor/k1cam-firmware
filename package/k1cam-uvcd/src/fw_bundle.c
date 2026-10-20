@@ -302,6 +302,81 @@ size_t fw_bundle_build(uint8_t *out, const char *board, const char *layout, cons
 	return total;
 }
 
+static bool info_text(const uint8_t *p, size_t len)
+{
+	if (len == 0 || len > FW_INFO_TEXT_MAX)
+		return false;
+	for (size_t i = 0; i < len; i++) {
+		if ((p[i] < 0x20 || p[i] > 0x7e) && p[i] != '\n' && p[i] != '\t')
+			return false;
+	}
+	return true;
+}
+
+enum fw_bundle_status fw_bundle_split(const uint8_t *buf, size_t len, size_t *bundle_len,
+				      const char **text, size_t *text_len, char *why,
+				      size_t why_size)
+{
+	uint8_t digest[FW_SHA256_SIZE];
+
+	*bundle_len = len;
+	*text = NULL;
+	*text_len = 0;
+	/* Anything else wrong with the bundle is for fw_bundle_parse() to say. */
+	if (len < FW_BUNDLE_MANIFEST_SIZE || memcmp(buf, FW_BUNDLE_MAGIC, 8) != 0)
+		return FW_BUNDLE_OK;
+	uint32_t end = le32(buf + FW_BUNDLE_OFF_LENGTH);
+	if (end < FW_BUNDLE_MANIFEST_SIZE || end >= len)
+		return FW_BUNDLE_OK;
+
+	const uint8_t *info = buf + end;
+	size_t n = len - end;
+	if (n < FW_INFO_HEADER_SIZE || memcmp(info, FW_INFO_MAGIC, 8) != 0) {
+		say(why, why_size, "%zu bytes after the bundle are not release information", n);
+		return FW_BUNDLE_FORMAT;
+	}
+	uint32_t tlen = le32(info + FW_INFO_OFF_LENGTH);
+	if (le32(info + FW_INFO_OFF_FLAGS) != 0 || tlen != n - FW_INFO_HEADER_SIZE) {
+		say(why, why_size, "malformed release information header");
+		return FW_BUNDLE_FORMAT;
+	}
+	if (memcmp(info + FW_INFO_OFF_MANIFEST_SHA, buf + FW_BUNDLE_OFF_MANIFEST_SHA,
+		   FW_SHA256_SIZE) != 0) {
+		say(why, why_size, "release information does not match the bundle's manifest digest");
+		return FW_BUNDLE_HASH;
+	}
+	fw_sha256(info + FW_INFO_HEADER_SIZE, tlen, digest);
+	if (memcmp(digest, info + FW_INFO_OFF_SHA, FW_SHA256_SIZE) != 0) {
+		say(why, why_size, "release information digest mismatch");
+		return FW_BUNDLE_HASH;
+	}
+	if (!info_text(info + FW_INFO_HEADER_SIZE, tlen)) {
+		say(why, why_size, "release information is not 1 to %d bytes of printable text",
+		    FW_INFO_TEXT_MAX);
+		return FW_BUNDLE_FORMAT;
+	}
+	*bundle_len = end;
+	*text = (const char *)info + FW_INFO_HEADER_SIZE;
+	*text_len = tlen;
+	return FW_BUNDLE_OK;
+}
+
+size_t fw_bundle_info_build(uint8_t *out, const uint8_t *bundle, const char *text,
+			    size_t text_len)
+{
+	if (!info_text((const uint8_t *)text, text_len))
+		return 0;
+	if (!out)
+		return FW_INFO_HEADER_SIZE + text_len;
+	memset(out, 0, FW_INFO_HEADER_SIZE);
+	memcpy(out, FW_INFO_MAGIC, 8);
+	put_le32(out + FW_INFO_OFF_LENGTH, (uint32_t)text_len);
+	memcpy(out + FW_INFO_OFF_MANIFEST_SHA, bundle + FW_BUNDLE_OFF_MANIFEST_SHA, FW_SHA256_SIZE);
+	fw_sha256(text, text_len, out + FW_INFO_OFF_SHA);
+	memcpy(out + FW_INFO_HEADER_SIZE, text, text_len);
+	return FW_INFO_HEADER_SIZE + text_len;
+}
+
 const char *fw_bundle_status_name(enum fw_bundle_status status)
 {
 	switch (status) {

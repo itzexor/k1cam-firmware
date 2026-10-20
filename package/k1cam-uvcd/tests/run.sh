@@ -33,12 +33,14 @@ for image in uImage rootfs.squashfs; do
 	[ ! -f "$out/images/$image" ] || cp "$out/images/$image" "$fixtures/"
 done
 
-# The bundle format's golden vector, read independently of the C code.
-golden=$(python3 -I "$here/bundle_check.py" --golden)
-grep -q "\"$golden\"" "$here/fw_test.c" || {
-	echo "run.sh: bundle_check.py golden vector $golden is not the one fw_test.c pins" >&2
-	exit 1
-}
+# The bundle format's golden vectors, read independently of the C code.
+goldens=$(python3 -I "$here/bundle_check.py" --golden)
+for golden in $goldens; do
+	grep -q "\"$golden\"" "$here/fw_test.c" || {
+		echo "run.sh: bundle_check.py golden vector $golden is not one fw_test.c pins" >&2
+		exit 1
+	}
+done
 if [ -f "$out/images/k1cam.upd" ]; then
 	python3 -I "$here/bundle_check.py" "$out/images/k1cam.upd" >/dev/null
 fi

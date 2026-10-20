@@ -781,7 +781,15 @@ static int fw_upgrade(const char *device, const char *file, bool reboot, int tim
 	uint8_t *bundle = read_file(file, &len);
 	if (!bundle)
 		return FW_EXIT_FAILED;
-	enum fw_bundle_status st = fw_bundle_parse(bundle, len, &b, why, sizeof(why));
+	/* The camera gets the bundle without the release information. */
+	const char *text;
+	size_t blen, tlen;
+	enum fw_bundle_status st = fw_bundle_split(bundle, len, &blen, &text, &tlen, why,
+						   sizeof(why));
+	if (st == FW_BUNDLE_OK) {
+		len = (uint32_t)blen;
+		st = fw_bundle_parse(bundle, len, &b, why, sizeof(why));
+	}
 	if (st != FW_BUNDLE_OK) {
 		fprintf(stderr, "uvcdctl: %s: %s: %s\n", file, fw_bundle_status_name(st), why);
 		goto out;

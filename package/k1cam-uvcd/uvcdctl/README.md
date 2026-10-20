@@ -84,7 +84,9 @@ two USB control requests -- so expect minutes; the rate is printed at the end.
 `k1cam.bin`). It needs a camera on the A/B flash layout. It checks the bundle
 completely before contacting the camera, and the camera checks it again: the
 bundle's digests, the kernel's uImage CRCs, the SquashFS header, the board,
-the layout, and that it fits. The camera writes it into the slot that is
+the layout, and that it fits. The release information after the bundle (the
+build's os-release) is checked too but stays on the host: the camera gets
+the bundle alone. The camera writes it into the slot that is
 neither running nor confirmed, reads it back, prepares that slot's settings
 (a copy of the current `/etc/uvcd.conf`), and schedules it as a trial. Then
 it reboots into the trial; the trial confirms itself once it has encoded

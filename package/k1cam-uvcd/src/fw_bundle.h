@@ -23,6 +23,19 @@
  *
  * The digests catch corruption; they don't authenticate the publisher.
  * Signing would be a new version with a compiled-in key.
+ *
+ * A k1cam.upd file may go on after the bundle with the release's
+ * information, for the person choosing the file. Hosts send the camera the
+ * bundle only (its length field says where it ends), so the camera never
+ * sees it and parses exactly the above:
+ *
+ *   +0x00 magic "K1CAMINF"
+ *   +0x08 u32 text length (1 to 4096), +0x0c u32 flags (0)
+ *   +0x10 the bundle's manifest SHA-256 (its field at 0x0c0): the bundle
+ *         this describes
+ *   +0x30 SHA-256 of the text
+ *   +0x50 the text, ending the file: the release's os-release, printable
+ *         ASCII lines (tabs allowed)
  */
 #ifndef FW_BUNDLE_H
 #define FW_BUNDLE_H
@@ -66,6 +79,15 @@
 #define FW_BUNDLE_REC_LENGTH 0x08
 #define FW_BUNDLE_REC_INSTALLED 0x0c
 #define FW_BUNDLE_REC_SHA 0x10
+
+/* Release information offsets */
+#define FW_INFO_MAGIC "K1CAMINF"
+#define FW_INFO_OFF_LENGTH 0x08
+#define FW_INFO_OFF_FLAGS 0x0c
+#define FW_INFO_OFF_MANIFEST_SHA 0x10
+#define FW_INFO_OFF_SHA 0x30
+#define FW_INFO_HEADER_SIZE 0x50
+#define FW_INFO_TEXT_MAX 4096
 
 enum fw_component {
 	FW_COMPONENT_KERNEL = 1,
@@ -116,6 +138,20 @@ enum fw_bundle_status fw_bundle_compatible(const struct fw_bundle *b, uint32_t b
 size_t fw_bundle_build(uint8_t *out, const char *board, const char *layout, const char *build,
 		       uint32_t min_boot_compat, const uint8_t *kernel, uint32_t kernel_len,
 		       const uint8_t *rootfs, uint32_t rootfs_len);
+
+/* Split a k1cam.upd file into the bundle, *bundle_len bytes to check with
+ * fw_bundle_parse() and send to the camera, and the release information
+ * after it (*text, *text_len; NULL and 0 when the file has none). Checks the
+ * information only. */
+enum fw_bundle_status fw_bundle_split(const uint8_t *buf, size_t len, size_t *bundle_len,
+				      const char **text, size_t *text_len, char *why,
+				      size_t why_size);
+
+/* Write the release information for bundle (as fw_bundle_build() made it)
+ * to out (NULL to just measure). Returns its length, or 0 if text is empty,
+ * too long or not printable ASCII lines. */
+size_t fw_bundle_info_build(uint8_t *out, const uint8_t *bundle, const char *text,
+			    size_t text_len);
 
 /* Individual image checks, also used on what was read back from flash. */
 int fw_check_uimage(const uint8_t *buf, uint32_t len, char *why, size_t why_size);

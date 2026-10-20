@@ -4,8 +4,9 @@
  * bundle (format in src/fw_bundle.h). Runs on the build host.
  *
  *   k1cam-mkupd -o OUT -k uImage -r rootfs.squashfs -B BUILD_ID
- *               [-b BOARD] [-l LAYOUT] [-c MIN_BOOT_COMPAT]
+ *               [-b BOARD] [-l LAYOUT] [-c MIN_BOOT_COMPAT] [-i OS_RELEASE]
  *   k1cam-mkupd --check FILE    validate a bundle and print its manifest
+ *                               (and its release information, info: lines)
  *   k1cam-mkupd --layout        print the A/B layout the camera enforces
  *
  * The bundle is assembled by the same code the camera and uvcdctl parse it
@@ -50,10 +51,14 @@ static int check(const char *path)
 	struct fw_bundle b;
 	char why[160];
 	char hex[2 * FW_SHA256_SIZE + 1];
+	const char *text;
+	size_t blen, tlen;
 
 	if (!buf)
 		return 1;
-	enum fw_bundle_status st = fw_bundle_parse(buf, len, &b, why, sizeof(why));
+	enum fw_bundle_status st = fw_bundle_split(buf, len, &blen, &text, &tlen, why, sizeof(why));
+	if (st == FW_BUNDLE_OK)
+		st = fw_bundle_parse(buf, blen, &b, why, sizeof(why));
 	if (st == FW_BUNDLE_OK)
 		st = fw_bundle_compatible(&b, FW_BOOT_COMPAT, why, sizeof(why));
 	if (st != FW_BUNDLE_OK) {
@@ -67,6 +72,13 @@ static int check(const char *path)
 		fw_sha256_hex(b.component[i].sha256, hex);
 		printf("%s=%u+%u sha256:%s\n", i ? "rootfs" : "kernel", b.component[i].offset,
 		       b.component[i].length, hex);
+	}
+	/* The text ends the file: no NUL after it. */
+	for (size_t at = 0; at < tlen;) {
+		const char *nl = memchr(text + at, '\n', tlen - at);
+		size_t n = nl ? (size_t)(nl - (text + at)) : tlen - at;
+		printf("info:%.*s\n", (int)n, text + at);
+		at += n + 1;
 	}
 	free(buf);
 	return 0;
@@ -84,7 +96,7 @@ static void layout(void)
 static int usage(void)
 {
 	fprintf(stderr, "usage: k1cam-mkupd -o OUT -k UIMAGE -r ROOTFS -B BUILD_ID [-b BOARD]"
-			" [-l LAYOUT] [-c MIN_BOOT_COMPAT]\n"
+			" [-l LAYOUT] [-c MIN_BOOT_COMPAT] [-i OS_RELEASE]\n"
 			"       k1cam-mkupd --check FILE\n"
 			"       k1cam-mkupd --layout\n");
 	return 2;
@@ -92,7 +104,7 @@ static int usage(void)
 
 int main(int argc, char **argv)
 {
-	const char *out = NULL, *kernel = NULL, *rootfs = NULL, *build = NULL;
+	const char *out = NULL, *kernel = NULL, *rootfs = NULL, *build = NULL, *info = NULL;
 	const char *board = FW_BOARD_ID, *layout_id = FW_LAYOUT_AB_ID;
 	unsigned long compat = FW_BOOT_COMPAT;
 
@@ -112,6 +124,7 @@ int main(int argc, char **argv)
 		case 'k': kernel = val; break;
 		case 'r': rootfs = val; break;
 		case 'B': build = val; break;
+		case 'i': info = val; break;
 		case 'b': board = val; break;
 		case 'l': layout_id = val; break;
 		case 'c': {
@@ -128,23 +141,47 @@ int main(int argc, char **argv)
 	if (!out || !kernel || !rootfs || !build)
 		return usage();
 
-	uint32_t klen, rlen;
+	uint32_t klen, rlen, ilen = 0;
 	uint8_t *k = slurp(kernel, &klen), *r = slurp(rootfs, &rlen);
-	if (!k || !r)
+	uint8_t *text = info ? slurp(info, &ilen) : NULL;
+	if (!k || !r || (info && !text))
 		return 1;
-	size_t total = fw_bundle_build(NULL, board, layout_id, build, (uint32_t)compat, k, klen, r,
-				       rlen);
-	uint8_t *bundle = total ? malloc(total) : NULL;
+	size_t len = fw_bundle_build(NULL, board, layout_id, build, (uint32_t)compat, k, klen, r,
+				     rlen);
+	size_t extra = text ? fw_bundle_info_build(NULL, NULL, (const char *)text, ilen) : 0;
+	if (!len) {
+		fprintf(stderr, "k1cam-mkupd: identifier too long\n");
+		return 1;
+	}
+	if (text && !extra) {
+		fprintf(stderr, "k1cam-mkupd: %s: not 1 to %d bytes of printable ASCII lines\n", info,
+			FW_INFO_TEXT_MAX);
+		return 1;
+	}
+	size_t total = len + extra;
+	uint8_t *bundle = malloc(total);
 	if (!bundle) {
-		fprintf(stderr, "k1cam-mkupd: %s\n", total ? "out of memory" : "identifier too long");
+		fprintf(stderr, "k1cam-mkupd: out of memory\n");
 		return 1;
 	}
 	fw_bundle_build(bundle, board, layout_id, build, (uint32_t)compat, k, klen, r, rlen);
+	if (text)
+		fw_bundle_info_build(bundle + len, bundle, (const char *)text, ilen);
 
-	/* What the camera will check, checked here first. */
+	/* What the camera will check, checked here first, and the release
+	 * information read back the way hosts read it. */
 	struct fw_bundle b;
 	char why[160];
-	enum fw_bundle_status st = fw_bundle_parse(bundle, total, &b, why, sizeof(why));
+	const char *got;
+	size_t blen, glen;
+	enum fw_bundle_status st = fw_bundle_split(bundle, total, &blen, &got, &glen, why,
+						   sizeof(why));
+	if (st == FW_BUNDLE_OK && (blen != len || glen != ilen || (text && memcmp(got, text, ilen)))) {
+		snprintf(why, sizeof(why), "the release information does not read back");
+		st = FW_BUNDLE_FORMAT;
+	}
+	if (st == FW_BUNDLE_OK)
+		st = fw_bundle_parse(bundle, blen, &b, why, sizeof(why));
 	if (st == FW_BUNDLE_OK)
 		st = fw_bundle_compatible(&b, FW_BOOT_COMPAT, why, sizeof(why));
 	if (st != FW_BUNDLE_OK) {
@@ -160,5 +197,6 @@ int main(int argc, char **argv)
 	free(bundle);
 	free(k);
 	free(r);
+	free(text);
 	return 0;
 }

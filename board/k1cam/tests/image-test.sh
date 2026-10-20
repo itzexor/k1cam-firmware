@@ -35,6 +35,11 @@ kernel=0123456789ab
 min_boot_compat=1
 protocol=1
 EOF
+cat >"$work/target/usr/lib/os-release" <<EOF
+NAME=k1cam
+BUILD_ID="image-test+0123456, 2026-01-01 00:00:00 +0000"
+KERNEL_COMMIT=0123456789ab
+EOF
 ${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -I"$top/package/k1cam-uvcd/src" \
 	"$top/package/k1cam-uvcd/tests/fwenv_tool.c" -o "$work/fwenv_tool"
 
@@ -77,6 +82,8 @@ trial_slot absent" ] || fail "environment state"
 python3 -I "$top/package/k1cam-uvcd/tests/bundle_check.py" "$img/k1cam.upd" >"$work/manifest" ||
 	fail "bundle_check.py refused k1cam.upd"
 grep -q '^build=k1cam-image-test$' "$work/manifest" || fail "bundle build id"
+sed -n 's/^info://p' "$work/manifest" | cmp -s - "$work/target/usr/lib/os-release" ||
+	fail "k1cam.upd's release information is not the target's os-release"
 cp "$img/k1cam.upd" "$work/first.upd"
 pack || fail "second run"
 cmp -s "$img/k1cam.upd" "$work/first.upd" || fail "k1cam.upd differs between identical runs"

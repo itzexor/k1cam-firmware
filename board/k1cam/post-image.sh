@@ -16,7 +16,8 @@
 #                     settings layer (slots/a, slots/b), all empty
 #   k1cam.bin         the whole flash, both slots holding this build: an
 #                     installation, which also resets the settings
-#   k1cam.upd         the routine update: this kernel and rootfs only
+#   k1cam.upd         the routine update: this kernel and rootfs only, and
+#                     the release's os-release for whoever picks the file
 #   *.sha256sum       their checksums
 #   k1cam-layout.txt  the layout, for people
 
@@ -27,6 +28,7 @@ BOARD_DIR=$(cd "$(dirname "$0")" && pwd)
 UENV=${K1CAM_UENV:-$BOARD_DIR/uenv.txt}
 FW_ENV_CONFIG=${K1CAM_FW_ENV_CONFIG:-$BOARD_DIR/rootfs-overlay/etc/fw_env.config}
 RELEASE="${TARGET_DIR:?}/usr/lib/k1cam/firmware-release"
+OS_RELEASE="$TARGET_DIR/usr/lib/os-release"
 MKUPD="${HOST_DIR:?}/bin/k1cam-mkupd"
 # The SFC NOR driver erases in 32 KiB blocks (mtd erasesize), not 64 KiB.
 ERASE_BLOCK=32768
@@ -226,14 +228,18 @@ put data data.jffs2
 [ "$(stat -c %s k1cam.bin)" -eq "$flash_size" ] || fail "k1cam.bin is not $flash_size bytes"
 sha256sum k1cam.bin >k1cam.bin.sha256sum
 
-# The update bundle, parsed back the way the camera will parse it.
-"$MKUPD" -o k1cam.upd -k uImage -r rootfs.squashfs -B "$build" -c "$min_boot_compat"
+# The update bundle, parsed back the way the camera will parse it, and the
+# os-release after it read back the way hosts read it.
+"$MKUPD" -o k1cam.upd -k uImage -r rootfs.squashfs -B "$build" -c "$min_boot_compat" \
+	-i "$OS_RELEASE"
 check=$("$MKUPD" --check k1cam.upd)
 for c in kernel:uImage rootfs:rootfs.squashfs; do
 	digest=$(sha256sum "${c#*:}" | cut -d' ' -f1)
 	printf '%s\n' "$check" | grep -q "^${c%%:*}=.* sha256:$digest$" ||
 		fail "k1cam.upd's ${c%%:*} is not ${c#*:}"
 done
+printf '%s\n' "$check" | sed -n 's/^info://p' | cmp -s - "$OS_RELEASE" ||
+	fail "k1cam.upd's release information is not $OS_RELEASE"
 sha256sum k1cam.upd >k1cam.upd.sha256sum
 
 {

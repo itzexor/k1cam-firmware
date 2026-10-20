@@ -530,6 +530,20 @@ static void write_bundle(const char *path, const char *build, uint8_t salt)
 	free(r);
 }
 
+/* Release information after the bundle, as post-image.sh packs k1cam.upd. */
+static void append_info(const char *path)
+{
+	static const char text[] = "NAME=k1cam\nBUILD_ID=\"k1cam+new, 2026-01-01 00:00:00 +0000\"\n";
+	uint8_t head[FW_BUNDLE_MANIFEST_SIZE], info[FW_INFO_HEADER_SIZE + sizeof(text)];
+	FILE *f = fopen(path, "rb");
+	assert(f && fread(head, 1, sizeof(head), f) == sizeof(head));
+	fclose(f);
+	size_t n = fw_bundle_info_build(info, head, text, strlen(text));
+	f = fopen(path, "ab");
+	assert(n && f && fwrite(info, 1, n, f) == n);
+	fclose(f);
+}
+
 static int fw_run(const char *a, const char *b, const char *c, const char *d, FILE *stream,
 		  char *out, size_t size)
 {
@@ -613,10 +627,13 @@ static void check_firmware(void)
 	cam_memory(40000);
 	free(copy);
 
-	/* Upgrade: staged, rebooted, confirmed by the camera. */
+	/* Upgrade: staged, rebooted, confirmed by the camera. The file carries
+	 * release information, which the camera (refusing trailing bytes) must
+	 * not get. */
 	snprintf(bundle, sizeof(bundle), "%s/uvcdctl-test-%d.upd",
 		 getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
 	write_bundle(bundle, "k1cam-new", 1);
+	append_info(bundle);
 	snprintf(cam_trial_build, sizeof(cam_trial_build), "k1cam-new");
 	assert(fw_run("upgrade", bundle, NULL, NULL, stdout, out, sizeof(out)) == 0);
 	assert(strstr(out, "staged: k1cam-new is in slot b") &&
@@ -672,6 +689,12 @@ static void check_firmware(void)
 	fclose(f);
 	assert(fw_run("upgrade", bundle, NULL, NULL, stderr, out, sizeof(out)) == 1);
 	assert(strstr(out, "digest mismatch"));
+	write_bundle(bundle, "k1cam-new", 1);
+	f = fopen(bundle, "ab");
+	fputc('x', f);
+	fclose(f);
+	assert(fw_run("upgrade", bundle, NULL, NULL, stderr, out, sizeof(out)) == 1);
+	assert(strstr(out, "not release information"));
 	cam_free();
 	cam_init(false);
 	write_bundle(bundle, "k1cam-new", 1);
