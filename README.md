@@ -40,6 +40,11 @@ layout, use `uvcdctl firmware upgrade` or the flasher's A/B Update tab with
 [firmware update guide](FIRMWARE-UPDATE.md) covers layout migration, backups
 and rollback.
 
+The running firmware uses `f055:4b31` (unofficial FOSS community VID,
+`4b31` = "K1"), with manufacturer `k1cam` and product `K1 Camera`. See
+[USB identity](USB-IDENTITY.md) for the collision checks and migration from
+the earlier `1d6b:0110` identity.
+
 ## Build the firmware
 
 Needs a Linux x86_64 host with Buildroot's usual prerequisites. The kernel
