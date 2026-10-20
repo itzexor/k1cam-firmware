@@ -34,17 +34,23 @@ Makefile                 thin wrapper around buildroot/ (submodule)
 configs/k1cam_defconfig  the whole configuration (savedefconfig output)
 board/k1cam/linux.config fixed T31L/GC2083 kernel configuration
 board/k1cam/uboot.config fixed T31L SPI-NOR U-Boot configuration
-board/k1cam/uenv.txt     U-Boot environment and flash layout (mtdparts)
+board/k1cam/uenv.txt     U-Boot environment, flash layout (mtdparts), A/B boot logic
 board/k1cam/rootfs-overlay/  fixed minimal runtime files and init scripts
 board/k1cam/post-build.sh   target compatibility links and k1cam identity
-board/k1cam/post-image.sh   packs k1cam.bin from the layout in uenv.txt
-package/k1cam-uvcd/      uvcd (UVC gadget daemon), uvcdctl, S31uvcd, tests
+board/k1cam/post-image.sh   packs k1cam.bin and k1cam.upd, checks the layout
+board/k1cam/tests/       boot-test.sh: the boot logic in U-Boot's sandbox;
+                         image-test.sh: post-image.sh's images and refusals
+package/k1cam-uvcd/      uvcd (UVC gadget daemon), uvcdctl, k1cam-mkupd,
+                         S31uvcd, tests
 package/thingino-*, ingenic-*   upstream camera libraries and drivers
 ```
 
-The flash layout is fixed. To change it, edit mtdparts and the matching
-kern_*/data_* lines in board/k1cam/uenv.txt; post-image.sh refuses an image
-whose layout, addresses or sizes disagree.
+The flash layout is fixed: A/B slots, described in FIRMWARE-UPDATE.md. It is
+in board/k1cam/uenv.txt (mtdparts and the matching kernel_*, rootfs_*_dev,
+data_* lines) and in package/k1cam-uvcd/src/fw_layout.h, which the updater
+takes every flash address from; post-image.sh refuses an image when they
+disagree. A layout change also changes k1_layout and fw_env.config, and can
+only reach a camera by flashing k1cam.bin.
 
 ## Kernel
 
@@ -56,9 +62,13 @@ descriptors live in `drivers/usb/gadget/webcam.c`.
 
 ## uvcd tests
 
-Host tests (config, gadget, pipeline, startup) need the raptor-hal headers
-from a build: `package/k1cam-uvcd/tests/run.sh` (after `make`). The
-supervisor test is `python3 package/k1cam-uvcd/tests/supervisor_test.py`.
+Host tests (config, firmware, protocol, gadget, pipeline, startup, uvcdctl)
+need the raptor-hal headers from a build: `package/k1cam-uvcd/tests/run.sh`
+(after `make`). The supervisor test is
+`python3 package/k1cam-uvcd/tests/supervisor_test.py`. The U-Boot boot logic
+is tested by `board/k1cam/tests/boot-test.sh`, which builds U-Boot's sandbox
+into output/uboot-sandbox the first time, and the image packer by
+`board/k1cam/tests/image-test.sh` (both after `make`).
 
 ## Working rules
 

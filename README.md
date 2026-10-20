@@ -11,6 +11,9 @@ standard UVC webcam (so far tested with Linux hosts), with:
   settings that UVC has no control for on a vendor extension unit, reachable
   with `uvcdctl` (package/k1cam-uvcd/uvcdctl);
 - settings that persist across reboots, with a factory reset;
+- flash dumps and A/B firmware updates over the same USB device (`uvcdctl
+  firmware`), which fall back to the previous firmware by themselves if the
+  new one does not work (see FIRMWARE-UPDATE.md);
 - a shell on the USB serial (ACM) port.
 
 The sensor and ISP run from boot on the default 1080p view, so exposure
@@ -30,20 +33,26 @@ git submodule update --init
 make
 ```
 
-The result is `output/k1cam/images/k1cam.bin`, a full image of the 8 MiB
-flash:
+The results are in `output/k1cam/images/`: `k1cam.bin`, a full image of the
+8 MiB flash for installing (it resets the settings), and `k1cam.upd`, the
+update bundle for `uvcdctl firmware upgrade`:
 
-| partition | offset   | size     |                                  |
-| --------- | -------- | -------- | -------------------------------- |
-| boot      | 0x000000 | 320 KiB  | U-Boot                           |
-| env       | 0x050000 | 64 KiB   | U-Boot environment               |
-| backup    | 0x060000 | 64 KiB   |                                  |
-| kernel    | 0x070000 | 1600 KiB | Linux 3.10 uImage                |
-| rootfs    | 0x200000 | 2560 KiB | squashfs                         |
-| data      | 0x480000 | 3584 KiB | jffs2 overlay (settings)         |
+| partition | offset   | size     |                                         |
+| --------- | -------- | -------- | --------------------------------------- |
+| boot      | 0x000000 | 320 KiB  | U-Boot                                  |
+| env_a     | 0x050000 | 64 KiB   | U-Boot environment                      |
+| env_b     | 0x060000 | 64 KiB   | U-Boot environment, redundant copy      |
+| kernel_a  | 0x070000 | 1280 KiB | slot a: Linux 3.10 uImage               |
+| rootfs_a  | 0x1b0000 | 1792 KiB | slot a: squashfs                        |
+| kernel_b  | 0x370000 | 1280 KiB | slot b: Linux 3.10 uImage               |
+| rootfs_b  | 0x4b0000 | 1792 KiB | slot b: squashfs                        |
+| data      | 0x670000 | 1600 KiB | jffs2: each slot's settings layer, /opt |
 
-The layout is defined once, in `board/k1cam/uenv.txt`. See AGENTS.md for how
-the tree is organised.
+The layout is defined in `board/k1cam/uenv.txt` and, for the updater, in
+`package/k1cam-uvcd/src/fw_layout.h`; the build checks that they agree.
+Cameras on the earlier single-slot layout move to this one by being flashed
+with `k1cam.bin` once (FIRMWARE-UPDATE.md). See AGENTS.md for how the tree is
+organised.
 
 ## Origins and licences
 
