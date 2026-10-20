@@ -131,12 +131,35 @@ row, with factory defaults.
 
 ## Build
 
+The standalone build runs on a Linux USB host and produces a native host
+executable. It needs `make`, a C11 compiler, libc development files and Linux
+userspace headers for V4L2/UVC. No libusb, camera SDK, Buildroot build or
+submodule initialization is required. Keep the firmware checkout intact:
+the Makefile also compiles shared bundle code from `../src`.
+
+From a fresh checkout:
+
 ```sh
+git clone --branch k1cam https://github.com/itzexor/k1cam-firmware.git
+cd k1cam-firmware/package/k1cam-uvcd/uvcdctl
 make
-sudo make install
+./uvcdctl help
 ```
 
+Run the resulting binary as `./uvcdctl` from this directory, or optionally
+install it to `/usr/bin/uvcdctl` with `sudo make install`. The firmware build
+separately cross-compiles a copy for the camera.
+
+See the [firmware README](../../../README.md#projects-in-the-ecosystem) for
+how the firmware, kernel and
+[k1cam-flasher](https://github.com/itzexor/k1cam-flasher) fit together.
+
 ## Use
+
+Connect a camera running k1cam firmware over USB. The host user needs read
+and write access to its `/dev/videoN` node, commonly through the `video`
+group or desktop device permissions. The examples below use the installed
+command; use `./uvcdctl` from the build directory if it is not installed.
 
 ```sh
 uvcdctl list                  # values, ranges and defaults
@@ -164,8 +187,12 @@ smaller size gets the rest of it back.
 On the camera, `uvcdctl` uses the daemon's local socket at `/var/run/uvcd.sock`.
 On a USB host, it selects the `uvcvideo` node that answers an Extension Unit 4
 query. Both paths use the same `list`/`describe` formatting. Local readings
-come from the daemon's control state. Use `--device /dev/videoN` to select a
-V4L2 device explicitly.
+come from the daemon's control state. Use `--device /dev/videoN` before the
+command to select a V4L2 device explicitly, for example:
+
+```sh
+uvcdctl --device /dev/video0 list
+```
 
 Exit status is 0 on success, 1 on a device error, 2 on a usage error (and
 for `firmware upgrade`, 3 and 4 as above).

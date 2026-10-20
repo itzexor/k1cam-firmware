@@ -9,11 +9,11 @@ standard UVC webcam (so far tested with Linux hosts), with:
 - the usual image controls (brightness, contrast, white balance, exposure,
   zoom and pan/tilt, ...) as standard UVC controls, and the ISP and encoder
   settings that UVC has no control for on a vendor extension unit, reachable
-  with `uvcdctl` (package/k1cam-uvcd/uvcdctl);
+  with [uvcdctl](package/k1cam-uvcd/uvcdctl/);
 - settings that persist across reboots, with a factory reset;
 - flash dumps and A/B firmware updates over the same USB device (`uvcdctl
   firmware`), which fall back to the previous firmware by themselves if the
-  new one does not work (see FIRMWARE-UPDATE.md);
+  new one does not work (see [firmware updates](FIRMWARE-UPDATE.md));
 - a shell on the USB serial (ACM) port.
 
 The sensor and ISP run from boot on the default 1080p view, so exposure
@@ -22,11 +22,31 @@ With nothing streaming they run at 30 fps until exposure settles, then at
 5 fps until the light changes. Capture and encoding only run while a
 program is streaming.
 
-## Build
+## Projects in the ecosystem
+
+| Project | Role |
+| --- | --- |
+| [k1cam-firmware](https://github.com/itzexor/k1cam-firmware) (this repository) | Buildroot external tree for the camera firmware: board configuration, the `uvcd` camera daemon, persistent settings, and firmware image/update packaging. |
+| [thingino-linux](https://github.com/itzexor/thingino-linux/tree/k1cam) | Linux kernel fork, with the K1 USB webcam gadget, UVC controls, extension unit and USB serial port. The firmware build fetches the exact commit pinned in `configs/k1cam_defconfig`. |
+| [k1cam-flasher](https://github.com/itzexor/k1cam-flasher) | Desktop GUI for full flash backups and initial installation/recovery through the Ingenic USB boot ROM, plus A/B updates over the running k1cam camera's UVC extension unit. See its README for platform support and USB driver setup. |
+| [uvcdctl](https://github.com/itzexor/k1cam-firmware/tree/k1cam/package/k1cam-uvcd/uvcdctl) | Linux CLI in this repository for image/encoder controls, flash backups and A/B updates over USB. It builds independently on the host and is also included in the camera firmware. |
+
+Build this firmware to produce `k1cam.bin` and `k1cam.upd`. Use
+[k1cam-flasher's installation instructions](https://github.com/itzexor/k1cam-flasher#using-it)
+to install the full `k1cam.bin` image through the boot ROM; this also installs
+the A/B flash layout and resets settings. Once the camera runs k1cam on that
+layout, use `uvcdctl firmware upgrade` or the flasher's A/B Update tab with
+`k1cam.upd` for subsequent updates over its normal USB connection. The
+[firmware update guide](FIRMWARE-UPDATE.md) covers layout migration, backups
+and rollback.
+
+## Build the firmware
 
 Needs a Linux x86_64 host with Buildroot's usual prerequisites. The kernel
-sources are fetched automatically: the thingino-linux fork's commit pinned in
-the defconfig, from its `k1cam` branch.
+sources are fetched automatically from
+[itzexor/thingino-linux](https://github.com/itzexor/thingino-linux/tree/k1cam):
+the commit pinned in the defconfig, from its `k1cam` branch. No sibling kernel
+checkout is needed.
 
 ```sh
 git submodule update --init
@@ -51,8 +71,60 @@ update bundle for `uvcdctl firmware upgrade`:
 The layout is defined in `board/k1cam/uenv.txt` and, for the updater, in
 `package/k1cam-uvcd/src/fw_layout.h`; the build checks that they agree.
 Cameras on the earlier single-slot layout move to this one by being flashed
-with `k1cam.bin` once (FIRMWARE-UPDATE.md). See AGENTS.md for how the tree is
-organised.
+with `k1cam.bin` once ([firmware update guide](FIRMWARE-UPDATE.md)). See
+[AGENTS.md](AGENTS.md) for how the tree is organised.
+
+## Build uvcdctl on a Linux host
+
+To control an already-flashed camera, only `uvcdctl` is needed. Its standalone
+build requires `make`, a C11 compiler, libc development files and Linux
+userspace headers (V4L2/UVC). It uses libc and the kernel's `uvcvideo` driver;
+no libusb, camera SDK, Buildroot build or submodule initialization is needed.
+Keep the firmware checkout intact: the CLI also compiles shared firmware
+bundle code from its sibling `../src` directory.
+
+From a fresh checkout:
+
+```sh
+git clone --branch k1cam https://github.com/itzexor/k1cam-firmware.git
+cd k1cam-firmware/package/k1cam-uvcd/uvcdctl
+make
+./uvcdctl help
+```
+
+The executable is `uvcdctl` in that directory. Run it there as `./uvcdctl`,
+or optionally install it to `/usr/bin/uvcdctl` with `sudo make install`.
+This builds for the machine running `make`, independently of the MIPS camera
+firmware build.
+
+## Use uvcdctl
+
+Connect the camera running k1cam firmware over USB. The host user needs read
+and write access to its `/dev/videoN` node (commonly through the `video`
+group or desktop device permissions). `uvcdctl` finds the camera by probing
+its UVC extension unit; use `--device /dev/videoN` before the command to
+select one explicitly when several cameras are connected.
+
+These examples use the installed command; use `./uvcdctl` from the build
+directory if it is not installed:
+
+```sh
+uvcdctl list                              # values, ranges and defaults
+uvcdctl describe h264-bitrate-kbps         # explain a control
+uvcdctl get spatial-denoise
+uvcdctl set h264-bitrate-kbps 6000
+uvcdctl --device /dev/video0 set rotation 180
+uvcdctl firmware info                     # build, layout and boot slots
+uvcdctl firmware dump k1-backup.bin        # verified full flash backup
+uvcdctl firmware upgrade /path/to/k1cam.upd
+uvcdctl help firmware
+```
+
+Control changes persist automatically on the camera; there is no save step.
+On the camera itself, the included `uvcdctl` uses the daemon's local socket
+for controls. On the USB host, it uses V4L2 and UVC extension unit requests.
+See the [uvcdctl README](package/k1cam-uvcd/uvcdctl/README.md) for the full
+command reference, device selection, reset behavior and firmware exit codes.
 
 ## Origins and licences
 
