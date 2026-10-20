@@ -20,6 +20,12 @@ uvcdctl get <control>
 uvcdctl set <control> <value>
 uvcdctl keyframe
 uvcdctl reset
+uvcdctl firmware info
+uvcdctl firmware status
+uvcdctl firmware dump [--live] FILE
+uvcdctl firmware upgrade [--no-reboot] [--wait-timeout SECONDS] FILE
+uvcdctl firmware reboot
+uvcdctl firmware cancel
 uvcdctl help [command]
 ```
 
@@ -47,6 +53,57 @@ returned value and exits with status 1 if it differs or cannot be read.
 Standard V4L2 controls can be cached by the host driver; this is not an
 independent ISP readback. Settings for an inactive mode or format are staged
 for when it is used.
+
+## Firmware
+
+The `firmware` commands read and update the camera's flash over the same
+device node, through three 60-byte controls on Extension Unit 4 (selectors
+26-28; the protocol is described in `../src/uvcd_firmware.h` and
+`FIRMWARE-UPDATE.md` at the top of the tree). A camera whose firmware
+predates them says so and exits with status 1.
+
+`firmware info` prints what the camera reports as `key=value` lines: board,
+flash layout, build id, kernel, serial number, how it booted (`confirmed`,
+`trial`, `fallback`, or `single` on the original layout), its running,
+confirmed and trial slots, and the features it offers now. `firmware status`
+reads the protocol's current state without changing anything: the phase and
+progress of the current operation and the result of the last command.
+
+`firmware dump FILE` saves the whole 8 MiB flash. The camera first copies it
+to RAM with its own settings writes and the flash filesystem's background
+writer paused, reading it twice to make sure nothing changed meanwhile, and
+the dump is checked against the camera's SHA-256 of that copy. Data goes to
+`FILE.part`, which becomes `FILE` only once complete and verified; a failed
+dump leaves the partial file and says so, and neither file is ever
+overwritten. If the camera lacks the RAM for a copy, the dump is refused;
+`--live` then reads the flash in place, a diagnostic dump that may be
+inconsistent and is labelled so. The transfer is slow -- every 44 bytes is
+two USB control requests -- so expect minutes; the rate is printed at the end.
+
+`firmware upgrade FILE` installs a `k1cam.upd` bundle (built next to
+`k1cam.bin`). It needs a camera on the A/B flash layout. It checks the bundle
+completely before contacting the camera, and the camera checks it again: the
+bundle's digests, the kernel's uImage CRCs, the SquashFS header, the board,
+the layout, and that it fits. The camera writes it into the slot that is
+neither running nor confirmed, reads it back, prepares that slot's settings
+(a copy of the current `/etc/uvcd.conf`), and schedules it as a trial. Then
+it reboots into the trial; the trial confirms itself once it has encoded
+video, and `uvcdctl` finds the camera again by its serial number and reports
+the outcome:
+
+- 0: confirmed, the camera runs the new build (with `--no-reboot`: staged;
+  `firmware reboot` or any reboot starts the trial);
+- 1: failed before a trial was scheduled: the camera still boots what it ran;
+- 3: rolled back: the trial failed and the camera runs the old build again;
+- 4: not confirmed: still pending when `--wait-timeout` (600 s) ran out, or
+  the camera did not come back.
+
+A trial that fails three boots, or whose kernel won't load, goes back to the
+confirmed slot. `firmware cancel` stops a dump or an upload, an install
+before it schedules the trial, or withdraws a scheduled trial. An update
+never writes the running or confirmed slot, the bootloader, its environment
+other than the slot variables, or the settings partition. The bundle's
+digests detect damage; they do not prove who made it.
 
 Gain ceilings use the T31 SDK's logarithmic units: 0 is 1x, and every
 32 units doubles gain. `max-analog-gain` accepts 0-224, with the unchanged
@@ -92,6 +149,9 @@ uvcdctl set zoom 200          # 2x digital zoom, then move it:
 uvcdctl set pan 18000
 uvcdctl keyframe
 uvcdctl reset
+uvcdctl firmware info
+uvcdctl firmware dump k1-backup.bin
+uvcdctl firmware upgrade k1cam.upd
 ```
 
 Zoom upscales part of the sensor image to the stream size, and the ISP can
@@ -107,4 +167,5 @@ query. Both paths use the same `list`/`describe` formatting. Local readings
 come from the daemon's control state. Use `--device /dev/videoN` to select a
 V4L2 device explicitly.
 
-Exit status is 0 on success, 1 on a device error, 2 on a usage error.
+Exit status is 0 on success, 1 on a device error, 2 on a usage error (and
+for `firmware upgrade`, 3 and 4 as above).

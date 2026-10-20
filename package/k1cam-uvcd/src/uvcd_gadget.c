@@ -26,6 +26,8 @@
 #include "uvcd_gadget.h"
 #include "uvcd_config.h"
 #include "uvcd_ctl.h"
+#include "uvcd_firmware.h"
+#include "uvcd_update.h"
 
 /* --------------------------------------------------------------------------
  * UVC gadget userspace API (from kernel uvc.h)
@@ -41,6 +43,11 @@ struct uvc_request_data {
 	int32_t length;
 	uint8_t data[60];
 };
+/* It travels in v4l2_event.u.data, 64 bytes; the kernel caps requests at the
+ * 60 left after the length (UVC_MAX_REQUEST_SIZE), the firmware frame size. */
+_Static_assert(sizeof(struct uvc_request_data) == 64, "uvc_request_data is 64 bytes");
+_Static_assert(UVCD_FW_FRAME_SIZE == sizeof(((struct uvc_request_data *)0)->data),
+	       "firmware frames fill a request");
 
 struct uvc_event {
 	union {
@@ -161,6 +168,19 @@ struct gadget_s {
 	uint8_t last_unit; /* entity ID, for control-interface requests */
 	uint8_t last_request;
 
+	/* Firmware info, dumps and updates (selectors 26-28); NULL if it
+	 * could not be set up, and those selectors then stall. */
+	struct uvcd_update *update;
+	/* A trial boot's proof that this release runs the camera. */
+	struct {
+		int step; /* SELFTEST_* */
+		int64_t since_ms;
+		uint64_t seen_seq;
+		int frames;
+		bool key;
+		int tries;
+	} selftest;
+
 	/* Controls are persistent by default -- there is no explicit SAVE.
 	 * Every accepted change marks the shadow dirty; the poll loop writes
 	 * it out once changes have settled for UVCD_CONFIG_SETTLE_MS. */
@@ -178,6 +198,12 @@ struct gadget_s {
 
 	uint64_t read_seq;
 };
+
+static bool firmware_selector(uint8_t selector)
+{
+	return selector == UVCD_FW_COMMAND_SELECTOR || selector == UVCD_FW_DATA_SELECTOR ||
+	       selector == UVCD_FW_STATUS_SELECTOR;
+}
 
 static void fill_streaming_control(struct uvc_streaming_control *ctrl, uint8_t format_idx,
 				   uint8_t frame_idx, uint32_t interval)
@@ -524,6 +550,9 @@ static int config_flush(gadget_t *g, bool force)
 {
 	if (!g->config_dirty ||
 	    (!force && uvcd_monotonic_ms() - g->config_dirty_at < UVCD_CONFIG_SETTLE_MS))
+		return 0;
+	/* A dump is copying the flash: keep the change until it is done. */
+	if (!force && g->update && uvcd_update_persist_paused(g->update))
 		return 0;
 	int ret = uvcd_config_save(UVCD_CONFIG_PATH, &g->pipe->controls);
 	if (ret != 0)
@@ -993,6 +1022,23 @@ static void handle_camera_data(gadget_t *g, const struct uvc_request_data *data)
 	}
 }
 
+static void handle_firmware_setup(gadget_t *g, const struct usb_ctrlrequest *req,
+				  struct uvc_request_data *resp)
+{
+	uint8_t selector = req->wValue >> 8;
+	bool in = req->bRequestType & USB_DIR_IN;
+
+	resp->length = g->update ? uvcd_update_setup(g->update, req->bRequest, selector, in,
+						     req->wLength, resp->data)
+				 : -1;
+	if (!in && resp->length >= 0) {
+		g->last_cs = selector;
+		g->last_intf = UVC_INTF_CONTROL;
+		g->last_unit = UVCD_CUSTOM_UNIT_ID;
+		g->last_request = req->bRequest;
+	}
+}
+
 static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 {
 	struct uvc_request_data resp;
@@ -1012,7 +1058,10 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 	if (intf == UVC_INTF_CONTROL) {
 		switch (unit) {
 		case UVCD_CUSTOM_UNIT_ID:
-			handle_custom_setup(g, req, &resp);
+			if (firmware_selector(cs))
+				handle_firmware_setup(g, req, &resp);
+			else
+				handle_custom_setup(g, req, &resp);
 			break;
 		case UVCD_PROCESSING_UNIT_ID:
 			handle_control_setup(g, req, &resp);
@@ -1092,6 +1141,11 @@ static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 	if (g->last_request == UVC_SET_CUR && g->last_intf == UVC_INTF_CONTROL) {
 		if (g->last_unit == UVCD_CAMERA_TERMINAL_ID) {
 			handle_camera_data(g, data);
+			return;
+		}
+		if (g->last_unit == UVCD_CUSTOM_UNIT_ID && firmware_selector(g->last_cs)) {
+			if (g->update)
+				uvcd_update_data(g->update, g->last_cs, data->data, data->length);
 			return;
 		}
 		bool xu = (g->last_unit == UVCD_CUSTOM_UNIT_ID);
@@ -1311,6 +1365,8 @@ static void process_events(gadget_t *g)
 		case UVC_EVENT_DISCONNECT:
 			LOGI("USB disconnected");
 			stop_streaming(g);
+			if (g->update)
+				uvcd_update_disconnect(g->update);
 			break;
 		case UVC_EVENT_SETUP:
 			handle_setup_event(g, &uvc_ev->req);
@@ -1491,6 +1547,101 @@ static int gadget_open(gadget_t *g)
 	return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Trial self-test. A trial boot of a new release is confirmed only once it
+ * has shown it can run the camera: ISP frames through the H.264 and then
+ * the MJPEG encoder, at a small size, with no host involved. A host stream
+ * that runs healthily for a while counts as the same proof. Failing that,
+ * the trial stays pending and k1cam-trial-gate reboots, which counts it.
+ */
+#define SELFTEST_OFF 0
+#define SELFTEST_H264 1
+#define SELFTEST_MJPEG 2
+#define SELFTEST_FRAMES 5
+#define SELFTEST_STEP_MS 5000
+#define SELFTEST_TRIES 3
+#define SELFTEST_HOST_MS 3000
+
+static bool selftest_frame_valid(int step, const uint8_t *d, uint32_t len)
+{
+	if (step == SELFTEST_H264)
+		return len > 4 && d[0] == 0 && d[1] == 0 &&
+		       (d[2] == 1 || (d[2] == 0 && d[3] == 1));
+	return len > 4 && d[0] == 0xff && d[1] == 0xd8 && d[len - 2] == 0xff && d[len - 1] == 0xd9;
+}
+
+static void selftest_start(gadget_t *g, int step)
+{
+	g->selftest.step = step;
+	g->selftest.since_ms = uvcd_monotonic_ms();
+	g->selftest.frames = 0;
+	g->selftest.key = false;
+	g->selftest.seen_seq = 0;
+	if (uvcd_pipeline_start(g->pipe, step == SELFTEST_H264 ? UVCD_FMT_H264 : UVCD_FMT_MJPEG,
+				UVCD_FRAME_360P, UVCD_INTERVAL_30FPS) != 0)
+		LOGW("trial self-test: %s stream did not start",
+		     step == SELFTEST_H264 ? "H.264" : "MJPEG");
+}
+
+static void selftest_tick(gadget_t *g)
+{
+	int64_t now = uvcd_monotonic_ms();
+
+	if (!g->update)
+		return;
+	if (g->streaming) {
+		/* The host has the camera (start_streaming replaced any test
+		 * stream). Its frames are the proof, or the test resumes after. */
+		g->selftest.step = SELFTEST_OFF;
+		if (g->healthy_since_ms && now - g->healthy_since_ms >= SELFTEST_HOST_MS &&
+		    uvcd_update_trial_wants_check(g->update))
+			uvcd_update_trial_health(g->update, true, "host stream delivered frames");
+		return;
+	}
+	if (g->selftest.step == SELFTEST_OFF) {
+		if (uvcd_update_trial_wants_check(g->update)) {
+			LOGI("trial boot: testing the camera before confirming this release");
+			g->selftest.tries = 0;
+			selftest_start(g, SELFTEST_H264);
+		}
+		return;
+	}
+
+	uvcd_pipeline_t *p = g->pipe;
+	pthread_mutex_lock(&p->frame.lock);
+	if (p->frame.seq != g->selftest.seen_seq) {
+		g->selftest.seen_seq = p->frame.seq;
+		if (selftest_frame_valid(g->selftest.step, p->frame.data, p->frame.len)) {
+			g->selftest.frames++;
+			g->selftest.key |= p->frame.is_key;
+		}
+	}
+	pthread_mutex_unlock(&p->frame.lock);
+
+	if (g->selftest.frames >= SELFTEST_FRAMES &&
+	    (g->selftest.step != SELFTEST_H264 || g->selftest.key)) {
+		uvcd_pipeline_stop(p);
+		if (g->selftest.step == SELFTEST_H264) {
+			selftest_start(g, SELFTEST_MJPEG);
+		} else {
+			g->selftest.step = SELFTEST_OFF;
+			uvcd_update_trial_health(g->update, true, "H.264 and MJPEG frames encoded");
+		}
+		return;
+	}
+	if (now - g->selftest.since_ms < SELFTEST_STEP_MS)
+		return;
+	uvcd_pipeline_stop(p);
+	if (++g->selftest.tries < SELFTEST_TRIES) {
+		selftest_start(g, g->selftest.step);
+		return;
+	}
+	g->selftest.step = SELFTEST_OFF;
+	uvcd_update_trial_health(g->update, false,
+				 g->selftest.frames ? "the encoder produced too few valid frames"
+						    : "no encoded frames from the camera");
+}
+
 extern volatile sig_atomic_t uvcd_running;
 
 int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
@@ -1501,6 +1652,9 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 
 	if (gadget_open(&g) < 0)
 		return -1;
+	g.update = uvcd_update_create(NULL);
+	if (!g.update)
+		LOGW("firmware updates unavailable: out of memory");
 	int ctl_fd = uvcd_ctl_listen();
 	if (ctl_fd < 0)
 		LOGW("control socket %s: %s", UVCD_CTL_PATH, strerror(errno));
@@ -1510,7 +1664,7 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 			{.fd = g.fd, .events = POLLPRI},
 			{.fd = ctl_fd, .events = POLLIN},
 		};
-		int timeout = g.streaming ? 5 : 500;
+		int timeout = g.streaming ? 5 : g.selftest.step != SELFTEST_OFF ? 50 : 500;
 		int n = poll(pfd, 2, timeout);
 
 		if (n < 0) {
@@ -1551,11 +1705,17 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 		stream_guard_tick(&g);
 		config_flush(&g, false);
 		uvcd_pipeline_tick(p);
+		selftest_tick(&g);
+		if (g.update)
+			uvcd_update_tick(g.update);
 	}
 
 	unlink("/var/run/uvcd.ready");
 	uvcd_ctl_close(ctl_fd);
 	stop_streaming(&g);
+	if (g.selftest.step != SELFTEST_OFF)
+		uvcd_pipeline_stop(p);
+	uvcd_update_destroy(g.update);
 	config_flush(&g, true);
 	if (g.fd >= 0)
 		close(g.fd);

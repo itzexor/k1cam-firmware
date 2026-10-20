@@ -40,10 +40,12 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#define UVCD_XU_UNIT_ID 4
+#include "uvcdctl.h"
+
 #define UVCD_XU_RESET_SELECTOR 10
 #define UVCD_XU_KEYFRAME_SELECTOR 20
 #define UVCD_SOCKET_PATH "/var/run/uvcd.sock"
@@ -196,6 +198,29 @@ static const struct command_def commands[] = {
 	 "Request an IDR keyframe from the running H.264 encoder.\n"
 	 "This has no effect unless an H.264 stream is active.\n\n"
 	 "Example:\n  uvcdctl keyframe\n"},
+	{"firmware", "<subcommand> [args]", 1, 5, "firmware info, flash dump and A/B update",
+	 "  info                 what the camera runs: build, flash layout, slots\n"
+	 "  status               the firmware protocol's current state (read only)\n"
+	 "  dump [--live] FILE   save the whole 8 MiB flash to FILE\n"
+	 "  upgrade [--no-reboot] [--wait-timeout SECONDS] FILE\n"
+	 "                       install a k1cam.upd bundle into the inactive slot,\n"
+	 "                       boot it as a trial and wait until it is confirmed\n"
+	 "  reboot               start a trial that was installed with --no-reboot\n"
+	 "  cancel               stop the current dump or update, or withdraw a\n"
+	 "                       trial that is scheduled but not confirmed\n\n"
+	 "dump copies the flash into the camera's RAM first and refuses if there is\n"
+	 "not enough; --live reads it in place instead, a diagnostic dump that may\n"
+	 "be inconsistent. The file appears only once complete and verified; until\n"
+	 "then data goes to FILE.part, which is left behind if the dump fails.\n\n"
+	 "upgrade never writes the running or confirmed slot, the bootloader or\n"
+	 "the settings partition. The new slot is confirmed by the camera itself\n"
+	 "after it booted and encoded video; a trial that fails three boots falls\n"
+	 "back to the previous slot. Exit status: 0 confirmed (or staged with\n"
+	 "--no-reboot), 1 failed before a trial was scheduled (the camera still\n"
+	 "boots what it ran), 3 rolled back, 4 not confirmed (still pending, or\n"
+	 "the camera did not come back).\n\n"
+	 "Examples:\n  uvcdctl firmware info\n  uvcdctl firmware dump k1-backup.bin\n"
+	 "  uvcdctl firmware upgrade output/k1cam/images/k1cam.upd\n"},
 	{"help", "[command]", 0, 1, "show general or command-specific help",
 	 "Omit <command> for the command list, or name a command to see its\n"
 	 "syntax, description and examples. Help works without a camera.\n\n"
@@ -235,7 +260,7 @@ static void command_usage(FILE *out, const char *prog, const struct command_def 
 		*cmd->args ? " " : "", cmd->args, cmd->description);
 }
 
-static int xioctl(int fd, unsigned long request, void *arg)
+int xioctl(int fd, unsigned long request, void *arg)
 {
 	int r;
 	do {
@@ -261,24 +286,29 @@ static const struct ctrl_def *find_ctrl(const char *key)
 /* --------------------------------------------------------------------------
  * UVC Extension Unit access
  */
-static int xu_query(int fd, uint8_t selector, uint8_t query, int16_t *value)
+int xu_query_bytes(int fd, uint8_t selector, uint8_t query, void *data, uint16_t size)
 {
 	struct uvc_xu_control_query q;
+
+	memset(&q, 0, sizeof(q));
+	q.unit = UVCD_XU_UNIT_ID;
+	q.selector = selector;
+	q.query = query;
+	q.size = size;
+	q.data = data;
+
+	return xioctl(fd, UVCIOC_CTRL_QUERY, &q);
+}
+
+static int xu_query(int fd, uint8_t selector, uint8_t query, int16_t *value)
+{
 	uint8_t data[UVCD_XU_VALUE_SIZE] = {0};
 
 	if (query == UVC_SET_CUR) {
 		data[0] = (uint8_t)(*value & 0xff);
 		data[1] = (uint8_t)((*value >> 8) & 0xff);
 	}
-
-	memset(&q, 0, sizeof(q));
-	q.unit = UVCD_XU_UNIT_ID;
-	q.selector = selector;
-	q.query = query;
-	q.size = sizeof(data);
-	q.data = data;
-
-	if (xioctl(fd, UVCIOC_CTRL_QUERY, &q) < 0)
+	if (xu_query_bytes(fd, selector, query, data, sizeof(data)) < 0)
 		return -1;
 
 	if (query != UVC_SET_CUR)
@@ -293,7 +323,7 @@ static int xu_query(int fd, uint8_t selector, uint8_t query, int16_t *value)
  * is the uvcvideo node that answers an XU query on unit 4. That is exactly
  * the property uvcdctl depends on, so anything it finds, it can drive.
  */
-static bool is_our_camera(int fd)
+bool is_our_camera(int fd)
 {
 	struct v4l2_capability cap;
 	int16_t probe;
@@ -305,7 +335,7 @@ static bool is_our_camera(int fd)
 	return xu_query(fd, UVCD_XU_PROBE_SELECTOR, UVC_GET_LEN, &probe) == 0;
 }
 
-static int open_device(const char *explicit_path, char *chosen, size_t chosen_len)
+int open_device(const char *explicit_path, char *chosen, size_t chosen_len)
 {
 	if (explicit_path) {
 		int fd = open(explicit_path, O_RDWR);
@@ -686,6 +716,9 @@ int main(int argc, char **argv)
 		}
 	} else if (listing) {
 		key = argi < argc ? argv[argi] : NULL;
+	} else if (!strcmp(cmd, "firmware")) {
+		/* Its own device handling: an update reconnects after a reboot. */
+		return cmd_firmware(argc - argi, argv + argi, device);
 	}
 
 	const struct ctrl_def *def = NULL;
