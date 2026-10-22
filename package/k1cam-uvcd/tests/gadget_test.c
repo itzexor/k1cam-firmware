@@ -153,13 +153,20 @@ void uvcd_pipeline_camera_guard_arm(uvcd_pipeline_t *p)
 	camera_guard_arms++;
 }
 
+static struct uvc_request_data last_response;
+
 int test_ioctl(int fd, unsigned long request, ...)
 {
 	(void)fd;
 	va_list ap;
 	va_start(ap, request);
-	struct v4l2_buffer *buf = va_arg(ap, struct v4l2_buffer *);
+	void *arg = va_arg(ap, void *);
+	struct v4l2_buffer *buf = arg;
 	va_end(ap);
+	if (request == UVCIOC_SEND_RESPONSE) {
+		last_response = *(struct uvc_request_data *)arg;
+		return 0;
+	}
 	if (request == VIDIOC_DQBUF) {
 		if (!host_reading) {
 			errno = EAGAIN;
@@ -440,6 +447,81 @@ static void test_rejected_view(void)
 	apply_resets_sequence = false;
 }
 
+/* One control request through the SETUP path; the reply's length, -1 for
+ * a stall. */
+static int setup(gadget_t *g, uint8_t dir, uint8_t request, uint8_t cs, uint8_t unit,
+		 uint8_t intf, uint16_t length)
+{
+	struct usb_ctrlrequest req = {.bRequestType = dir | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+				      .bRequest = request, .wValue = cs << 8,
+				      .wIndex = unit << 8 | intf, .wLength = length};
+	last_response.length = -2;
+	handle_setup_event(g, &req);
+	return last_response.length;
+}
+
+static int error_code(gadget_t *g)
+{
+	assert(setup(g, USB_DIR_IN, UVC_GET_CUR, UVC_VC_REQUEST_ERROR_CODE_CONTROL, 0,
+		     UVC_INTF_CONTROL, 1) == 1);
+	return last_response.data[0];
+}
+
+/* A stall leaves its reason in the request error code control, which
+ * uvcvideo reads after each one; any request that succeeds clears it,
+ * reading the code included. */
+static void test_request_error_code(void)
+{
+	uvcd_pipeline_t p = {0};
+	gadget_t g = {.pipe = &p};
+	uvcd_config_defaults(&p.controls);
+
+	assert(error_code(&g) == UVCD_REQUEST_ERROR_NONE);
+	assert(setup(&g, USB_DIR_IN, UVC_GET_INFO, UVC_VC_REQUEST_ERROR_CODE_CONTROL, 0,
+		     UVC_INTF_CONTROL, 1) == 1 && last_response.data[0] == UVC_CONTROL_CAP_GET);
+
+	static const struct {
+		uint8_t dir, request, cs, unit, intf, code;
+	} stalls[] = {
+		/* a retired unit 4 selector, a removed PU control */
+		{USB_DIR_IN, UVC_GET_CUR, 8, UVCD_CUSTOM_UNIT_ID, UVC_INTF_CONTROL,
+		 UVCD_REQUEST_ERROR_INVALID_CONTROL},
+		{USB_DIR_IN, UVC_GET_CUR, UVC_PU_BACKLIGHT_COMPENSATION_CONTROL,
+		 UVCD_PROCESSING_UNIT_ID, UVC_INTF_CONTROL, UVCD_REQUEST_ERROR_INVALID_CONTROL},
+		/* a real control, asked something it doesn't answer */
+		{USB_DIR_OUT, UVC_GET_CUR, UVC_PU_BRIGHTNESS_CONTROL, UVCD_PROCESSING_UNIT_ID,
+		 UVC_INTF_CONTROL, UVCD_REQUEST_ERROR_INVALID_REQUEST},
+		{USB_DIR_IN, UVC_RC_UNDEFINED, UVC_CT_ZOOM_ABSOLUTE_CONTROL, UVCD_CAMERA_TERMINAL_ID,
+		 UVC_INTF_CONTROL, UVCD_REQUEST_ERROR_INVALID_REQUEST},
+		/* the firmware exchange with no update service behind it */
+		{USB_DIR_IN, UVC_GET_LEN, UVCD_FW_STATUS_SELECTOR, UVCD_CUSTOM_UNIT_ID,
+		 UVC_INTF_CONTROL, UVCD_REQUEST_ERROR_INVALID_CONTROL},
+		/* the output terminal, and the error code control itself */
+		{USB_DIR_IN, UVC_GET_CUR, 1, 3, UVC_INTF_CONTROL, UVCD_REQUEST_ERROR_INVALID_UNIT},
+		{USB_DIR_IN, UVC_GET_CUR, 1, 0, UVC_INTF_CONTROL, UVCD_REQUEST_ERROR_INVALID_CONTROL},
+		{USB_DIR_OUT, UVC_SET_CUR, UVC_VC_REQUEST_ERROR_CODE_CONTROL, 0, UVC_INTF_CONTROL,
+		 UVCD_REQUEST_ERROR_INVALID_REQUEST},
+		{USB_DIR_IN, UVC_GET_MIN, UVC_VC_REQUEST_ERROR_CODE_CONTROL, 0, UVC_INTF_CONTROL,
+		 UVCD_REQUEST_ERROR_INVALID_REQUEST},
+		/* streaming: probe asked GET_INFO, an unknown selector */
+		{USB_DIR_IN, UVC_GET_INFO, UVC_VS_PROBE_CONTROL, 0, UVC_INTF_STREAMING,
+		 UVCD_REQUEST_ERROR_INVALID_REQUEST},
+		{USB_DIR_IN, UVC_GET_CUR, 9, 0, UVC_INTF_STREAMING, UVCD_REQUEST_ERROR_INVALID_CONTROL},
+	};
+	for (size_t i = 0; i < sizeof(stalls) / sizeof(stalls[0]); i++) {
+		assert(setup(&g, stalls[i].dir, stalls[i].request, stalls[i].cs, stalls[i].unit,
+			     stalls[i].intf, 2) == -1);
+		assert(error_code(&g) == stalls[i].code);
+		assert(error_code(&g) == UVCD_REQUEST_ERROR_NONE);
+	}
+
+	/* Any other request that succeeds clears it as well. */
+	assert(setup(&g, USB_DIR_IN, UVC_GET_CUR, 8, UVCD_CUSTOM_UNIT_ID, UVC_INTF_CONTROL, 2) == -1);
+	assert(setup(&g, USB_DIR_IN, UVC_GET_CUR, UVC_PU_BRIGHTNESS_CONTROL,
+		     UVCD_PROCESSING_UNIT_ID, UVC_INTF_CONTROL, 2) == 2);
+	assert(error_code(&g) == UVCD_REQUEST_ERROR_NONE);
+}
+
 static void test_gain_headroom(void)
 {
 	uvcd_pipeline_t p = {0};
@@ -677,6 +759,7 @@ int main(void)
 	assert(custom_ctrl_def(15) == NULL && custom_control_value(&g, 15) == NULL);
 	assert(uvcd_ctrl_find("h264-gop-frames") == NULL);
 	test_rejected_view();
+	test_request_error_code();
 	test_gain_headroom();
 	test_encoder_failures();
 	test_firmware_routing();

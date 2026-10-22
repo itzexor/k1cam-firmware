@@ -65,6 +65,15 @@ struct uvc_event {
 #define UVCD_CAMERA_TERMINAL_ID 1
 #define UVCD_PROCESSING_UNIT_ID 2
 #define UVCD_CUSTOM_UNIT_ID 4
+/* Request Error Code Control (UVC 1.5 4.2.1.2), on the control interface
+ * itself: why the last request stalled, 0 once any request succeeds.
+ * uvcvideo reads it after every stall to pick an errno; when that read
+ * stalled too, the host logged "Failed to query ... UVC error code control"
+ * for each refused request. Linux maps 5-7 to EIO. */
+#define UVCD_REQUEST_ERROR_NONE 0x00
+#define UVCD_REQUEST_ERROR_INVALID_UNIT 0x05
+#define UVCD_REQUEST_ERROR_INVALID_CONTROL 0x06
+#define UVCD_REQUEST_ERROR_INVALID_REQUEST 0x07
 #define UVCD_CUSTOM_MAX_AGAIN 1
 #define UVCD_CUSTOM_MAX_DGAIN 2
 #define UVCD_CUSTOM_AE_COMP 3
@@ -171,6 +180,7 @@ struct gadget_s {
 	uint8_t last_intf;
 	uint8_t last_unit; /* entity ID, for control-interface requests */
 	uint8_t last_request;
+	uint8_t request_error; /* UVCD_REQUEST_ERROR_*, for the last request */
 
 	/* Firmware info, dumps and updates (selectors 26-28); NULL if it
 	 * could not be set up, and those selectors then stall. */
@@ -1026,6 +1036,56 @@ static void handle_camera_data(gadget_t *g, const struct uvc_request_data *data)
 	}
 }
 
+/* The control interface's own control: only the request error code. */
+static void handle_interface_setup(gadget_t *g, const struct usb_ctrlrequest *req,
+				   struct uvc_request_data *resp)
+{
+	uint8_t selector = req->wValue >> 8;
+	uint16_t len = req->wLength < 1 ? req->wLength : 1;
+
+	resp->length = -1;
+	if (selector != UVC_VC_REQUEST_ERROR_CODE_CONTROL || !(req->bRequestType & USB_DIR_IN))
+		return;
+	if (req->bRequest == UVC_GET_CUR)
+		resp->data[0] = g->request_error;
+	else if (req->bRequest == UVC_GET_INFO)
+		resp->data[0] = UVC_CONTROL_CAP_GET;
+	else
+		return;
+	resp->length = len;
+}
+
+/* Why a request stalled: its unit, its control, or the request itself.
+ * The handlers above stall only for those, using the same lookups. */
+static uint8_t stall_reason(gadget_t *g, const struct usb_ctrlrequest *req)
+{
+	uint8_t cs = req->wValue >> 8;
+	bool known;
+
+	if ((req->wIndex & 0xff) != UVC_INTF_CONTROL)
+		known = cs == UVC_VS_PROBE_CONTROL || cs == UVC_VS_COMMIT_CONTROL;
+	else
+		switch (req->wIndex >> 8) {
+		case 0:
+			known = cs == UVC_VC_REQUEST_ERROR_CODE_CONTROL;
+			break;
+		case UVCD_CUSTOM_UNIT_ID:
+			known = firmware_selector(cs) ? g->update != NULL :
+				cs == UVCD_CUSTOM_RESET || cs == UVCD_CUSTOM_H264_KEYFRAME ||
+					custom_control_value(g, cs);
+			break;
+		case UVCD_PROCESSING_UNIT_ID:
+			known = standard_ctrl_def(cs) && control_value(g, cs);
+			break;
+		case UVCD_CAMERA_TERMINAL_ID:
+			known = camera_control_length(cs) && ctrl_def_part(UVCD_CTRL_CAMERA, cs, 0);
+			break;
+		default:
+			return UVCD_REQUEST_ERROR_INVALID_UNIT;
+		}
+	return known ? UVCD_REQUEST_ERROR_INVALID_REQUEST : UVCD_REQUEST_ERROR_INVALID_CONTROL;
+}
+
 static void handle_firmware_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 				  struct uvc_request_data *resp)
 {
@@ -1073,9 +1133,11 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 		case UVCD_CAMERA_TERMINAL_ID:
 			handle_camera_setup(g, req, &resp);
 			break;
+		case 0:
+			handle_interface_setup(g, req, &resp);
+			break;
 		default:
-			/* Interface-level requests (e.g. the error code
-			 * control) and the output terminal: nothing here. */
+			/* The output terminal: nothing here. */
 			resp.length = -1;
 			break;
 		}
@@ -1132,6 +1194,8 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 	}
 
 send:
+	/* After the reply is built: reading the error code clears it too. */
+	g->request_error = resp.length < 0 ? stall_reason(g, req) : UVCD_REQUEST_ERROR_NONE;
 	LOGD("UVC RESPONSE length=%d", resp.length);
 	if (ioctl(g->fd, UVCIOC_SEND_RESPONSE, &resp) < 0) {
 		LOGW("UVCIOC_SEND_RESPONSE: %s", strerror(errno));
