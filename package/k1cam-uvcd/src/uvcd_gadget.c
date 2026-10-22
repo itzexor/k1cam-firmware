@@ -424,6 +424,10 @@ static const struct uvcd_ctrl_def uvcd_ctrl_defs[] = {
 		      0, 255, 64, temper),
 	UVCD_CTRL_ROW("defective-pixel-correction", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DPC,
 		      0, 255, 128, dpc),
+	/* No effect with the shipped sensor tuning (hyb_D), which bypasses
+	 * ADR: frames at 0 and 255 measure the same. With ADR on, above 128 it
+	 * lifts shadows and the black floor with them. Kept for other
+	 * tunings. */
 	UVCD_CTRL_ROW("dynamic-range-compression", UVCD_CTRL_CUSTOM, UVCD_CUSTOM_DRC,
 		      0, 255, 128, drc),
 	/* Not a 128-centred ratio like the knobs above: the SDK takes 0-10,

@@ -127,7 +127,7 @@ static const struct ctrl_def ctrl_defs[] = {
 	{25, "defective-pixel-correction", CTRL_CUSTOM, 0, 6,
 	 "0-255: strength, 128: as tuned"},
 	{26, "dynamic-range-compression", CTRL_CUSTOM, 0, 7,
-	 "0-255: strength, 128: as tuned"},
+	 "0-255: strength, 128: as tuned; no effect with the shipped sensor tuning"},
 	{28, "highlight-suppression", CTRL_CUSTOM, 0, 9,
 	 "0: off, 1-10: strength"},
 	/* 27 was defog-strength, which had no effect; 29 and 30 were
