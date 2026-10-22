@@ -447,19 +447,20 @@ static void test_gain_headroom(void)
 	uvcd_config_defaults(&p.controls);
 	const struct uvcd_ctrl_def *again = uvcd_ctrl_find("max-analog-gain");
 	const struct uvcd_ctrl_def *dgain = uvcd_ctrl_find("max-digital-gain");
-	assert(custom_control_max(UVCD_CUSTOM_MAX_AGAIN) == 224);
+	assert(custom_control_max(UVCD_CUSTOM_MAX_AGAIN) == 223);
 	assert(custom_control_def(UVCD_CUSTOM_MAX_AGAIN) == 160);
 	assert(custom_control_max(UVCD_CUSTOM_MAX_DGAIN) == 160);
 	assert(p.controls.max_again == 160 && p.controls.max_dgain == 80);
 	int applied;
-	assert(uvcd_ctrl_set(&g, again, 224, &applied) == 0 && applied == 224);
-	assert(p.controls.max_again == 224);
+	assert(uvcd_ctrl_set(&g, again, 223, &applied) == 0 && applied == 223);
+	assert(p.controls.max_again == 223);
 	g.config_dirty = false;
 	apply_error = -EIO;
 	assert(uvcd_ctrl_set(&g, again, 192, &applied) == -1);
-	assert(p.controls.max_again == 224 && !g.config_dirty);
+	assert(p.controls.max_again == 223 && !g.config_dirty);
 	apply_error = 0;
-	assert(uvcd_ctrl_set(&g, again, 255, &applied) == 0 && applied == 224);
+	/* 224, the old maximum, which libimp ignored, clamps to the real one. */
+	assert(uvcd_ctrl_set(&g, again, 224, &applied) == 0 && applied == 223);
 	assert(uvcd_ctrl_set(&g, dgain, 224, &applied) == 0 && applied == 160);
 }
 

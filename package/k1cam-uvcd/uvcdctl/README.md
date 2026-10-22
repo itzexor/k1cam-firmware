@@ -108,9 +108,10 @@ other than the slot variables, or the settings partition. The bundle's
 digests detect damage; they do not prove who made it.
 
 Gain ceilings use the T31 SDK's logarithmic units: 0 is 1x, and every
-32 units doubles gain. `max-analog-gain` accepts 0-224, with the unchanged
-default of 160 (32x). A ceiling of 224 (128x) allows the GC2083 to reach
-its last analog step, about 125.4x. `max-digital-gain` still accepts 0-160,
+32 units doubles gain. `max-analog-gain` accepts 0-223, with a default of
+160 (32x). The GC2083 rounds gain down to its own steps: any ceiling from
+216 to 223 gives its 106.7x step, the most it can reach this way (its last
+step, 125.4x, needs a ceiling the SDK refuses). `max-digital-gain` accepts 0-160,
 with a default of 80 (about 5.66x).
 
 ## Persistence

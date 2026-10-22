@@ -117,7 +117,7 @@ static const struct ctrl_def ctrl_defs[] = {
 	{20, "exposure-compensation", CTRL_CUSTOM, 0, 3,
 	 "0-255, 128: none, higher is brighter"},
 	{21, "max-analog-gain", CTRL_CUSTOM, 0, 1,
-	 "0-224: analog gain ceiling, 32 per doubling; 160: 32x (default), 224: sensor maximum"},
+	 "0-223: analog gain ceiling, 32 per doubling; 160: 32x (default), 216-223: ~107x, the most"},
 	{22, "max-digital-gain", CTRL_CUSTOM, 0, 2,
 	 "0-160: digital gain ceiling, 32 per doubling; 80: ~5.66x (default)"},
 	{23, "spatial-denoise", CTRL_CUSTOM, 0, 4,

@@ -105,9 +105,13 @@ struct uvc_event {
 /* 23-25 were save, apply-on-boot and saved-query, from a short-lived
  * explicit save model. Retired, not reused: controls persist on their own. */
 #define UVCD_CUSTOM_GAIN_MIN 0
-/* T31 SDK units: 32 per doubling (160 = 32x). The GC2083's last
- * analog step is 125.4375x: allow a 128x ceiling to reach it. */
-#define UVCD_CUSTOM_AGAIN_MAX 224
+/* T31 SDK units: 32 per doubling (160 = 32x). libimp silently ignores a
+ * ceiling above the sensor's max_again (GC2083: 125.4375x, 223.07 units),
+ * so 224 kept the previous ceiling while reading back as set. The sensor
+ * rounds a gain down to its step table, whose top steps are 106.7x (215.6)
+ * and 125.4x: any ceiling from 216 to 223 stops at 106.7x, and 125.4x is
+ * out of reach. Measured on the K1 at a 100 us exposure. */
+#define UVCD_CUSTOM_AGAIN_MAX 223
 #define UVCD_CUSTOM_DGAIN_MAX 160
 
 #define UVCD_CONTROL_MIN 0
