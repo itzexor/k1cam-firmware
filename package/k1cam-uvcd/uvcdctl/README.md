@@ -52,7 +52,10 @@ Control names and numeric IDs are accepted by `get`, `set`, `list`, and `describ
 returned value and exits with status 1 if it differs or cannot be read.
 Standard V4L2 controls can be cached by the host driver; this is not an
 independent ISP readback. Settings for an inactive mode or format are staged
-for when it is used.
+for when it is used, with two exceptions: under their auto controls,
+`white-balance-temperature` and `exposure-time` read the value auto is using,
+and a Linux host refuses writes to them (`Permission denied`). Turning auto
+off starts manual from that value; set them after that.
 
 ## Firmware
 

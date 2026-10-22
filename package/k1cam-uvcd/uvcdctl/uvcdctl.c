@@ -457,7 +457,14 @@ static int ctrl_set(int fd, const struct ctrl_def *def, int value, int *expected
 
 	struct v4l2_control c = {.id = def->cid, .value = value};
 	if (xioctl(fd, VIDIOC_S_CTRL, &c) < 0) {
-		fprintf(stderr, "uvcdctl: %s: VIDIOC_S_CTRL: %s\n", def->name, strerror(errno));
+		/* uvcvideo refuses these two while their auto control is on. */
+		const char *hint =
+			errno != EACCES ? "" :
+			def->cid == V4L2_CID_WHITE_BALANCE_TEMPERATURE ?
+					  " (set white-balance-auto 0 first)" :
+			def->cid == V4L2_CID_EXPOSURE_ABSOLUTE ? " (set auto-exposure 1 first)" : "";
+		fprintf(stderr, "uvcdctl: %s: VIDIOC_S_CTRL: %s%s\n", def->name, strerror(errno),
+			hint);
 		return -1;
 	}
 	*expected = c.value; /* V4L2 may align the request to the control's step. */

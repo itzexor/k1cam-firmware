@@ -117,6 +117,8 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
 }
 
 int uvcd_camera_live_exposure(uvcd_camera_t *cam) { (void)cam; return -1; }
+static int awb_ct = -1;
+int uvcd_camera_awb_ct(uvcd_camera_t *cam) { (void)cam; return awb_ct; }
 int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p)
 {
 	bitrate_calls++;
@@ -522,6 +524,52 @@ static void test_request_error_code(void)
 	assert(error_code(&g) == UVCD_REQUEST_ERROR_NONE);
 }
 
+/* Under auto white balance the temperature reads what auto measured, and
+ * GET_INFO flags it auto-update so uvcvideo asks again instead of caching
+ * the first answer. */
+static void test_live_wb_temperature(void)
+{
+	uvcd_pipeline_t p = {0};
+	gadget_t g = {.pipe = &p};
+	uvcd_config_defaults(&p.controls);
+	p.controls.wb_temp = 5000;
+	assert(p.controls.wb_auto);
+
+	static const struct {
+		bool wb_auto;
+		int ct, reads;
+	} cases[] = {
+		{true, 4200, 4200},
+		{true, 9000, UVCD_WB_TEMP_MAX},
+		{true, 1000, UVCD_WB_TEMP_MIN},
+		{true, -1, 5000}, /* no estimate: the stored value */
+		{false, 4200, 5000},
+	};
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		p.controls.wb_auto = cases[i].wb_auto;
+		awb_ct = cases[i].ct;
+		assert(setup(&g, USB_DIR_IN, UVC_GET_CUR, UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL,
+			     UVCD_PROCESSING_UNIT_ID, UVC_INTF_CONTROL, 2) == 2);
+		assert((last_response.data[0] | last_response.data[1] << 8) == cases[i].reads);
+	}
+	/* The rest of the control, and the stored value, stay as they were. */
+	p.controls.wb_auto = 1;
+	awb_ct = 4200;
+	assert(setup(&g, USB_DIR_IN, UVC_GET_DEF, UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL,
+		     UVCD_PROCESSING_UNIT_ID, UVC_INTF_CONTROL, 2) == 2);
+	assert((last_response.data[0] | last_response.data[1] << 8) == UVCD_WB_TEMP_DEF);
+	assert(p.controls.wb_temp == 5000);
+	awb_ct = -1;
+
+	for (uint8_t cs = 1; cs <= UVC_PU_WHITE_BALANCE_COMPONENT_AUTO_CONTROL; cs++) {
+		if (setup(&g, USB_DIR_IN, UVC_GET_INFO, cs, UVCD_PROCESSING_UNIT_ID,
+			  UVC_INTF_CONTROL, 1) < 0)
+			continue;
+		bool autoupdate = last_response.data[0] & UVC_CONTROL_CAP_AUTOUPDATE;
+		assert(autoupdate == (cs == UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL));
+	}
+}
+
 static void test_gain_headroom(void)
 {
 	uvcd_pipeline_t p = {0};
@@ -760,6 +808,7 @@ int main(void)
 	assert(uvcd_ctrl_find("h264-gop-frames") == NULL);
 	test_rejected_view();
 	test_request_error_code();
+	test_live_wb_temperature();
 	test_gain_headroom();
 	test_encoder_failures();
 	test_firmware_routing();

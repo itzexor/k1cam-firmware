@@ -76,7 +76,7 @@ ssize_t test_read(int fd, void *buf, size_t size)
 	return (ssize_t)n;
 }
 
-static int current_qp = 30, get_error, range_error;
+static int current_qp = 30, get_error, range_error, s_ctrl_error;
 
 /* --------------------------------------------------------------------------
  * The camera's firmware side: uvcd_update on a NOR model, as the gadget
@@ -299,6 +299,10 @@ int test_ioctl(int fd, unsigned long request, ...)
 		q->step = 3600;
 		return 0;
 	}
+	if (request == VIDIOC_S_CTRL && s_ctrl_error) {
+		errno = s_ctrl_error;
+		return -1;
+	}
 	if (request == VIDIOC_S_CTRL || request == VIDIOC_G_CTRL) {
 		((struct v4l2_control *)arg)->value = 0;
 		return 0;
@@ -367,6 +371,30 @@ static int capture_list(const char *command, const char *key, char *out, size_t 
 	char *local_args[] = {"uvcdctl", (char *)command, (char *)key, NULL};
 	return local_socket ? capture_command(key ? 3 : 2, local_args, stdout, out, size) :
 		capture_command(key ? 5 : 4, args, stdout, out, size);
+}
+
+/* uvcvideo refuses the two auto-governed controls while auto is on; the
+ * error says which control to turn off first. */
+static void check_auto_refusal(void)
+{
+	char out[1024];
+	char *args[] = {"uvcdctl", "--device", "/fake", "set", "white-balance-temperature", "4000",
+			NULL};
+	s_ctrl_error = EACCES;
+	assert(capture_command(6, args, stderr, out, sizeof(out)) == 1);
+	assert(strstr(out, "Permission denied (set white-balance-auto 0 first)\n"));
+	args[4] = "exposure-time";
+	args[5] = "100";
+	assert(capture_command(6, args, stderr, out, sizeof(out)) == 1);
+	assert(strstr(out, "Permission denied (set auto-exposure 1 first)\n"));
+	args[4] = "brightness";
+	assert(capture_command(6, args, stderr, out, sizeof(out)) == 1);
+	assert(strstr(out, "VIDIOC_S_CTRL: Permission denied\n"));
+	s_ctrl_error = EIO;
+	args[4] = "white-balance-temperature";
+	assert(capture_command(6, args, stderr, out, sizeof(out)) == 1);
+	assert(strstr(out, "Input/output error\n"));
+	s_ctrl_error = 0;
 }
 
 static void check_help(void)
@@ -728,6 +756,7 @@ int main(void)
 	assert(uvcdctl_program_main(6, args) == 0); /* host step alignment to 0 */
 	check_listings();
 	check_help();
+	check_auto_refusal();
 	check_firmware();
 	puts("uvcdctl regression tests passed");
 	return 0;

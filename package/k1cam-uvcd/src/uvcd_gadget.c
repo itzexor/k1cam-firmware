@@ -811,6 +811,20 @@ static void handle_custom_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	}
 }
 
+/* GET_CUR of a Processing Unit control. Under auto white balance the
+ * temperature is the one auto has measured, the way exposure-time reads
+ * under auto-exposure; the stored one while the camera has no estimate.
+ * Leaving auto starts manual from that value. */
+static int current_value(gadget_t *g, uint8_t selector)
+{
+	int ct;
+
+	if (selector != UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL || !g->pipe->controls.wb_auto ||
+	    (ct = uvcd_camera_awb_ct(&g->pipe->cam)) <= 0)
+		return *control_value(g, selector);
+	return ct < UVCD_WB_TEMP_MIN ? UVCD_WB_TEMP_MIN : ct > UVCD_WB_TEMP_MAX ? UVCD_WB_TEMP_MAX : ct;
+}
+
 static void handle_control_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 				 struct uvc_request_data *resp)
 {
@@ -850,7 +864,7 @@ static void handle_control_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	case UVC_GET_MAX:
 	case UVC_GET_RES:
 	case UVC_GET_DEF:
-		value = (req->bRequest == UVC_GET_CUR) ? *control_value(g, selector) :
+		value = (req->bRequest == UVC_GET_CUR) ? current_value(g, selector) :
 			(req->bRequest == UVC_GET_MAX) ? max_value :
 			(req->bRequest == UVC_GET_DEF) ? def_value :
 			(req->bRequest == UVC_GET_RES) ? 1 : min_value;
@@ -866,6 +880,9 @@ static void handle_control_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 		break;
 	case UVC_GET_INFO:
 		info = UVC_CONTROL_CAP_GET | UVC_CONTROL_CAP_SET;
+		/* Without it, uvcvideo reads the value once and caches it. */
+		if (selector == UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL)
+			info |= UVC_CONTROL_CAP_AUTOUPDATE;
 		len = length < sizeof(info) ? length : sizeof(info);
 		memcpy(resp->data, &info, len);
 		resp->length = len;
