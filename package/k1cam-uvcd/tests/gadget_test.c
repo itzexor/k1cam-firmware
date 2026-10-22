@@ -449,6 +449,65 @@ static void test_rejected_view(void)
 	apply_resets_sequence = false;
 }
 
+static void camera_write(gadget_t *g, uint8_t selector, int a, int b)
+{
+	struct uvc_request_data d = {.length = camera_control_length(selector)};
+	unsigned parts = camera_control_parts(selector);
+	put_le(d.data, a, d.length / parts);
+	if (parts == 2)
+		put_le(d.data + d.length / 2, b, d.length / 2);
+	g->last_cs = selector;
+	g->last_request = UVC_SET_CUR;
+	g->last_intf = UVC_INTF_CONTROL;
+	g->last_unit = UVCD_CAMERA_TERMINAL_ID;
+	handle_data_event(g, &d);
+}
+
+/* While a stream runs, a burst of zoom/pan/tilt writes re-creates the
+ * stream at most once per interval, and the last value asked for lands. */
+static void test_view_throttle(void)
+{
+	uvcd_pipeline_t p = {0};
+	pthread_mutex_init(&p.frame.lock, NULL);
+	uvcd_config_defaults(&p.controls);
+	gadget_t g = {.pipe = &p, .streaming = true};
+	int before = applies;
+
+	camera_write(&g, UVC_CT_ZOOM_ABSOLUTE_CONTROL, 150, 0); /* at once */
+	assert(applies == before + 1 && p.controls.zoom == 150);
+	for (int z = 160; z <= 200; z += 10)
+		camera_write(&g, UVC_CT_ZOOM_ABSOLUTE_CONTROL, z, 0);
+	camera_write(&g, UVC_CT_PANTILT_ABSOLUTE_CONTROL, 3600, -7200);
+	view_tick(&g);
+	assert(applies == before + 1 && p.controls.zoom == 150 && p.controls.pan == 0);
+	/* Other controls are not held back. */
+	camera_write(&g, UVC_CT_AE_PRIORITY_CONTROL, 1, 0);
+	assert(applies == before + 2 && p.controls.ae_priority == 1);
+
+	g.view_applied_ms -= UVCD_VIEW_INTERVAL_MS;
+	view_tick(&g);
+	assert(applies == before + 5); /* zoom, pan, tilt */
+	assert(p.controls.zoom == 200 && p.controls.pan == 3600 && p.controls.tilt == -7200);
+	view_tick(&g);
+	assert(applies == before + 5);
+
+	/* Without a stream a view change costs nothing: no throttle. */
+	g.streaming = false;
+	camera_write(&g, UVC_CT_ZOOM_ABSOLUTE_CONTROL, 120, 0);
+	camera_write(&g, UVC_CT_ZOOM_ABSOLUTE_CONTROL, 130, 0);
+	assert(applies == before + 7 && p.controls.zoom == 130);
+
+	/* A factory reset drops a held-back view rather than undo it later. */
+	g.streaming = true;
+	camera_write(&g, UVC_CT_ZOOM_ABSOLUTE_CONTROL, 250, 0);
+	assert(g.view_pending_set[0]);
+	assert(uvcd_ctrl_reset(&g) == 0);
+	g.view_applied_ms -= UVCD_VIEW_INTERVAL_MS;
+	view_tick(&g);
+	assert(p.controls.zoom == UVCD_ZOOM_DEF);
+	pthread_mutex_destroy(&p.frame.lock);
+}
+
 /* One control request through the SETUP path; the reply's length, -1 for
  * a stall. */
 static int setup(gadget_t *g, uint8_t dir, uint8_t request, uint8_t cs, uint8_t unit,
@@ -858,6 +917,7 @@ int main(void)
 	test_request_error_code();
 	test_live_wb_temperature();
 	test_frame_size_fallback();
+	test_view_throttle();
 	test_gain_headroom();
 	test_encoder_failures();
 	test_firmware_routing();

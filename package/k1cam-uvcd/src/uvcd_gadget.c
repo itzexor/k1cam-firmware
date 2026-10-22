@@ -182,6 +182,12 @@ struct gadget_s {
 	uint8_t last_request;
 	uint8_t request_error; /* UVCD_REQUEST_ERROR_*, for the last request */
 
+	/* Zoom (0) and pan/tilt (1) writes held back by the view throttle
+	 * (handle_camera_data), and when a view change last finished. */
+	struct uvc_request_data view_pending[2];
+	bool view_pending_set[2];
+	int64_t view_applied_ms;
+
 	/* Firmware info, dumps and updates (selectors 26-28); NULL if it
 	 * could not be set up, and those selectors then stall. */
 	struct uvcd_update *update;
@@ -746,6 +752,8 @@ int uvcd_ctrl_keyframe(gadget_t *g)
 int uvcd_ctrl_reset(gadget_t *g)
 {
 	int ret = 0;
+	/* The reset's view wins over one still held back. */
+	g->view_pending_set[0] = g->view_pending_set[1] = false;
 	g->defer_encoder_restart = true;
 	g->restart_h264 = g->restart_mjpeg = false;
 	for (size_t i = 0; i < UVCD_CTRL_DEF_COUNT; i++) {
@@ -1064,9 +1072,8 @@ static void handle_camera_setup(gadget_t *g, const struct usb_ctrlrequest *req,
 	}
 }
 
-static void handle_camera_data(gadget_t *g, const struct uvc_request_data *data)
+static void apply_camera_data(gadget_t *g, uint8_t selector, const struct uvc_request_data *data)
 {
-	uint8_t selector = g->last_cs;
 	uint16_t size = camera_control_length(selector);
 	unsigned parts = camera_control_parts(selector);
 
@@ -1087,6 +1094,57 @@ static void handle_camera_data(gadget_t *g, const struct uvc_request_data *data)
 		}
 		LOGI("%s=%d", d->name, applied);
 	}
+}
+
+/* Zoom, pan and tilt re-create a running stream's channels (apply_view):
+ * a gap and a visible glitch each, and pan/tilt is two of them. A slider
+ * sends a burst of writes, so while a stream runs take at most one view
+ * change per UVCD_VIEW_INTERVAL_MS: the first at once, the last one asked
+ * for when the interval is up (view_tick). */
+#define UVCD_VIEW_INTERVAL_MS 150
+
+static int view_slot(uint8_t selector)
+{
+	return selector == UVC_CT_ZOOM_ABSOLUTE_CONTROL ? 0
+	       : selector == UVC_CT_PANTILT_ABSOLUTE_CONTROL ? 1
+							      : -1;
+}
+
+static void handle_camera_data(gadget_t *g, const struct uvc_request_data *data)
+{
+	uint8_t selector = g->last_cs;
+	int slot = view_slot(selector);
+
+	if (slot < 0) {
+		apply_camera_data(g, selector, data);
+		return;
+	}
+	if (g->streaming && (g->view_pending_set[0] || g->view_pending_set[1] ||
+			     uvcd_monotonic_ms() - g->view_applied_ms < UVCD_VIEW_INTERVAL_MS)) {
+		g->view_pending[slot] = *data;
+		g->view_pending_set[slot] = true;
+		return;
+	}
+	apply_camera_data(g, selector, data);
+	g->view_applied_ms = uvcd_monotonic_ms();
+}
+
+static void view_tick(gadget_t *g)
+{
+	static const uint8_t selectors[2] = {UVC_CT_ZOOM_ABSOLUTE_CONTROL,
+					     UVC_CT_PANTILT_ABSOLUTE_CONTROL};
+
+	if (!g->view_pending_set[0] && !g->view_pending_set[1])
+		return;
+	if (g->streaming && uvcd_monotonic_ms() - g->view_applied_ms < UVCD_VIEW_INTERVAL_MS)
+		return;
+	for (int i = 0; i < 2; i++) {
+		if (!g->view_pending_set[i])
+			continue;
+		g->view_pending_set[i] = false;
+		apply_camera_data(g, selectors[i], &g->view_pending[i]);
+	}
+	g->view_applied_ms = uvcd_monotonic_ms();
 }
 
 /* The control interface's own control: only the request error code. */
@@ -1825,6 +1883,7 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 			g.healthy_since_ms = 0;
 		}
 
+		view_tick(&g);
 		stream_guard_tick(&g);
 		config_flush(&g, false);
 		uvcd_pipeline_tick(p);
