@@ -570,6 +570,54 @@ static void test_live_wb_temperature(void)
 	}
 }
 
+/* MJPEG frames that keep outgrowing the cap cost this stream 10 quality
+ * at a time, down to 10, instead of a dead stream and the watchdog. */
+static void test_frame_size_fallback(void)
+{
+	uvcd_pipeline_t p = {0};
+	pthread_mutex_init(&p.frame.lock, NULL);
+	gadget_t g = {.pipe = &p, .streaming = true};
+	uvcd_config_defaults(&p.controls);
+	p.controls.mjpeg_quality = 100;
+	p.running = true;
+	p.cur_format = UVCD_FMT_MJPEG;
+	p.frame.cap = 2048 * 1024;
+	int before = restarts;
+
+	p.frame.too_large = UVCD_TOO_LARGE_RUN - 1;
+	frame_size_tick(&g);
+	assert(restarts == before && p.mjpeg_quality_cut == 0);
+	p.frame.too_large = UVCD_TOO_LARGE_RUN;
+	frame_size_tick(&g);
+	assert(restarts == before + 1 && p.mjpeg_quality_cut == 10);
+	/* The restart starts a fresh run; a frame that fits ends one too. */
+	p.frame.too_large = 0;
+	frame_size_tick(&g);
+	assert(restarts == before + 1);
+	/* Down to the floor, never past it. */
+	p.controls.mjpeg_quality = 25;
+	p.mjpeg_quality_cut = 10;
+	p.frame.too_large = UVCD_TOO_LARGE_RUN;
+	frame_size_tick(&g);
+	assert(restarts == before + 2 && p.mjpeg_quality_cut == 15);
+	frame_size_tick(&g);
+	assert(restarts == before + 2 && p.mjpeg_quality_cut == 15);
+	/* H.264 is bitrate-controlled: a drop only asks for an IDR. */
+	p.cur_format = UVCD_FMT_H264;
+	p.controls.mjpeg_quality = 100;
+	p.mjpeg_quality_cut = 0;
+	frame_size_tick(&g);
+	assert(restarts == before + 2 && p.mjpeg_quality_cut == 0);
+
+	/* A new quality starts from scratch. */
+	p.cur_format = UVCD_FMT_MJPEG;
+	p.mjpeg_quality_cut = 30;
+	int applied;
+	assert(uvcd_ctrl_set(&g, uvcd_ctrl_find("mjpeg-quality"), 90, &applied) == 0);
+	assert(applied == 90 && p.mjpeg_quality_cut == 0 && restarts == before + 3);
+	pthread_mutex_destroy(&p.frame.lock);
+}
+
 static void test_gain_headroom(void)
 {
 	uvcd_pipeline_t p = {0};
@@ -809,6 +857,7 @@ int main(void)
 	test_rejected_view();
 	test_request_error_code();
 	test_live_wb_temperature();
+	test_frame_size_fallback();
 	test_gain_headroom();
 	test_encoder_failures();
 	test_firmware_routing();

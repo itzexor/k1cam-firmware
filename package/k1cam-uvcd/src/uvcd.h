@@ -225,6 +225,8 @@ struct uvcd_frame_buf {
 	pthread_mutex_t lock;
 	uint8_t *data;
 	uint32_t size;     /* allocated capacity */
+	uint32_t cap;      /* the running stream's limit, its max_size (<= size) */
+	uint32_t too_large; /* frames in a row dropped for being over cap */
 	uint32_t len;      /* valid bytes */
 	uint64_t seq;      /* bumped on every publish; consumer tracks last seen */
 	int64_t ts_us;     /* capture time, CLOCK_MONOTONIC microseconds */
@@ -391,6 +393,10 @@ typedef struct {
 	uint8_t cur_frame;  /* UVCD_FRAME_* */
 	uint32_t cur_interval;
 	uint32_t enc_fps; /* the rate the encoder was last told */
+	/* Taken off mjpeg_quality for this stream only, after its frames
+	 * outgrew the USB cap (uvcd_gadget.c); 0 again at the next stream or
+	 * quality change. */
+	int mjpeg_quality_cut;
 
 	/* The SDK's frame timestamps were rebased onto CLOCK_MONOTONIC at
 	 * start; if not, frames are stamped when the pump receives them. */

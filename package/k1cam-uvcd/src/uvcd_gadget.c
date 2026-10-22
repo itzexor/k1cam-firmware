@@ -637,12 +637,48 @@ static int encoder_after_store(gadget_t *g, uint8_t selector)
 		ret = encoder_restart(g, UVCD_FMT_H264);
 		break;
 	case UVCD_CUSTOM_MJPEG_QUALITY:
+		g->pipe->mjpeg_quality_cut = 0;
 		ret = encoder_restart(g, UVCD_FMT_MJPEG);
 		break;
 	default:
 		break;
 	}
 	return ret;
+}
+
+/* MJPEG frames the USB cap can't carry. JPEG size follows sensor noise, so
+ * a quality and sharpness that fit in daylight can outgrow the cap at night
+ * (1080p at quality 100, sharpness 180, 19x gain: 2.17 MB frames against
+ * 2 MB). Every frame is then dropped, the frame watchdog restarts the
+ * daemon, and the crash guard falls back to proven controls that may well
+ * be the same ones, then to factory settings. Lower this stream's quality
+ * instead, 10 at a time; the stored setting stays as it is. */
+#define UVCD_TOO_LARGE_RUN 3
+#define UVCD_MJPEG_QUALITY_STEP 10
+#define UVCD_MJPEG_QUALITY_FLOOR 10
+
+static void frame_size_tick(gadget_t *g)
+{
+	uvcd_pipeline_t *p = g->pipe;
+
+	if (!g->streaming || !p->running || p->cur_format != UVCD_FMT_MJPEG)
+		return;
+	pthread_mutex_lock(&p->frame.lock);
+	uint32_t run = p->frame.too_large, cap = p->frame.cap;
+	pthread_mutex_unlock(&p->frame.lock);
+	if (run < UVCD_TOO_LARGE_RUN)
+		return;
+	int from = p->controls.mjpeg_quality - p->mjpeg_quality_cut;
+	if (from <= UVCD_MJPEG_QUALITY_FLOOR)
+		return; /* nothing left to give: the frame watchdog takes over */
+	int to = from - UVCD_MJPEG_QUALITY_STEP;
+	if (to < UVCD_MJPEG_QUALITY_FLOOR)
+		to = UVCD_MJPEG_QUALITY_FLOOR;
+	p->mjpeg_quality_cut += from - to;
+	LOGW("MJPEG frames outgrow the %u-byte cap at quality %d; this stream continues at %d",
+	     cap, from, to);
+	if (encoder_restart(g, UVCD_FMT_MJPEG) != 0)
+		LOGW("encoder restart at quality %d failed", to);
 }
 
 int uvcd_ctrl_set(gadget_t *g, const struct uvcd_ctrl_def *def, int value, int *out_applied)
@@ -1430,6 +1466,7 @@ static void stop_streaming(gadget_t *g)
 
 	/* The stream's channels go now; the camera stays up, back at idle. */
 	uvcd_pipeline_stop(g->pipe);
+	g->pipe->mjpeg_quality_cut = 0;
 	/* Only once teardown is over: it can hang after an ISP failure. */
 	stream_guard_clear(g);
 	LOGI("streaming stopped");
@@ -1783,6 +1820,7 @@ int uvcd_gadget_run(uvcd_pipeline_t *p, const char *device)
 				_exit(1);
 			}
 			deliver_frame(&g);
+			frame_size_tick(&g);
 		} else {
 			g.healthy_since_ms = 0;
 		}

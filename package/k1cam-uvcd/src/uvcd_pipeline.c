@@ -176,7 +176,7 @@ int uvcd_pipeline_init(uvcd_pipeline_t *p)
 		LOGE("frame buffer alloc failed");
 		return -1;
 	}
-	p->frame.size = UVCD_FRAME_BUF_CAP;
+	p->frame.size = p->frame.cap = UVCD_FRAME_BUF_CAP;
 
 	if (load_controls(p) != 0 || uvcd_camera_init(&p->cam, &p->controls) != 0) {
 		free(p->frame.data);
@@ -215,6 +215,38 @@ static uint16_t primary_nal_type(const rss_frame_t *f)
 	return f->nal_count ? (uint16_t)f->nals[0].type : (uint16_t)RSS_NAL_UNKNOWN;
 }
 
+/* Copy an encoded frame into the shared slot, or drop it whole when it is
+ * over the stream's cap: the gadget's buffers and the host's
+ * dwMaxVideoFrameSize are that size, and a truncated frame is garbage.
+ * Returns true when it was dropped. */
+static bool publish_frame(uvcd_pipeline_t *p, const rss_frame_t *frame)
+{
+	uint32_t total = 0;
+	for (uint32_t n = 0; n < frame->nal_count; n++)
+		total += frame->nals[n].length;
+
+	pthread_mutex_lock(&p->frame.lock);
+	bool dropped = total > p->frame.cap;
+	if (!dropped) {
+		uint32_t off = 0;
+		for (uint32_t n = 0; n < frame->nal_count; n++) {
+			memcpy(p->frame.data + off, frame->nals[n].data, frame->nals[n].length);
+			off += frame->nals[n].length;
+		}
+		p->frame.len = off;
+		p->frame.ts_us = p->ts_rebased && frame->timestamp > 0 ? frame->timestamp
+								       : uvcd_monotonic_us();
+		p->frame.is_key = frame->is_key;
+		p->frame.seq++;
+		p->frame.too_large = 0;
+	} else if (p->frame.too_large++ == 0) {
+		/* Once per run: at 30 fps a run would flood the kernel log. */
+		LOGW("frame too large (%u > %u), dropped", total, p->frame.cap);
+	}
+	pthread_mutex_unlock(&p->frame.lock);
+	return dropped;
+}
+
 static void *pump_thread(void *arg)
 {
 	uvcd_pipeline_t *p = arg;
@@ -230,30 +262,7 @@ static void *pump_thread(void *arg)
 		if (ret != RSS_OK)
 			continue;
 
-		uint32_t total = 0;
-		for (uint32_t n = 0; n < frame.nal_count; n++)
-			total += frame.nals[n].length;
-
-		pthread_mutex_lock(&p->frame.lock);
-		if (total <= p->frame.size) {
-			uint32_t off = 0;
-			for (uint32_t n = 0; n < frame.nal_count; n++) {
-				memcpy(p->frame.data + off, frame.nals[n].data,
-				       frame.nals[n].length);
-				off += frame.nals[n].length;
-			}
-			p->frame.len = off;
-			p->frame.ts_us = p->ts_rebased && frame.timestamp > 0
-						 ? frame.timestamp
-						 : uvcd_monotonic_us();
-			p->frame.is_key = frame.is_key;
-			p->frame.seq++;
-		} else {
-			LOGW("frame too large (%u > %u), dropped", total, p->frame.size);
-		}
-		bool dropped = total > p->frame.size;
-		pthread_mutex_unlock(&p->frame.lock);
-		if (dropped)
+		if (publish_frame(p, &frame))
 			uvcd_enc_request_keyframe(p); /* see deliver_frame() */
 
 		(void)primary_nal_type(&frame);
@@ -287,6 +296,13 @@ static rss_rc_mode_t h264_rc_mode(const uvcd_pipeline_t *p)
 	default:
 		return RSS_RC_CBR;
 	}
+}
+
+/* The quality this stream's JPEG channel is created with. */
+static int mjpeg_quality(const uvcd_pipeline_t *p)
+{
+	int q = p->controls.mjpeg_quality - p->mjpeg_quality_cut;
+	return q < 1 ? 1 : q;
 }
 
 static bool running_h264(const uvcd_pipeline_t *p)
@@ -404,7 +420,7 @@ static int configure_channel(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 		.max_same_scene_cnt = 1, /* SDK default 2 doubles the IDR interval */
 		/* On T31 a JPEG channel's quality *is* its initial QP, and it can
 		 * only be set here -- enc_set_jpeg_qp is unsupported on this SDK. */
-		.init_qp = jpeg ? (int16_t)c->mjpeg_quality : -1,
+		.init_qp = jpeg ? (int16_t)mjpeg_quality(p) : -1,
 		.min_qp = jpeg ? -1 : min_qp,
 		.max_qp = jpeg ? -1 : max_qp,
 		.ip_delta = -1,
@@ -544,6 +560,8 @@ int uvcd_pipeline_start(uvcd_pipeline_t *p, uint8_t format, uint8_t frame,
 
 	p->frame.seq = 0;
 	p->frame.len = 0;
+	p->frame.cap = uvcd_frames[frame].max_size;
+	p->frame.too_large = 0;
 	p->pump_run = 1;
 	if (pthread_create(&p->pump_tid, NULL, pump_thread, p) != 0) {
 		LOGE("pump thread create failed");

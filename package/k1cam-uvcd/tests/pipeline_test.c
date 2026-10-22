@@ -1066,6 +1066,31 @@ static void test_idle_pacing(void)
 	it_limit_error = 0;
 }
 
+/* A frame over the stream's cap is dropped whole, and the slot counts the
+ * run of them for the gadget's quality fallback. */
+static void test_frame_cap(void)
+{
+	uvcd_pipeline_t p = {0};
+	static uint8_t slot[4096], big[3000];
+	pthread_mutex_init(&p.frame.lock, NULL);
+	p.frame.data = slot;
+	p.frame.size = sizeof(slot);
+	p.frame.cap = 2000;
+	rss_nal_unit_t nals[2] = {{.data = big, .length = 1000}, {.data = big, .length = 999}};
+	rss_frame_t f = {.nals = nals, .nal_count = 2, .is_key = true};
+
+	assert(!publish_frame(&p, &f) && p.frame.seq == 1 && p.frame.len == 1999);
+	nals[1].length = 1001; /* 2001: over the cap, though the slot holds it */
+	for (uint32_t i = 1; i <= 3; i++) {
+		assert(publish_frame(&p, &f));
+		assert(p.frame.too_large == i && p.frame.seq == 1 && p.frame.len == 1999);
+	}
+	nals[1].length = 1000;
+	assert(!publish_frame(&p, &f) && p.frame.too_large == 0 && p.frame.seq == 2);
+	assert(p.frame.len == 2000);
+	pthread_mutex_destroy(&p.frame.lock);
+}
+
 /* The stream's channel takes its crop from the camera's view, which a
  * lease sets for the output size. */
 static int configure(uvcd_pipeline_t *p, uint8_t format, uint8_t frame, uint32_t interval)
@@ -1147,10 +1172,18 @@ int main(void)
 	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_1280X960, 333333) == -EIO);
 	assert(fs.fcrop.x == 240 && fs.fcrop.y == 0);
 	assert(fs.fcrop.w == 1440 && fs.fcrop.h == 1080);
-	/* The requested JPEG quality goes to the encoder as is. */
+	/* The requested JPEG quality goes to the encoder as is, less any cut
+	 * this stream took for outgrowing the frame cap. */
 	p.controls.mjpeg_quality = 100;
 	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -EIO);
 	assert(enc.init_qp == 100);
+	p.mjpeg_quality_cut = 20;
+	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(enc.init_qp == 80);
+	p.controls.mjpeg_quality = 15;
+	assert(configure(&p, UVCD_FMT_MJPEG, UVCD_FRAME_720P, 333333) == -EIO);
+	assert(enc.init_qp == 1);
+	p.mjpeg_quality_cut = 0;
 	p.controls.mjpeg_quality = 80;
 	assert(configure(&p, UVCD_FMT_H264, UVCD_FRAME_1080P, 333333) == -EIO);
 	assert(enc.gop_length == 30 && enc.max_same_scene_cnt == 1);
@@ -1187,6 +1220,7 @@ int main(void)
 	test_metering_exit_failure();
 	test_camera_lease();
 	test_idle_pacing();
+	test_frame_cap();
 	test_control_failures();
 	puts("pipeline regression tests passed");
 	return 0;
