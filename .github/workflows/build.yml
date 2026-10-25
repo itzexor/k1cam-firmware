@@ -1,0 +1,79 @@
+name: build
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  firmware:
+    # 24.04 still has GNU coreutils: 26.04 ships uutils, whose install(1)
+    # thingino's CI had to swap back out.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      # Buildroot's host requirements, and what U-Boot's tools, pylibfdt and
+      # binman build with from the host.
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          bc cpio file rsync unzip
+          libssl-dev python3-dev python3-pyelftools python3-setuptools swig
+      - id: key
+        run: echo "dl=dl-$(git rev-parse HEAD:buildroot)-${{ hashFiles('configs/k1cam_defconfig', 'package/*/*.mk', 'package/*/*.hash', 'board/k1cam/*.mk') }}" >>"$GITHUB_OUTPUT"
+      # Downloads change only with a version, so they are saved per set of
+      # versions; the compiler cache is saved after every build.
+      - uses: actions/cache@v4
+        with:
+          path: dl
+          key: ${{ steps.key.outputs.dl }}
+          restore-keys: dl-
+      - uses: actions/cache@v4
+        with:
+          path: ~/.buildroot-ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+      - run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k1cam-firmware
+          path: |
+            output/k1cam/images/k1cam.bin
+            output/k1cam/images/k1cam.bin.sha256sum
+            output/k1cam/images/k1cam.upd
+            output/k1cam/images/k1cam.upd.sha256sum
+  # Every push to the default branch replaces the files of one prerelease,
+  # "nightly", and moves its tag, so releases/download/nightly/<file> is
+  # always the newest build: no login, no zip, no expiry.
+  nightly:
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    needs: firmware
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: nightly
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SUBJECT: ${{ github.event.head_commit.message }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: k1cam-firmware
+          path: dist
+      - name: Publish
+        run: |
+          # A run that finishes after a newer commit's leaves nightly alone.
+          head=$(gh api "repos/$GH_REPO/commits/$GITHUB_REF_NAME" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME is at $head now, not $GITHUB_SHA: skipping"
+            exit 0
+          fi
+          notes="Built from [${GITHUB_SHA::7}]($GITHUB_SERVER_URL/$GH_REPO/commit/$GITHUB_SHA): ${SUBJECT%%$'\n'*}
+
+          Replaced on every push to $GITHUB_REF_NAME. \`k1cam.upd\` is the A/B update; \`k1cam.bin\` is the whole flash, which also resets the settings."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly dist/* --clobber
+          else
+            gh release create nightly dist/* --prerelease --title nightly --target "$GITHUB_SHA" --notes "$notes"
+          fi
+          gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true >/dev/null ||
+            gh api "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA" >/dev/null
+          gh release edit nightly --notes "$notes"

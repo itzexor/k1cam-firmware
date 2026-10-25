@@ -31,7 +31,11 @@ program is streaming.
 | [k1cam-flasher](https://github.com/itzexor/k1cam-flasher) | Desktop GUI for full flash backups and initial installation/recovery through the Ingenic USB boot ROM, plus A/B updates over the running k1cam camera's UVC extension unit. See its README for platform support and USB driver setup. |
 | [uvcdctl](https://github.com/itzexor/k1cam-firmware/tree/k1cam/package/k1cam-uvcd/uvcdctl) | Linux CLI in this repository for image/encoder controls, flash backups and A/B updates over USB. It builds independently on the host and is also included in the camera firmware. |
 
-Build this firmware to produce `k1cam.bin` and `k1cam.upd`. Use
+Build this firmware, or download the newest build of the `k1cam` branch from
+the [nightly release](https://github.com/itzexor/k1cam-firmware/releases/tag/nightly)
+([`k1cam.bin`](https://github.com/itzexor/k1cam-firmware/releases/download/nightly/k1cam.bin),
+[`k1cam.upd`](https://github.com/itzexor/k1cam-firmware/releases/download/nightly/k1cam.upd),
+replaced on every push), to get `k1cam.bin` and `k1cam.upd`. Use
 [k1cam-flasher's installation instructions](https://github.com/itzexor/k1cam-flasher#using-it)
 to install the full `k1cam.bin` image through the boot ROM; this also installs
 the A/B flash layout and resets settings. Once the camera runs k1cam on that
