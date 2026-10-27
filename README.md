@@ -83,6 +83,33 @@ Cameras on the earlier single-slot layout move to this one by being flashed
 with `k1cam.bin` once ([firmware update guide](FIRMWARE-UPDATE.md)). See
 [AGENTS.md](AGENTS.md) for how the tree is organised.
 
+## Get uvcdctl for a Linux host
+
+The [nightly release](https://github.com/itzexor/k1cam-firmware/releases/tag/nightly)
+includes static `uvcdctl` builds with SHA-256 checksums:
+
+| Host architecture (`uname -m`) | Download |
+| --- | --- |
+| `x86_64` | [uvcdctl-linux-x86_64.tar.gz](https://github.com/itzexor/k1cam-firmware/releases/download/nightly/uvcdctl-linux-x86_64.tar.gz) |
+| `aarch64` (ARM64) | [uvcdctl-linux-aarch64.tar.gz](https://github.com/itzexor/k1cam-firmware/releases/download/nightly/uvcdctl-linux-aarch64.tar.gz) |
+| `armv7l` (32-bit hard-float ARM) | [uvcdctl-linux-armv7.tar.gz](https://github.com/itzexor/k1cam-firmware/releases/download/nightly/uvcdctl-linux-armv7.tar.gz) |
+| `mips` (32-bit little-endian MIPS, mipsel) | [uvcdctl-linux-mipsel.tar.gz](https://github.com/itzexor/k1cam-firmware/releases/download/nightly/uvcdctl-linux-mipsel.tar.gz) |
+
+Download the archive for your Linux host and extract it, for example:
+
+```sh
+tar -xzf uvcdctl-linux-x86_64.tar.gz
+./uvcdctl help
+```
+
+The MIPS build requires little-endian hardware; `uname -m` does not identify
+the byte order.
+
+The binary needs no installed runtime libraries. CI builds all four host
+architectures independently of the firmware and runs their help commands
+(under QEMU for ARM and MIPS). `uvcdctl` uses Linux's V4L2/UVC interfaces;
+macOS and Windows are not supported.
+
 ## Build uvcdctl on a Linux host
 
 To control an already-flashed camera, only `uvcdctl` is needed. Its standalone

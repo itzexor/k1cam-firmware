@@ -139,6 +139,25 @@ runs, the camera assumes the newest settings caused it. It restarts with the
 settings the last healthy stream used, and after a second such failure in a
 row, with factory defaults.
 
+## Download
+
+The [nightly release](https://github.com/itzexor/k1cam-firmware/releases/tag/nightly)
+provides `uvcdctl-linux-x86_64.tar.gz`, `uvcdctl-linux-aarch64.tar.gz`,
+`uvcdctl-linux-armv7.tar.gz` and `uvcdctl-linux-mipsel.tar.gz`, each with a
+`.sha256sum` file. These are static Linux executables with no installed
+runtime library dependencies. The ARMv7 build uses the 32-bit hard-float ABI.
+Choose for your host's OS architecture (`uname -m`), extract the archive and
+run `./uvcdctl help`. The archive preserves the executable permission. The
+MIPS build is for 32-bit little-endian hosts (mipsel); `uname -m` does not
+identify the byte order.
+
+CI builds these independently of Buildroot on every push, pull request and
+manual run, checks that they have no dynamic loader or shared library
+dependencies, and runs the help commands natively on x86_64 or through QEMU
+on ARM and MIPS. Pushes to the default branch also publish them with the
+firmware in the nightly release. The CLI currently requires Linux's V4L2/UVC
+interfaces.
+
 ## Build
 
 The standalone build runs on a Linux USB host and produces a native host
@@ -159,6 +178,20 @@ make
 Run the resulting binary as `./uvcdctl` from this directory, or optionally
 install it to `/usr/bin/uvcdctl` with `sudo make install`. The firmware build
 separately cross-compiles a copy for the camera.
+
+To link statically with a compiler whose libc development package includes
+static libraries, use `make LDFLAGS="-static -s"` on a clean build. To cross
+compile, also set `CC`, for example:
+
+```sh
+make CC=aarch64-linux-gnu-gcc LDFLAGS="-static -s"
+```
+
+For 32-bit little-endian MIPS, use `CC=mipsel-linux-gnu-gcc` instead.
+
+The cross compiler needs its target's libc and Linux userspace headers.
+Changing `CC` or `LDFLAGS` does not rebuild an existing binary; use
+`make clean` first when switching builds.
 
 See the [firmware README](../../../README.md#projects-in-the-ecosystem) for
 how the firmware, kernel and

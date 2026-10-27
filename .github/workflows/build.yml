@@ -39,12 +39,74 @@ jobs:
             output/k1cam/images/k1cam.bin.sha256sum
             output/k1cam/images/k1cam.upd
             output/k1cam/images/k1cam.upd.sha256sum
+  uvcdctl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cc: gcc
+            packages: gcc libc6-dev
+            runner: env
+          - arch: aarch64
+            cc: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+            runner: qemu-aarch64
+          - arch: armv7
+            cc: arm-linux-gnueabihf-gcc
+            packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
+            runner: qemu-arm
+          - arch: mipsel
+            cc: mipsel-linux-gnu-gcc
+            packages: gcc-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user
+            runner: qemu-mipsel
+    env:
+      ARCH: ${{ matrix.arch }}
+      CC: ${{ matrix.cc }}
+      RUNNER: ${{ matrix.runner }}
+    steps:
+      # This build needs neither Buildroot nor its submodule.
+      - uses: actions/checkout@v4
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          binutils file ${{ matrix.packages }}
+      - name: Build
+        run: |
+          if ! make -C package/k1cam-uvcd/uvcdctl LDFLAGS="-static -s" >uvcdctl-build.log 2>&1; then
+            cat uvcdctl-build.log
+            exit 1
+          fi
+          cat uvcdctl-build.log
+      - name: Check static linking and run help
+        run: |
+          bin=package/k1cam-uvcd/uvcdctl/uvcdctl
+          file "$bin"
+          readelf -lWd "$bin" >uvcdctl-elf.txt
+          if grep -E 'INTERP|NEEDED' uvcdctl-elf.txt; then
+            echo "uvcdctl must have no dynamic loader or shared libraries" >&2
+            exit 1
+          fi
+          "$RUNNER" "$bin" help
+          "$RUNNER" "$bin" help firmware
+      - name: Package
+        run: |
+          mkdir -p dist
+          archive=uvcdctl-linux-$ARCH.tar.gz
+          tar -czf "dist/$archive" -C package/k1cam-uvcd/uvcdctl uvcdctl
+          (cd dist && sha256sum "$archive" >"$archive.sha256sum")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uvcdctl-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
   # Every push to the default branch replaces the files of one prerelease,
   # "nightly", and moves its tag, so releases/download/nightly/<file> is
   # always the newest build: no login, no zip, no expiry.
   nightly:
     if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
-    needs: firmware
+    needs: [firmware, uvcdctl]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -58,6 +120,11 @@ jobs:
         with:
           name: k1cam-firmware
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: uvcdctl-linux-*
+          merge-multiple: true
+          path: dist
       - name: Publish
         run: |
           # A run that finishes after a newer commit's leaves nightly alone.
@@ -68,7 +135,9 @@ jobs:
           fi
           notes="Built from [${GITHUB_SHA::7}]($GITHUB_SERVER_URL/$GH_REPO/commit/$GITHUB_SHA): ${SUBJECT%%$'\n'*}
 
-          Replaced on every push to $GITHUB_REF_NAME. \`k1cam.upd\` is the A/B update; \`k1cam.bin\` is the whole flash, which also resets the settings."
+          Replaced on every push to $GITHUB_REF_NAME. \`k1cam.upd\` is the A/B update; \`k1cam.bin\` is the whole flash, which also resets the settings.
+
+          \`uvcdctl-linux-*.tar.gz\` contains a static Linux CLI for x86_64, aarch64 (ARM64), armv7 (32-bit hard-float ARM) or mipsel (32-bit little-endian MIPS). Extract it and run \`./uvcdctl help\`."
           if gh release view nightly >/dev/null 2>&1; then
             gh release upload nightly dist/* --clobber
           else
