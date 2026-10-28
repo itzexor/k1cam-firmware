@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <time.h>
 #include <raptor_hal.h>
+#include "uvcd_diag.h"
 
 static inline int64_t uvcd_monotonic_us(void)
 {
@@ -307,6 +308,10 @@ typedef struct {
 	float subject_weight[15][15];
 	uint8_t subject_written[15][15];
 	float ae_comp_cut;
+	bool ae_comp_valid, guard_valid;
+	uint8_t ae_comp_applied, guard_top;
+	float guard_level;
+	uint16_t diag_sequence;
 	int64_t subject_checked_ms, guard_checked_ms;
 	int64_t metering_tried_ms;
 
@@ -363,6 +368,9 @@ int uvcd_camera_live_exposure(uvcd_camera_t *cam);
 /* The colour temperature the ISP's auto white balance currently measures,
  * in Kelvin, or -1 when the camera is down or the ISP won't say. */
 int uvcd_camera_awb_ct(uvcd_camera_t *cam);
+
+/* Capture from the main loop only; no waits for a frame or writes to the ISP. */
+void uvcd_camera_diag(uvcd_camera_t *cam, uint8_t record[UVCD_DIAG_SIZE]);
 
 /* --------------------------------------------------------------------------
  * Pipeline: the camera plus the stream that leases it -- uvcd_pipeline.c

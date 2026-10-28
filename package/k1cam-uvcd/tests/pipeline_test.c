@@ -1099,8 +1099,64 @@ static int configure(uvcd_pipeline_t *p, uint8_t format, uint8_t frame, uint32_t
 	return configure_channel(p, format, frame, interval);
 }
 
+static void test_diagnostic_capture(void)
+{
+	rss_hal_ops_t ops = {.isp_get_exposure = get_exposure,
+			     .isp_get_awb_ct_attr = get_ct,
+			     .isp_get_ae_zone = get_zone,
+			     .isp_get_ae_hist_origin = get_hist,
+			     .isp_get_ae_state = get_ae_state};
+	struct uvcd_control_state c = {.zoom = 100, .ae_mode = 8, .wb_auto = 1, .ae_comp = 200};
+	uvcd_camera_t cam = {.ops = &ops,
+			     .controls = &c,
+			     .up = true,
+			     .sensor_w = 1920,
+			     .sensor_h = 1080,
+			     .view = {.w = 1920, .h = 1080},
+			     .view_frame = 1,
+			     .metering_valid = true,
+			     .metering_mode = 4,
+			     .ae_comp_valid = true,
+			     .ae_comp_applied = 150,
+			     .guard_valid = true,
+			     .guard_top = 220,
+			     .guard_level = 170.25f,
+			     .ae_comp_cut = 0.25f};
+	for (unsigned i = 0; i < 225; i++) {
+		cam.subject_written[i / 15][i % 15] = i % 9;
+		fake_zone[i / 15][i % 15] = i * 1000;
+	}
+	memset(fake_hist, 0, sizeof(fake_hist));
+	fake_hist[0] = UINT32_MAX;
+	fake_hist[1] = UINT32_MAX; // sum must not overflow u32
+	fake_hist[4] = UINT32_MAX;
+	ae_stable = true;
+	uint8_t r[UVCD_DIAG_SIZE];
+	uvcd_camera_diag(&cam, r);
+	assert(r[0] == 1 && r[1] == 15 && uvcd_diag_get(r + 2, 2) == 1);
+	assert(uvcd_diag_get(r + 4, 2) == 745 && uvcd_diag_get(r + 6, 2) == 511);
+	assert(uvcd_diag_get(r + 24, 4) == 12345 && uvcd_diag_get(r + 28, 4) == 256);
+	assert(uvcd_diag_get(r + 32, 2) == 9000 && r[18] == 150);
+	assert(uvcd_diag_get(r + 50, 2) == 17025 && uvcd_diag_get(r + 52, 2) == 2500);
+	assert(r[54] == 0x10 && (r[166] & 0xf0) == 0);
+	assert(uvcd_diag_get(r + 167 + 15 * 2, 2) == 15000);
+	assert(uvcd_diag_get(r + 167 + 224 * 2, 2) == 65535);
+	assert(uvcd_diag_get(r + 617, 2) == 65535 && uvcd_diag_get(r + 619, 2) == 32767);
+	cam.up = false;
+	uvcd_camera_diag(&cam, r);
+	assert(r[16] == 255 && uvcd_diag_get(r + 6, 2) == 0 && uvcd_diag_get(r + 24, 4) == 0);
+	cam.up = true;
+	memset(&ops, 0, sizeof(ops));
+	uvcd_camera_diag(&cam, r);
+	assert(uvcd_diag_get(r + 6, 2) == (8 | 16 | 128 | 256));
+	assert(uvcd_diag_get(r + 24, 4) == 0 && uvcd_diag_get(r + 617, 2) == 0);
+	// Capture never changed the ISP or controls.
+	assert(c.ae_comp == 200);
+}
+
 int main(void)
 {
+	test_diagnostic_capture();
 	rss_hal_ops_t ops = {
 		.isp_set_sensor_fps = set_sensor_rate,
 		.fs_create_channel = create_fs,

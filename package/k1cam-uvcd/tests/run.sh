@@ -51,7 +51,7 @@ set -- -std=gnu11 -D_GNU_SOURCE -g -O1 -Wall -Wextra \
 	-ffunction-sections -fdata-sections -I"$(dirname "$hal")" -I"$src"
 for test in config fw update gadget pipeline startup uvcdctl; do
 	case $test in
-		gadget | uvcdctl) extra=$firmware ;;
+		gadget | uvcdctl) extra="$firmware $src/uvcd_diag.c" ;;
 		*) extra= ;;
 	esac
 	# shellcheck disable=SC2086

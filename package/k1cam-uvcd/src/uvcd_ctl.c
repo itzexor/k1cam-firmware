@@ -20,6 +20,11 @@ int uvcd_ctl_command(gadget_t *g, const char *line, char *out, size_t size)
 	int n = sscanf(line, "%31s %63s %63s", command, name, arg);
 	if (n < 1)
 		return reply(out, size, "err empty command");
+	if (!strcmp(command, "diag") && n == 1) {
+		uint8_t record[UVCD_DIAG_SIZE];
+		uvcd_ctrl_diag(g, record);
+		return uvcd_diag_format(record, out, size);
+	}
 	if (!strcmp(command, "list")) {
 		size_t used = 0;
 		for (size_t i = 0; i < uvcd_ctrl_count(); i++) {
@@ -92,7 +97,8 @@ void uvcd_ctl_accept(gadget_t *g, int fd)
 		return;
 	struct timeval timeout = {.tv_sec = 1};
 	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-	char line[160] = {0}, out[4096];
+	setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+	char line[160] = {0}, out[UVCD_DIAG_TEXT_SIZE];
 	ssize_t n = read(client, line, sizeof(line) - 1);
 	if (n > 0) {
 		char *nl = strpbrk(line, "\r\n");
@@ -100,7 +106,15 @@ void uvcd_ctl_accept(gadget_t *g, int fd)
 			*nl = '\0';
 		if (uvcd_ctl_command(g, line, out, sizeof(out)) != 0)
 			strcpy(out, "err reply too large\n");
-		write(client, out, strlen(out));
+		size_t sent = 0, total = strlen(out);
+		while (sent < total) {
+			ssize_t written = write(client, out + sent, total - sent);
+			if (written < 0 && errno == EINTR)
+				continue;
+			if (written <= 0)
+				break;
+			sent += (size_t)written;
+		}
 	}
 	close(client);
 }

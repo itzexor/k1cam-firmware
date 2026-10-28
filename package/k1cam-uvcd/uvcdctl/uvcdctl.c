@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 #include "uvcdctl.h"
+#include "../src/uvcd_diag.h"
 
 #define UVCD_XU_RESET_SELECTOR 10
 #define UVCD_XU_KEYFRAME_SELECTOR 20
@@ -167,6 +168,9 @@ struct command_def {
 };
 
 static const struct command_def commands[] = {
+	{"diag", "", 0, 0, "read ISP diagnostics",
+	 "Read a diagnostic snapshot as name=value lines, with 15x15 zone tables.\n"
+	 "The valid bitmask says which measurements the ISP supplied.\n"},
 	{"get", "<key>", 1, 1, "read one control",
 	 "Read the current value of one control.\n"
 	 "<key> is a control name or numeric ID from list.\n"
@@ -646,9 +650,54 @@ static int socket_request(const char *command, char *buf, size_t size)
 	       (used == 3 || buf[used - 4] == '\n') ? 0 : 1;
 }
 
+static int cmd_diag(int fd)
+{
+	uint8_t len[2], version, trigger = 0, r[UVCD_DIAG_SIZE] = {0}, page[60];
+	char text[UVCD_DIAG_TEXT_SIZE];
+	if (xu_query_bytes(fd, UVCD_DIAG_PAGE, UVC_GET_LEN, len, 2) ||
+	    uvcd_diag_get(len, 2) != 60 ||
+	    xu_query_bytes(fd, UVCD_DIAG_LATCH, UVC_GET_CUR, &version, 1) ||
+	    version != UVCD_DIAG_VERSION) {
+		fprintf(stderr, "uvcdctl: diagnostic channel unavailable\n");
+		return 1;
+	}
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		if (xu_query_bytes(fd, UVCD_DIAG_LATCH, UVC_SET_CUR, &trigger, 1))
+			return 1;
+		unsigned count = 1, seq = 0, i;
+		for (i = 0; i < count; i++) {
+			if (xu_query_bytes(fd, UVCD_DIAG_PAGE, UVC_GET_CUR, page, 60))
+				return 1;
+			if (!i) {
+				count = page[1];
+				seq = uvcd_diag_get(page + 2, 2);
+			}
+			if (count < UVCD_DIAG_PAGES || count > 32 || page[0] != i ||
+			    page[1] != count || uvcd_diag_get(page + 2, 2) != seq)
+				break;
+			unsigned offset = i * UVCD_DIAG_PAYLOAD;
+			if (offset < UVCD_DIAG_SIZE) {
+				unsigned n = UVCD_DIAG_SIZE - offset;
+				if (n > UVCD_DIAG_PAYLOAD)
+					n = UVCD_DIAG_PAYLOAD;
+				memcpy(r + offset, page + 4, n);
+			}
+		}
+		unsigned size = uvcd_diag_get(r + 4, 2);
+		if (i == count && uvcd_diag_get(r + 2, 2) == seq &&
+		    size > (count - 1) * UVCD_DIAG_PAYLOAD && size <= count * UVCD_DIAG_PAYLOAD &&
+		    uvcd_diag_format(r, text, sizeof(text)) == 0) {
+			fputs(text, stdout);
+			return 0;
+		}
+	}
+	fprintf(stderr, "uvcdctl: inconsistent diagnostic pages\n");
+	return 1;
+}
+
 static int socket_command(const char *command)
 {
-	char buf[4097] = {0};
+	char buf[UVCD_DIAG_TEXT_SIZE] = {0};
 	int rc = socket_request(command, buf, sizeof(buf));
 	fputs(buf, stdout);
 	return rc;
@@ -777,6 +826,8 @@ int main(int argc, char **argv)
 				}
 			}
 		}
+	} else if (!strcmp(cmd, "diag")) {
+		rc = cmd_diag(fd);
 	} else if (listing) {
 		rc = cmd_list(fd, def, descriptions);
 	} else if (strcmp(cmd, "keyframe") == 0) {

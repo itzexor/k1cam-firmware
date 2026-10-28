@@ -239,3 +239,12 @@ uvcdctl --device /dev/video0 list
 
 Exit status is 0 on success, 1 on a device error, 2 on a usage error (and
 for `firmware upgrade`, 3 and 4 as above).
+
+## ISP diagnostics
+
+`uvcdctl diag` reads a fresh ISP snapshot through the camera's local socket;
+`uvcdctl --device /dev/videoN diag` reads it over USB on a Linux host.
+Output is `name=value` lines, including the `valid` bitmask, 15 rows each of
+zone weights and levels, and 64 relative linear histogram bins. Consult
+[DIAGNOSTICS.md](../DIAGNOSTICS.md) for units and validity bits. USB access
+requires a kernel advertising XU selectors 29 and 30.

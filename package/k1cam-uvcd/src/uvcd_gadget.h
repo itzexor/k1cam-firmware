@@ -83,4 +83,7 @@ int uvcd_ctrl_keyframe(gadget_t *g);
  * only a complete reset replaces the last proven controls. UVC XU selector 10. */
 int uvcd_ctrl_reset(gadget_t *g);
 
+/* Console capture does not disturb the USB latch or its cursor. */
+void uvcd_ctrl_diag(gadget_t *g, uint8_t record[UVCD_DIAG_SIZE]);
+
 #endif /* UVCD_GADGET_H */

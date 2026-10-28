@@ -76,6 +76,8 @@ ssize_t test_read(int fd, void *buf, size_t size)
 	return (ssize_t)n;
 }
 
+static bool diag_mixed;
+static unsigned diag_cursor;
 static int current_qp = 30, get_error, range_error, s_ctrl_error;
 
 /* --------------------------------------------------------------------------
@@ -309,6 +311,34 @@ int test_ioctl(int fd, unsigned long request, ...)
 	}
 	assert(request == UVCIOC_CTRL_QUERY);
 	struct uvc_xu_control_query *q = arg;
+	if (q->selector == 29 || q->selector == 30) {
+		if (q->query == UVC_GET_LEN) {
+			q->data[0] = 60;
+			q->data[1] = 0;
+			return 0;
+		}
+		if (q->selector == 29) {
+			if (q->query == UVC_SET_CUR)
+				diag_cursor = 0;
+			else
+				q->data[0] = 1;
+			return 0;
+		}
+		uint8_t r[UVCD_DIAG_SIZE] = {1};
+		uvcd_diag_put(r + 2, 42, 2);
+		uvcd_diag_put(r + 4, UVCD_DIAG_SIZE, 2);
+		uvcd_diag_put(r + 24, 12345, 4);
+		memset(q->data, 0, 60);
+		q->data[0] = diag_cursor;
+		q->data[1] = UVCD_DIAG_PAGES;
+		uvcd_diag_put(q->data + 2, diag_mixed && diag_cursor == 2 ? 43 : 42, 2);
+		unsigned offset = diag_cursor * UVCD_DIAG_PAYLOAD, n = UVCD_DIAG_SIZE - offset;
+		if (n > UVCD_DIAG_PAYLOAD)
+			n = UVCD_DIAG_PAYLOAD;
+		memcpy(q->data + 4, r + offset, n);
+		diag_cursor++;
+		return 0;
+	}
 	if (q->selector >= UVCD_FW_COMMAND_SELECTOR && q->selector <= UVCD_FW_STATUS_SELECTOR)
 		return cam_query(q);
 	if (cam_rebooting) {
@@ -734,6 +764,14 @@ static void check_firmware(void)
 
 int main(void)
 {
+	char diag_text[8192];
+	char *diag_args[] = {"uvcdctl", "--device", "/fake", "diag"};
+	assert(capture_command(4, diag_args, stdout, diag_text, sizeof(diag_text)) == 0);
+	assert(strstr(diag_text, "exposure_us=12345\n") && strstr(diag_text, "levels_14="));
+	diag_mixed = true;
+	assert(capture_command(4, diag_args, stderr, diag_text, sizeof(diag_text)) == 1);
+	assert(strstr(diag_text, "inconsistent diagnostic pages"));
+	diag_mixed = false;
 	const char *fragmented[] = {"128\n", "o", "k\n", NULL};
 	const char *failed[] = {"err ", "apply failed\n", NULL};
 	const char *incomplete[] = {"128\no", NULL};

@@ -191,6 +191,9 @@ struct gadget_s {
 	/* Firmware info, dumps and updates (selectors 26-28); NULL if it
 	 * could not be set up, and those selectors then stall. */
 	struct uvcd_update *update;
+	uint8_t diag[UVCD_DIAG_SIZE];
+	bool diag_latched;
+	uint8_t diag_page;
 	/* A trial boot's proof that this release runs the camera. */
 	struct {
 		int step; /* SELFTEST_* */
@@ -218,6 +221,10 @@ struct gadget_s {
 
 	uint64_t read_seq;
 };
+
+void uvcd_ctrl_diag(gadget_t *g, uint8_t r[UVCD_DIAG_SIZE]) { uvcd_camera_diag(&g->pipe->cam, r); }
+
+static bool diagnostic_selector(uint8_t s) { return s == UVCD_DIAG_LATCH || s == UVCD_DIAG_PAGE; }
 
 static bool firmware_selector(uint8_t selector)
 {
@@ -1185,9 +1192,11 @@ static uint8_t stall_reason(gadget_t *g, const struct usb_ctrlrequest *req)
 			known = cs == UVC_VC_REQUEST_ERROR_CODE_CONTROL;
 			break;
 		case UVCD_CUSTOM_UNIT_ID:
-			known = firmware_selector(cs) ? g->update != NULL :
-				cs == UVCD_CUSTOM_RESET || cs == UVCD_CUSTOM_H264_KEYFRAME ||
-					custom_control_value(g, cs);
+			known = diagnostic_selector(cs) ? true
+				: firmware_selector(cs)
+				    ? g->update != NULL
+				    : cs == UVCD_CUSTOM_RESET || cs == UVCD_CUSTOM_H264_KEYFRAME ||
+					  custom_control_value(g, cs);
 			break;
 		case UVCD_PROCESSING_UNIT_ID:
 			known = standard_ctrl_def(cs) && control_value(g, cs);
@@ -1199,6 +1208,54 @@ static uint8_t stall_reason(gadget_t *g, const struct usb_ctrlrequest *req)
 			return UVCD_REQUEST_ERROR_INVALID_UNIT;
 		}
 	return known ? UVCD_REQUEST_ERROR_INVALID_REQUEST : UVCD_REQUEST_ERROR_INVALID_CONTROL;
+}
+
+static void handle_diag_setup(gadget_t *g, const struct usb_ctrlrequest *req,
+			      struct uvc_request_data *resp)
+{
+	unsigned s = req->wValue >> 8;
+	bool latch = s == UVCD_DIAG_LATCH;
+	resp->length = -1;
+	if (!(req->bRequestType & USB_DIR_IN)) {
+		if (latch && req->bRequest == UVC_SET_CUR && req->wLength == 1) {
+			g->last_cs = s;
+			g->last_unit = UVCD_CUSTOM_UNIT_ID;
+			g->last_intf = UVC_INTF_CONTROL;
+			g->last_request = UVC_SET_CUR;
+			resp->length = 1;
+		}
+		return;
+	}
+	memset(resp->data, 0, sizeof(resp->data));
+	switch (req->bRequest) {
+	case UVC_GET_INFO:
+		resp->data[0] = UVC_CONTROL_CAP_GET | (latch ? UVC_CONTROL_CAP_SET : 0);
+		resp->length = req->wLength < 1 ? req->wLength : 1;
+		break;
+	case UVC_GET_LEN:
+		resp->data[0] = latch ? 1 : UVCD_DIAG_PAGE_SIZE;
+		resp->length = req->wLength < 2 ? req->wLength : 2;
+		break;
+	case UVC_GET_CUR:
+		/* A short page must never advance the cursor. */
+		if (req->wLength != (latch ? 1 : UVCD_DIAG_PAGE_SIZE))
+			return;
+		resp->length = req->wLength;
+		if (latch) {
+			resp->data[0] = UVCD_DIAG_VERSION;
+		} else if (g->diag_latched) {
+			unsigned offset = g->diag_page * UVCD_DIAG_PAYLOAD;
+			unsigned n = UVCD_DIAG_SIZE - offset;
+			if (n > UVCD_DIAG_PAYLOAD)
+				n = UVCD_DIAG_PAYLOAD;
+			resp->data[0] = g->diag_page;
+			resp->data[1] = UVCD_DIAG_PAGES;
+			memcpy(resp->data + 2, g->diag + 2, 2);
+			memcpy(resp->data + 4, g->diag + offset, n);
+			g->diag_page = (g->diag_page + 1) % UVCD_DIAG_PAGES;
+		}
+		break;
+	}
 }
 
 static void handle_firmware_setup(gadget_t *g, const struct usb_ctrlrequest *req,
@@ -1237,7 +1294,9 @@ static void handle_setup_event(gadget_t *g, const struct usb_ctrlrequest *req)
 	if (intf == UVC_INTF_CONTROL) {
 		switch (unit) {
 		case UVCD_CUSTOM_UNIT_ID:
-			if (firmware_selector(cs))
+			if (diagnostic_selector(cs))
+				handle_diag_setup(g, req, &resp);
+			else if (firmware_selector(cs))
 				handle_firmware_setup(g, req, &resp);
 			else
 				handle_custom_setup(g, req, &resp);
@@ -1324,6 +1383,14 @@ static void handle_data_event(gadget_t *g, const struct uvc_request_data *data)
 	if (g->last_request == UVC_SET_CUR && g->last_intf == UVC_INTF_CONTROL) {
 		if (g->last_unit == UVCD_CAMERA_TERMINAL_ID) {
 			handle_camera_data(g, data);
+			return;
+		}
+		if (g->last_unit == UVCD_CUSTOM_UNIT_ID && diagnostic_selector(g->last_cs)) {
+			if (g->last_cs == UVCD_DIAG_LATCH && data->length == 1) {
+				uvcd_ctrl_diag(g, g->diag);
+				g->diag_latched = true;
+				g->diag_page = 0;
+			}
 			return;
 		}
 		if (g->last_unit == UVCD_CUSTOM_UNIT_ID && firmware_selector(g->last_cs)) {

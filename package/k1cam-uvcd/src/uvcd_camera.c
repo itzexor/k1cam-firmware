@@ -559,7 +559,12 @@ static int apply_ae_comp(uvcd_camera_t *cam, const struct uvcd_control_state *c)
 
 	if (c->metering == UVCD_METERING_SUBJECT)
 		v = (int)((float)v * (1.0f - cam->ae_comp_cut) + 0.5f);
-	return RSS_HAL_CALL(cam->ops, isp_set_ae_comp, cam->hal_ctx, v);
+	int ret = RSS_HAL_CALL(cam->ops, isp_set_ae_comp, cam->hal_ctx, v);
+	if (ret == RSS_OK) {
+		cam->ae_comp_valid = true;
+		cam->ae_comp_applied = (uint8_t)v;
+	}
+	return ret;
 }
 
 /* Write the weights for c->metering over the current view, whatever the
@@ -591,6 +596,7 @@ static int write_metering(uvcd_camera_t *cam, const struct uvcd_control_state *c
 	cam->subject_checked_ms = cam->guard_checked_ms = uvcd_monotonic_ms();
 	cam->metering_mode = c->metering;
 	cam->metering_valid = false;
+	cam->guard_valid = false;
 	/* Only subject metering holds compensation back. Keep its cut until
 	 * the ISP accepts the uncut value. On failure the caller keeps its
 	 * stored mode, which the tick restores because metering is invalid. */
@@ -773,6 +779,9 @@ static void highlight_guard(uvcd_camera_t *cam)
 	 * A pile-up brighter than anything in view is outside it. */
 	float share = view_share(cam);
 	float level = (float)top * share;
+	cam->guard_valid = true;
+	cam->guard_top = (uint8_t)top;
+	cam->guard_level = level;
 	bool saturated = share == 1.0f &&
 			 (float)bins[top] * 2.0f >= (float)total * UVCD_GUARD_TOP;
 	float scale = 1.0f - cam->ae_comp_cut;
@@ -1155,6 +1164,7 @@ int uvcd_camera_up(uvcd_camera_t *cam)
 		return ret;
 	}
 	cam->up = true;
+	cam->ae_comp_valid = cam->guard_valid = false;
 	cam->sensor_fps = 0;          /* the driver boots at its own default rate */
 	cam->it_capped = false;
 	cam->metering_valid = false;  /* and the ISP with the tuning's weights */
@@ -1446,4 +1456,98 @@ int uvcd_camera_apply(uvcd_camera_t *cam, struct uvcd_control_state *next, size_
 			return ret;
 	}
 	return apply_field(cam, next, field);
+}
+
+/* Getters are individually sampled: coherent daemon state, not one ISP frame. */
+void uvcd_camera_diag(uvcd_camera_t *cam, uint8_t r[UVCD_DIAG_SIZE])
+{
+	const struct uvcd_control_state *c = cam->controls;
+	unsigned valid = 0;
+	memset(r, 0, UVCD_DIAG_SIZE);
+	r[0] = UVCD_DIAG_VERSION;
+	r[1] = (c->ae_mode != UVCD_AE_MANUAL ? 2 : 0) | (c->wb_auto ? 4 : 0);
+	uvcd_diag_put(r + 2, ++cam->diag_sequence, 2);
+	uvcd_diag_put(r + 4, UVCD_DIAG_SIZE, 2);
+	uvcd_diag_put(r + 8, (uint64_t)uvcd_monotonic_ms(), 8);
+	r[16] = cam->up && cam->metering_valid ? cam->metering_mode : 255;
+	r[17] = (uint8_t)c->ae_comp;
+	uvcd_diag_put(r + 48, c->rotation, 2);
+	if (!cam->up)
+		return;
+	if (cam->ae_comp_valid) {
+		r[18] = cam->ae_comp_applied;
+		valid |= UVCD_DIAG_COMP;
+	}
+	if (cam->guard_valid && cam->metering_valid &&
+	    cam->metering_mode == UVCD_METERING_SUBJECT && c->ae_mode != UVCD_AE_MANUAL) {
+		r[1] |= 8;
+		r[19] = cam->guard_top;
+		uvcd_diag_put(r + 50, (unsigned)(cam->guard_level * 100.0f + 0.5f), 2);
+		uvcd_diag_put(r + 52, (unsigned)(cam->ae_comp_cut * 10000.0f + 0.5f), 2);
+		valid |= UVCD_DIAG_GUARD;
+	}
+	struct uvcd_imp_ae_state ae = {0};
+	if (RSS_HAL_CALL(cam->ops, isp_get_ae_state, cam->hal_ctx, &ae) == RSS_OK) {
+		valid |= UVCD_DIAG_AE;
+		r[1] |= ae.stable ? 1 : 0;
+		uvcd_diag_put(r + 20, ae.target > UINT16_MAX ? UINT16_MAX : ae.target, 2);
+		uvcd_diag_put(r + 22, ae.mean > UINT16_MAX ? UINT16_MAX : ae.mean, 2);
+	}
+	rss_exposure_t e = {0};
+	if (RSS_HAL_CALL(cam->ops, isp_get_exposure, cam->hal_ctx, &e) == RSS_OK &&
+	    e.exposure_time && e.total_gain) {
+		valid |= UVCD_DIAG_EXPOSURE;
+		uvcd_diag_put(r + 24, e.exposure_time, 4);
+		uvcd_diag_put(r + 28, e.total_gain, 4);
+	}
+	int ct = uvcd_camera_awb_ct(cam);
+	if (ct > 0) {
+		valid |= UVCD_DIAG_AWB;
+		uvcd_diag_put(r + 32, ct > UINT16_MAX ? UINT16_MAX : ct, 2);
+	}
+	if (cam->sensor_w > 0 && cam->sensor_h > 0 && cam->view.w > 0 && cam->view.h > 0) {
+		valid |= UVCD_DIAG_VIEW;
+		uvcd_diag_put(r + 34, cam->sensor_w, 2);
+		uvcd_diag_put(r + 36, cam->sensor_h, 2);
+		uvcd_diag_put(r + 38, cam->view.x, 2);
+		uvcd_diag_put(r + 40, cam->view.y, 2);
+		uvcd_diag_put(r + 42, cam->view.w, 2);
+		uvcd_diag_put(r + 44, cam->view.h, 2);
+		if (cam->view_frame >= 1 && cam->view_frame <= UVCD_NUM_FRAMES)
+			uvcd_diag_put(r + 46, effective_zoom(cam, c, cam->view_frame), 2);
+	}
+	if (cam->metering_valid) {
+		valid |= UVCD_DIAG_WEIGHTS;
+		for (unsigned i = 0; i < 225; i++) {
+			unsigned w = cam->subject_written[i / 15][i % 15];
+			r[UVCD_DIAG_WEIGHTS_OFFSET + i / 2] |= (w > 8 ? 8 : w) << (4 * (i % 2));
+		}
+	}
+	uint32_t zone[15][15];
+	if (RSS_HAL_CALL(cam->ops, isp_get_ae_zone, cam->hal_ctx, zone) == RSS_OK) {
+		valid |= UVCD_DIAG_ZONES;
+		for (unsigned i = 0; i < 225; i++) {
+			uint32_t z = zone[i / 15][i % 15];
+			uvcd_diag_put(r + UVCD_DIAG_ZONES_OFFSET + i * 2,
+				      z > UINT16_MAX ? UINT16_MAX : z, 2);
+		}
+	}
+	uint32_t hist[256];
+	if (RSS_HAL_CALL(cam->ops, isp_get_ae_hist_origin, cam->hal_ctx, hist) == RSS_OK) {
+		uint64_t bins[64], max = 0;
+		for (unsigned i = 0; i < 64; i++) {
+			bins[i] = 0;
+			for (unsigned j = 0; j < 4; j++)
+				bins[i] += hist[i * 4 + j];
+			if (bins[i] > max)
+				max = bins[i];
+		}
+		if (max) {
+			valid |= UVCD_DIAG_HIST;
+			for (unsigned i = 0; i < 64; i++)
+				uvcd_diag_put(r + UVCD_DIAG_HIST_OFFSET + i * 2,
+					      bins[i] * UINT16_MAX / max, 2);
+		}
+	}
+	uvcd_diag_put(r + 6, valid, 2);
 }

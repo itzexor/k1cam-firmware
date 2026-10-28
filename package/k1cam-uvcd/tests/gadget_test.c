@@ -117,6 +117,14 @@ int uvcd_enc_request_keyframe(uvcd_pipeline_t *p)
 }
 
 int uvcd_camera_live_exposure(uvcd_camera_t *cam) { (void)cam; return -1; }
+void uvcd_camera_diag(uvcd_camera_t *cam, uint8_t r[UVCD_DIAG_SIZE])
+{
+	for (unsigned i = 0; i < UVCD_DIAG_SIZE; i++)
+		r[i] = (uint8_t)i;
+	r[0] = 1;
+	uvcd_diag_put(r + 2, ++cam->diag_sequence, 2);
+	uvcd_diag_put(r + 4, UVCD_DIAG_SIZE, 2);
+}
 static int awb_ct = -1;
 int uvcd_camera_awb_ct(uvcd_camera_t *cam) { (void)cam; return awb_ct; }
 int uvcd_enc_apply_bitrate(uvcd_pipeline_t *p)
@@ -235,8 +243,17 @@ static void test_firmware_routing(void)
 	struct uvc_request_data data = {.length = 60};
 	fw_frame(data.data, 42, UVCD_FW_OP_INFO);
 	handle_data_event(&g, &data);
+	uint8_t before[60];
+	fw_status(&g, before);
+	struct usb_ctrlrequest diag = {.bRequestType = USB_DIR_IN,
+				       .bRequest = UVC_GET_CUR,
+				       .wValue = UVCD_DIAG_PAGE << 8,
+				       .wIndex = UVCD_CUSTOM_UNIT_ID << 8,
+				       .wLength = 60};
+	handle_setup_event(&g, &diag);
 	uint8_t s[60];
 	fw_status(&g, s);
+	assert(!memcmp(s, before, sizeof(s)));
 	assert(uvcd_fw_get_le32(s + UVCD_FW_STATUS_SEQUENCE) == 42 &&
 	       s[UVCD_FW_STATUS_RESULT] == 0 && s[UVCD_FW_STATUS_OPCODE] == UVCD_FW_OP_INFO);
 	/* A SET the service refuses (wrong length) stalls and leaves no
@@ -760,8 +777,90 @@ static void test_encoder_failures(void)
 	assert(uvcd_ctrl_reset(&g) == -1 && good_saves == before);
 }
 
+static void test_diagnostics(void)
+{
+	uvcd_pipeline_t p = {0};
+	gadget_t g = {.pipe = &p};
+	struct usb_ctrlrequest req = {.bRequestType = USB_DIR_IN,
+				      .bRequest = UVC_GET_CUR,
+				      .wValue = UVCD_DIAG_PAGE << 8,
+				      .wIndex = UVCD_CUSTOM_UNIT_ID << 8,
+				      .wLength = 60};
+	handle_setup_event(&g, &req);
+	assert(last_response.length == 60);
+	for (unsigned i = 0; i < 60; i++)
+		assert(last_response.data[i] == 0);
+	for (unsigned sel = 29; sel <= 30; sel++) {
+		req.wValue = sel << 8;
+		req.bRequest = UVC_GET_INFO;
+		req.wLength = 1;
+		handle_setup_event(&g, &req);
+		assert(last_response.length == 1 && last_response.data[0] == (sel == 29 ? 3 : 1));
+		req.bRequest = UVC_GET_LEN;
+		req.wLength = 2;
+		handle_setup_event(&g, &req);
+		assert(last_response.length == 2 &&
+		       uvcd_diag_get(last_response.data, 2) == (sel == 29 ? 1 : 60));
+	}
+	req.wValue = 29 << 8;
+	req.bRequest = UVC_SET_CUR;
+	req.bRequestType = USB_DIR_OUT;
+	req.wLength = 2;
+	handle_setup_event(&g, &req);
+	assert(last_response.length == -1);
+	req.wLength = 1;
+	handle_setup_event(&g, &req);
+	assert(last_response.length == 1);
+	struct uvc_request_data data = {.length = 0};
+	handle_data_event(&g, &data);
+	assert(!g.diag_latched);
+	data.length = 1;
+	handle_data_event(&g, &data);
+	assert(g.diag_latched);
+	uint8_t expected[UVCD_DIAG_SIZE], record[UVCD_DIAG_SIZE];
+	memcpy(expected, g.diag, sizeof(expected));
+	req.wValue = 30 << 8;
+	req.bRequest = UVC_GET_CUR;
+	req.bRequestType = USB_DIR_IN;
+	req.wLength = 59;
+	handle_setup_event(&g, &req);
+	assert(last_response.length == -1 && g.diag_page == 0);
+	req.wLength = 60;
+	for (unsigned i = 0; i < UVCD_DIAG_PAGES; i++) {
+		handle_setup_event(&g, &req);
+		assert(last_response.length == 60 && last_response.data[0] == i &&
+		       last_response.data[1] == UVCD_DIAG_PAGES &&
+		       uvcd_diag_get(last_response.data + 2, 2) == 1);
+		unsigned n = UVCD_DIAG_SIZE - i * UVCD_DIAG_PAYLOAD;
+		if (n > UVCD_DIAG_PAYLOAD)
+			n = UVCD_DIAG_PAYLOAD;
+		memcpy(record + i * UVCD_DIAG_PAYLOAD, last_response.data + 4, n);
+		for (unsigned j = n + 4; j < 60; j++)
+			assert(last_response.data[j] == 0);
+		if (i == 3) {
+			char text[UVCD_DIAG_TEXT_SIZE];
+			assert(uvcd_ctl_command(&g, "diag", text, sizeof(text)) == 0);
+			assert(strstr(text, "version=1\n") && strstr(text, "weights_14="));
+			assert(g.diag_page == 4 && !memcmp(expected, g.diag, sizeof(expected)));
+		}
+	}
+	assert(!memcmp(record, expected, sizeof(record)));
+	handle_setup_event(&g, &req);
+	assert(last_response.data[0] == 0);
+	req.bRequestType = USB_DIR_OUT;
+	req.bRequest = UVC_SET_CUR;
+	handle_setup_event(&g, &req);
+	assert(last_response.length == -1);
+	req.wValue = 29 << 8;
+	req.wLength = 1;
+	handle_setup_event(&g, &req);
+	handle_data_event(&g, &data);
+	assert(uvcd_diag_get(g.diag + 2, 2) == 3 && g.diag_page == 0);
+}
+
 int main(void)
 {
+	test_diagnostics();
 	uvcd_pipeline_t p = {0};
 	pthread_mutex_init(&p.frame.lock, NULL);
 	gadget_t g = {.pipe = &p};
